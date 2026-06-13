@@ -33,8 +33,8 @@ from pytgcalls.types import MediaStream, AudioQuality
 # ---------------------------------------------------------------------------
 # https://my.telegram.org -> API development tools theke API_ID o API_HASH nin.
 # Niche apnar nijer value boshiye din.
-API_ID = 1234567                       # <-- apnar API ID din
-API_HASH = "your_api_hash_here"        # <-- apnar API HASH din
+API_ID = 36133167                                  # <-- apnar API ID
+API_HASH = "1bcd447993d473593424ec00e31d3439"      # <-- apnar API HASH
 
 # Session file name. Prothom barer login-er por ei file-e session save thakbe,
 # tai porer bar ar phone number/OTP lagbe na.
