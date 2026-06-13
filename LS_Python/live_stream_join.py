@@ -18,6 +18,29 @@ NOTE (Bangla):
 """
 
 import asyncio
+import sys
+
+# ---------------------------------------------------------------------------
+# EVENT LOOP FIX (Python 3.12+ / 3.14)
+# ---------------------------------------------------------------------------
+# Python 3.12 theke `asyncio.get_event_loop()` MainThread-e kono loop na thakle
+# RuntimeError dey. Pyrogram import howar somoy ei function call kore, tai
+# import-ei crash kore ("There is no current event loop in thread 'MainThread'").
+# Niche ekta loop banaye set kore dile import-time error chole jay.
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+# WARNING: py-tgcalls (live stream join) ekhono Python 3.13/3.14 e thik moto
+# kaj nao korte pare. Stable result-er jonno Python 3.11 ba 3.12 use korun.
+if sys.version_info >= (3, 13):
+    print(
+        "[!] Sotorko: Apni Python "
+        f"{sys.version_info.major}.{sys.version_info.minor} use korchen. "
+        "py-tgcalls Python 3.11/3.12 te shobcheye stable. "
+        "Live stream join na hole Python 3.11 install kore cholan.\n"
+    )
 
 from pyrogram import Client
 from pyrogram.errors import (
