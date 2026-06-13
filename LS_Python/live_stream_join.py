@@ -26,11 +26,15 @@ import sys
 # Python 3.12 theke `asyncio.get_event_loop()` MainThread-e kono loop na thakle
 # RuntimeError dey. Pyrogram import howar somoy ei function call kore, tai
 # import-ei crash kore ("There is no current event loop in thread 'MainThread'").
-# Niche ekta loop banaye set kore dile import-time error chole jay.
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
+#
+# AR EKTA BUG: jodi import-fix-e ek loop banai, kintu pore asyncio.run() onno
+# loop banay, tahole PyTgCalls ek loop-e ar play() onno loop-e cole jay ->
+# "Future attached to a different loop" error ase.
+#
+# Tai amra ekhanei EKTA loop baniye set kore di, ar pore ei EKI loop diye
+# sob kichu chalai (asyncio.run() use kori NA).
+LOOP = asyncio.new_event_loop()
+asyncio.set_event_loop(LOOP)
 
 # WARNING: py-tgcalls (live stream join) ekhono Python 3.13/3.14 e thik moto
 # kaj nao korte pare. Stable result-er jonno Python 3.11 ba 3.12 use korun.
@@ -49,7 +53,7 @@ from pyrogram.errors import (
     FloodWait,
 )
 from pytgcalls import PyTgCalls
-from pytgcalls.types import MediaStream, AudioQuality
+from pytgcalls.types import MediaStream
 
 # ---------------------------------------------------------------------------
 # API CREDENTIALS
@@ -132,25 +136,32 @@ async def ensure_joined(link: str):
 async def join_live_stream(chat_id: int):
     """
     Chat-er cholmaan video chat (group call)-e listen-only mode-e join kore.
-    Listen-only mane: kono audio/video pathabo na, sudhu shune/dekhe.
+    Listen-only mane: kono audio/video pathabo na, sudhu connect hoye thaki.
     """
     try:
-        # MediaStream-e silent/empty input diye listen-only join kora hoy.
-        # AudioQuality kom rakha holo karon amra kichu pathacchi na.
+        # Listen-only: ekta silent/dummy audio stream diye call-e dhuki.
+        # Flags.IGNORE diye audio + video duto-i off rakhi, tai amra kichu
+        # pathai na -> sudhu shuni/dekhi (listen only).
         await call_py.play(
             chat_id,
             MediaStream(
-                "input.raw",  # placeholder; listen-only te real file lage na
-                audio_parameters=AudioQuality.STUDIO,
-                video_flags=MediaStream.Flags.IGNORE,  # video off
-                audio_flags=MediaStream.Flags.IGNORE,  # audio off -> listen only
+                "input.raw",
+                audio_flags=MediaStream.Flags.IGNORE,
+                video_flags=MediaStream.Flags.IGNORE,
             ),
         )
         print("[+] Live stream-e (video chat) join holo - LISTEN ONLY mode.")
         return True
     except Exception as e:
-        print(f"[!] Live stream-e join korte error: {e}")
-        print("    -> Hoyto oi chat-e ekhon kono live stream/video chat chalu nei.")
+        msg = str(e).upper()
+        # py-tgcalls onek somoy specific error dey - shegulo bujhiye dei.
+        if "GROUPCALL" in msg and ("INVALID" in msg or "NOT" in msg or "FORBIDDEN" in msg):
+            print("[!] Oi chat-e EKHON kono live stream/video chat chalu nei.")
+            print("    -> Age chat-e ekta Video Chat START korun, tarpor try korun.")
+        elif "NO ACTIVE" in msg or "GROUP CALL" in msg:
+            print("[!] Oi chat-e kono active group call/live stream paowa jay ni.")
+        else:
+            print(f"[!] Live stream-e join korte error: {e}")
         return False
 
 
@@ -201,4 +212,10 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # asyncio.run() use kori NA, karon seta NOTUN loop banay ar PyTgCalls
+    # already amader LOOP-er sathe bind. Tai amader EKI LOOP diye chalai,
+    # na hole "Future attached to a different loop" error ase.
+    try:
+        LOOP.run_until_complete(main())
+    except KeyboardInterrupt:
+        print("\n[i] Bondho holo (Ctrl+C). Bye!")
