@@ -142,14 +142,21 @@ export function AccountCard({ account, onChange }: { account: AccountRow; onChan
               Enter the Telegram login code
             </Label>
             <Input id={`lc-${account.id}`} name="code" placeholder="12345" inputMode="numeric" required />
-            {account.status === "login_2fa" ? (
-              <>
-                <Label htmlFor={`pw-${account.id}`} className="text-xs">
-                  2FA password (cloud password)
-                </Label>
-                <Input id={`pw-${account.id}`} name="password" type="password" placeholder="••••••••" required />
-              </>
-            ) : null}
+            <Label htmlFor={`pw-${account.id}`} className="text-xs">
+              {account.status === "login_2fa"
+                ? "2FA password (required for this account)"
+                : "2FA password (only if this account has one)"}
+            </Label>
+            <Input
+              id={`pw-${account.id}`}
+              name="password"
+              type="password"
+              placeholder="••••••••"
+              required={account.status === "login_2fa"}
+            />
+            <p className="text-[11px] text-muted-foreground">
+              Tip: if your account has a cloud password, enter it together with the code.
+            </p>
             <Button type="submit" disabled={pending} size="sm" className="mt-1">
               Complete login
             </Button>

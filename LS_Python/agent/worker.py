@@ -1,0 +1,238 @@
+"""
+Iamhear userbot agent - main worker loop.
+
+Run this on your local PC or a VPS. It connects to the SAME Neon database the
+website uses, polls the `jobs` table, and executes each job:
+
+  create_app          -> log into my.telegram.org, create the app, store api_id/hash
+  submit_mtproto_code -> finish my.telegram.org login with the code you typed
+  send_login_code     -> send a userbot login code to the phone
+  submit_login_code   -> finish userbot login (+2FA), store the session string
+  join_livestream     -> join a chat's live stream (listen-only)
+  leave_livestream    -> leave the live stream
+
+Start it with:  python -m agent.worker      (from the LS_Python folder)
+"""
+
+from __future__ import annotations
+
+# --- event loop fix (Python 3.12+), must run before pyrogram import in userbot ---
+import asyncio
+
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+import os
+import socket
+import time
+import uuid
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from agent import db
+from agent import mtproto_app
+from agent import userbot
+
+POLL_SECONDS = float(os.environ.get("AGENT_POLL_SECONDS", "3"))
+AGENT_ID = os.environ.get("AGENT_ID") or f"agent-{uuid.uuid4().hex[:8]}"
+HOSTNAME = socket.gethostname()
+
+
+# ---------------------------------------------------------------------------
+# Job handlers. Each returns a dict that gets stored as the job result.
+# ---------------------------------------------------------------------------
+
+async def handle_create_app(job: dict) -> dict:
+    """
+    Log into my.telegram.org and request the login code. We CANNOT finish here
+    because the code arrives in the Telegram app - so we send the code, save the
+    random_hash, and move the account to 'api_code' so the website shows an input.
+    """
+    account_id = job["account_id"]
+    acc = db.get_account(account_id)
+    phone = acc["phone_number"]
+
+    random_hash = mtproto_app.send_login_code(phone)
+    # Persist the random_hash in its own column so submit_mtproto_code can use it.
+    db.update_account(account_id, status="api_code", last_error=None, mtproto_hash=random_hash)
+    return {"stage": "code_sent", "message": "my.telegram.org code sent to the Telegram app."}
+
+
+async def handle_submit_mtproto_code(job: dict) -> dict:
+    """Finish my.telegram.org login with the code, then create the app."""
+    account_id = job["account_id"]
+    acc = db.get_account(account_id)
+    phone = acc["phone_number"]
+    code = job["payload"].get("code", "").strip()
+
+    random_hash = acc.get("mtproto_hash")
+    if not random_hash:
+        raise RuntimeError("Missing my.telegram.org session state. Re-add the account.")
+
+    cookies = mtproto_app.login(phone, random_hash, code)
+    api_id, api_hash = mtproto_app.get_or_create_app(
+        cookies, acc["app_title"], acc["short_name"]
+    )
+
+    db.update_account(
+        account_id,
+        api_id=api_id,
+        api_hash=api_hash,
+        mtproto_hash=None,  # clear the transient hash
+        status="api_collected",
+        last_error=None,
+    )
+    return {"stage": "api_collected", "api_id": api_id}
+
+
+async def handle_send_login_code(job: dict) -> dict:
+    """Send a userbot login code to the phone using the collected api_id/hash."""
+    account_id = job["account_id"]
+    acc = db.get_account(account_id)
+
+    session, code_hash = await userbot.begin_login(
+        int(acc["api_id"]), acc["api_hash"], acc["phone_number"]
+    )
+    # Persist the partial session + code hash for phase 2 (own columns).
+    db.update_account(
+        account_id,
+        session_string=session,
+        login_hash=code_hash,
+        last_error=None,
+        status="login_code",
+    )
+    return {"stage": "login_code_sent"}
+
+
+async def handle_submit_login_code(job: dict) -> dict:
+    """Finish userbot login (+2FA), store the final session string."""
+    account_id = job["account_id"]
+    acc = db.get_account(account_id)
+    code = job["payload"].get("code", "").strip()
+    password = job["payload"].get("password")
+
+    phone_code_hash = acc.get("login_hash")
+    if not phone_code_hash:
+        raise RuntimeError("Missing login code hash. Click Verify again to resend the code.")
+
+    try:
+        final_session = await userbot.complete_login(
+            int(acc["api_id"]),
+            acc["api_hash"],
+            acc["phone_number"],
+            acc["session_string"],
+            phone_code_hash,
+            code,
+            password,
+        )
+    except userbot.LoginNeeds2FA:
+        db.update_account(account_id, status="login_2fa", two_factor_required=True,
+                          last_error=None)
+        return {"stage": "needs_2fa"}
+
+    db.update_account(
+        account_id,
+        session_string=final_session,
+        login_hash=None,
+        status="logged_in",
+        last_error=None,
+    )
+    return {"stage": "logged_in"}
+
+
+async def handle_join_livestream(job: dict) -> dict:
+    account_id = job["account_id"]
+    target_id = job["payload"]["target_id"]
+    chat_link = job["payload"]["chat_link"]
+    acc = db.get_account(account_id)
+
+    try:
+        await userbot.join_livestream(
+            account_id, int(acc["api_id"]), acc["api_hash"], acc["session_string"], chat_link
+        )
+        db.set_participant(target_id, account_id, "joined", None)
+    except Exception as e:
+        db.set_participant(target_id, account_id, "failed", str(e)[:500])
+        db.recount_livestream(target_id)
+        raise
+    db.recount_livestream(target_id)
+    return {"stage": "joined", "target_id": target_id}
+
+
+async def handle_leave_livestream(job: dict) -> dict:
+    account_id = job["account_id"]
+    target_id = job["payload"]["target_id"]
+    chat_link = job["payload"].get("chat_link", "")
+    await userbot.leave_livestream(account_id, chat_link)
+    db.set_participant(target_id, account_id, "left", None)
+    db.recount_livestream(target_id)
+    return {"stage": "left", "target_id": target_id}
+
+
+HANDLERS = {
+    "create_app": handle_create_app,
+    "submit_mtproto_code": handle_submit_mtproto_code,
+    "send_login_code": handle_send_login_code,
+    "submit_login_code": handle_submit_login_code,
+    "join_livestream": handle_join_livestream,
+    "leave_livestream": handle_leave_livestream,
+}
+
+
+async def process_one(job: dict) -> None:
+    handler = HANDLERS.get(job["type"])
+    if not handler:
+        db.fail_job(job["id"], f"Unknown job type: {job['type']}")
+        return
+    try:
+        result = await handler(job)
+        db.finish_job(job["id"], result)
+        print(f"[OK] job #{job['id']} {job['type']} -> {result.get('stage', 'done')}")
+    except Exception as e:
+        db.fail_job(job["id"], str(e))
+        if job.get("account_id"):
+            db.set_account_status(job["account_id"], "failed", str(e)[:500])
+        print(f"[FAIL] job #{job['id']} {job['type']}: {e}")
+
+
+async def main() -> None:
+    print(f"[i] Iamhear agent '{AGENT_ID}' starting on {HOSTNAME}")
+    print(f"[i] Polling every {POLL_SECONDS}s. Press Ctrl+C to stop.\n")
+    last_beat = 0.0
+    while True:
+        # Heartbeat so the website shows the agent as online.
+        now = time.time()
+        if now - last_beat > 10:
+            try:
+                logged_in = db.query(
+                    "SELECT count(*) AS c FROM telegram_accounts WHERE status = 'logged_in'"
+                )
+                db.heartbeat(AGENT_ID, HOSTNAME, int(logged_in[0]["c"]))
+            except Exception as e:
+                print(f"[!] heartbeat failed: {e}")
+            last_beat = now
+
+        try:
+            job = db.claim_next_job()
+        except Exception as e:
+            print(f"[!] DB poll error: {e}")
+            await asyncio.sleep(POLL_SECONDS)
+            continue
+
+        if not job:
+            await asyncio.sleep(POLL_SECONDS)
+            continue
+
+        print(f"[>] Got job #{job['id']} type={job['type']} account={job['account_id']}")
+        await process_one(job)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[i] Agent stopped. Bye!")
