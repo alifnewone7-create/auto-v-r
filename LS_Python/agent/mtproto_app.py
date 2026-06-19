@@ -87,15 +87,40 @@ def login(phone: str, random_hash: str, code: str) -> dict[str, str]:
         return cookies
 
 
-_API_ID_RE = re.compile(r'app_id[^>]*value="(\d+)"')
-_API_HASH_RE = re.compile(r'app_hash[^>]*value="([a-f0-9]{32})"')
+# my.telegram.org renders the credentials as the *text* of an uneditable span,
+# anchored by a <label for="app_id"> / <label for="app_hash">. The id sits inside
+# a <strong> tag, the hash is plain text. Example:
+#   <label for="app_id" ...>App api_id:</label>
+#   <div class="col-md-7"><span class="...uneditable-input"><strong>31193643</strong></span></div>
+#   <label for="app_hash" ...>App api_hash:</label>
+#   <div class="col-md-7"><span class="...uneditable-input">1073be...ad13</span></div>
+#
+# We anchor on `for="app_id"` / `for="app_hash"`, then grab the first number /
+# 32-char hex that follows inside the next span. Fallback patterns cover the
+# older value="" markup just in case Telegram serves a different template.
+_API_ID_PATTERNS = [
+    re.compile(r'for="app_id".*?<span[^>]*>\s*(?:<strong>\s*)?(\d+)', re.IGNORECASE | re.DOTALL),
+    re.compile(r'app_id[^>]*value="(\d+)"', re.IGNORECASE),
+]
+_API_HASH_PATTERNS = [
+    re.compile(r'for="app_hash".*?<span[^>]*>\s*(?:<strong>\s*)?([a-f0-9]{32})', re.IGNORECASE | re.DOTALL),
+    re.compile(r'app_hash[^>]*value="([a-f0-9]{32})"', re.IGNORECASE),
+]
+
+
+def _first_match(patterns: list[re.Pattern], html: str) -> Optional[str]:
+    for pat in patterns:
+        m = pat.search(html)
+        if m:
+            return m.group(1)
+    return None
 
 
 def _scrape_credentials(html: str) -> Optional[tuple[str, str]]:
-    api_id = _API_ID_RE.search(html)
-    api_hash = _API_HASH_RE.search(html)
+    api_id = _first_match(_API_ID_PATTERNS, html)
+    api_hash = _first_match(_API_HASH_PATTERNS, html)
     if api_id and api_hash:
-        return api_id.group(1), api_hash.group(1)
+        return api_id, api_hash
     return None
 
 
