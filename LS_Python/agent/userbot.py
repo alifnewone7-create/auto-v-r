@@ -36,28 +36,51 @@ class UserbotError(Exception):
 # { account_id: {"client": Client, "calls": PyTgCalls} }
 _POOL: dict[int, dict] = {}
 
+# In-memory pool of IN-PROGRESS login clients, keyed by phone number.
+# The userbot login is split across two jobs (send_login_code -> submit_login_code)
+# that both run inside this same long-running worker process. We MUST keep the
+# connected Client alive between them instead of exporting a half-finished
+# session string: exporting a session before sign-in packs an empty user_id and
+# crashes with "required argument is not an integer".
+# { phone: {"client": Client, "code_ok": bool} }
+_LOGIN_POOL: dict[str, dict] = {}
+
+
+async def _drop_login_client(phone: str) -> None:
+    """Disconnect and forget an in-progress login client."""
+    entry = _LOGIN_POOL.pop(phone, None)
+    if entry:
+        try:
+            await entry["client"].disconnect()
+        except Exception:
+            pass
+
 
 async def begin_login(api_id: int, api_hash: str, phone: str) -> tuple[str, str]:
     """
-    Phase 1 of userbot login. Sends the login code to the phone.
-    Returns (session_string_so_far, phone_code_hash).
+    Phase 1 of userbot login. Sends the login code to the phone and keeps the
+    connected client alive (in _LOGIN_POOL) so phase 2 can finish on the SAME
+    client. Returns ("", phone_code_hash).
 
-    We use an in-memory session (no file) and export the partial session so the
-    next job can resume the same auth attempt.
+    We intentionally do NOT export a session string here: the client is not
+    authorized yet (no user_id), and exporting it raises
+    "required argument is not an integer".
     """
+    # Clear any stale half-finished attempt for this phone.
+    await _drop_login_client(phone)
+
     client = Client(
         name=f"login_{phone}",
-        api_id=api_id,
+        api_id=int(api_id),
         api_hash=api_hash,
         in_memory=True,
         phone_number=phone,
     )
     await client.connect()
     sent = await client.send_code(phone)
-    # Export the partial session so phase 2 can reconnect with the same auth key.
-    session = await client.export_session_string()
-    await client.disconnect()
-    return session, sent.phone_code_hash
+    # Keep the connected client for phase 2 instead of exporting a partial session.
+    _LOGIN_POOL[phone] = {"client": client, "code_ok": False}
+    return "", sent.phone_code_hash
 
 
 async def complete_login(
@@ -70,36 +93,49 @@ async def complete_login(
     password: Optional[str] = None,
 ) -> str:
     """
-    Phase 2: submit the code (and 2FA password if set). Returns the final
-    session string to store in the DB.
+    Phase 2: submit the code (and 2FA password if set) on the SAME client kept
+    alive from phase 1. Returns the final (authorized) session string to store.
     """
-    client = Client(
-        name=f"login_{phone}",
-        api_id=api_id,
-        api_hash=api_hash,
-        session_string=session_string,
-        in_memory=True,
-    )
-    await client.connect()
+    entry = _LOGIN_POOL.get(phone)
+    if entry is None:
+        # The worker likely restarted between the two jobs, so the in-memory
+        # login client is gone. The user must request a fresh code.
+        raise UserbotError(
+            "Login session expired (agent restarted). Click Verify again to resend the code."
+        )
+
+    client: Client = entry["client"]
     try:
-        try:
-            await client.sign_in(phone, phone_code_hash, code)
-        except SessionPasswordNeeded:
+        if not entry["code_ok"]:
+            # We still need to submit the login code.
+            try:
+                await client.sign_in(phone, phone_code_hash, code)
+                entry["code_ok"] = True
+            except SessionPasswordNeeded:
+                entry["code_ok"] = True  # code accepted; 2FA password still needed
+                if not password:
+                    # Keep the client alive for the follow-up password submission.
+                    raise LoginNeeds2FA("This account has 2FA enabled. Password required.")
+                await client.check_password(password)
+            except (PhoneCodeInvalid, PhoneCodeExpired) as e:
+                await _drop_login_client(phone)
+                raise UserbotError(f"Login code problem: {e.__class__.__name__}")
+        else:
+            # Code was already accepted on a previous job; this call carries the 2FA password.
             if not password:
-                await client.disconnect()
                 raise LoginNeeds2FA("This account has 2FA enabled. Password required.")
             await client.check_password(password)
-        except (PhoneCodeInvalid, PhoneCodeExpired) as e:
-            await client.disconnect()
-            raise UserbotError(f"Login code problem: {e.__class__.__name__}")
 
         final_session = await client.export_session_string()
-        return final_session
-    finally:
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
+    except (LoginNeeds2FA, UserbotError):
+        raise
+    except Exception as e:
+        # Wrong 2FA password or any other hard failure -> reset so the user can retry.
+        await _drop_login_client(phone)
+        raise UserbotError(f"Login failed: {e.__class__.__name__}: {e}")
+
+    await _drop_login_client(phone)
+    return final_session
 
 
 async def _ensure_online(account_id: int, api_id: int, api_hash: str, session_string: str) -> dict:
