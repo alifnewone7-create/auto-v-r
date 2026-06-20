@@ -182,6 +182,16 @@ HANDLERS = {
     "leave_livestream": handle_leave_livestream,
 }
 
+# Jobs that are part of the login / auth flow. ONLY these may flip an account
+# into the 'failed' state (which makes the website ask for re-login). A livestream
+# join/leave failure must NEVER log the userbot out - the account is still valid.
+AUTH_JOB_TYPES = {
+    "create_app",
+    "submit_mtproto_code",
+    "send_login_code",
+    "submit_login_code",
+}
+
 
 async def process_one(job: dict) -> None:
     handler = HANDLERS.get(job["type"])
@@ -194,7 +204,10 @@ async def process_one(job: dict) -> None:
         print(f"[OK] job #{job['id']} {job['type']} -> {result.get('stage', 'done')}")
     except Exception as e:
         db.fail_job(job["id"], str(e))
-        if job.get("account_id"):
+        # Only auth/login jobs may mark the account as failed. A livestream
+        # join/leave error keeps the account logged in so the website does not
+        # wrongly ask the user to log the userbot in again.
+        if job.get("account_id") and job["type"] in AUTH_JOB_TYPES:
             db.set_account_status(job["account_id"], "failed", str(e)[:500])
         print(f"[FAIL] job #{job['id']} {job['type']}: {e}")
 

@@ -19,7 +19,12 @@ from __future__ import annotations
 from typing import Optional
 
 from pyrogram import Client
-from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired
+from pyrogram.errors import (
+    SessionPasswordNeeded,
+    PhoneCodeInvalid,
+    PhoneCodeExpired,
+    ChatAdminRequired,
+)
 from pytgcalls import PyTgCalls
 from pytgcalls.types import MediaStream
 
@@ -30,6 +35,10 @@ class LoginNeeds2FA(Exception):
 
 class UserbotError(Exception):
     pass
+
+
+class NoActiveLivestream(UserbotError):
+    """Raised when the chat has no live stream / video chat running to join."""
 
 
 # In-memory pool of live userbots, keyed by account_id.
@@ -171,15 +180,32 @@ async def join_livestream(
     # 1) Resolve + join the chat so the userbot is a member.
     chat_id = await _resolve_and_join_chat(client, chat_link)
 
-    # 2) Join the active group call (listen-only: both streams ignored).
-    await calls.play(
-        chat_id,
-        MediaStream(
-            "input.raw",
-            audio_flags=MediaStream.Flags.IGNORE,
-            video_flags=MediaStream.Flags.IGNORE,
-        ),
-    )
+    # 2) Make sure a live stream / video chat is actually running. If it is NOT,
+    #    pytgcalls would try phone.CreateGroupCall, which needs admin rights and
+    #    fails with CHAT_ADMIN_REQUIRED. We want to JOIN an existing stream only,
+    #    never create one, so we check first and report a clear error.
+    if not await _has_active_group_call(client, chat_id):
+        raise NoActiveLivestream(
+            "No live stream is currently running in this chat. "
+            "Start the live stream/video chat first, then add the link."
+        )
+
+    # 3) Join the active group call (listen-only: both streams ignored).
+    try:
+        await calls.play(
+            chat_id,
+            MediaStream(
+                "input.raw",
+                audio_flags=MediaStream.Flags.IGNORE,
+                video_flags=MediaStream.Flags.IGNORE,
+            ),
+        )
+    except ChatAdminRequired:
+        # Race: the live stream ended between our check and the join attempt.
+        raise NoActiveLivestream(
+            "No live stream is currently running in this chat. "
+            "Start the live stream/video chat first, then add the link."
+        )
 
 
 async def leave_livestream(account_id: int, chat_link: str) -> None:
@@ -193,6 +219,27 @@ async def leave_livestream(account_id: int, chat_link: str) -> None:
         await calls.leave_call(chat.id)
     except Exception:
         pass
+
+
+async def _has_active_group_call(client: Client, chat_id: int) -> bool:
+    """
+    Return True if the chat currently has a live stream / video chat running.
+
+    We read the chat's full info: Telegram only populates `call` when a group
+    call is active. This lets us JOIN an existing stream without ever trying to
+    CREATE one (which needs admin rights).
+    """
+    try:
+        full = await client.invoke(
+            __import__(
+                "pyrogram.raw.functions.channels", fromlist=["GetFullChannel"]
+            ).GetFullChannel(channel=await client.resolve_peer(chat_id))
+        )
+        return getattr(full.full_chat, "call", None) is not None
+    except Exception:
+        # Could be a basic group (not a channel) or a transient error. Fall back
+        # to attempting the join; play() / our ChatAdminRequired catch handles it.
+        return True
 
 
 async def _resolve_and_join_chat(client: Client, chat_link: str) -> int:
