@@ -16,6 +16,7 @@ it can join multiple live streams without re-logging-in.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Optional
 
 from pyrogram import Client
@@ -164,6 +165,32 @@ async def _ensure_online(account_id: int, api_id: int, api_hash: str, session_st
     await calls.start()
     _POOL[account_id] = {"client": client, "calls": calls}
     return _POOL[account_id]
+
+
+async def prewarm(accounts: list[dict]) -> int:
+    """
+    Connect every already-logged-in account up front and keep it in _POOL.
+
+    The slowest part of joining a live stream is the per-account cold start
+    (client.start(): MTProto handshake + auth + updates sync). By doing it once
+    at agent startup, later join jobs only have to run calls.play(), which is
+    near-instant. Returns how many clients are now warm.
+
+    Connections are opened concurrently so warming 100 accounts takes about as
+    long as warming one.
+    """
+    async def _warm(acc: dict) -> bool:
+        try:
+            await _ensure_online(
+                acc["id"], int(acc["api_id"]), acc["api_hash"], acc["session_string"]
+            )
+            return True
+        except Exception as e:
+            print(f"[!] prewarm failed for account {acc.get('id')}: {e}")
+            return False
+
+    results = await asyncio.gather(*(_warm(a) for a in accounts))
+    return sum(1 for ok in results if ok)
 
 
 async def join_livestream(

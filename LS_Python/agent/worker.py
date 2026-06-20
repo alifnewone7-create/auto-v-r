@@ -38,6 +38,9 @@ from agent import mtproto_app
 from agent import userbot
 
 POLL_SECONDS = float(os.environ.get("AGENT_POLL_SECONDS", "3"))
+# How many queued jobs to claim and run concurrently per loop. Raise this if you
+# have many userbots (e.g. 100) so they all join in one parallel batch.
+BATCH_SIZE = int(os.environ.get("AGENT_BATCH_SIZE", "100"))
 AGENT_ID = os.environ.get("AGENT_ID") or f"agent-{uuid.uuid4().hex[:8]}"
 HOSTNAME = socket.gethostname()
 
@@ -212,9 +215,36 @@ async def process_one(job: dict) -> None:
         print(f"[FAIL] job #{job['id']} {job['type']}: {e}")
 
 
+async def prewarm_accounts() -> None:
+    """Connect all logged-in userbots at startup so the first joins are fast."""
+    try:
+        accounts = db.query(
+            """
+            SELECT id, api_id, api_hash, session_string
+            FROM telegram_accounts
+            WHERE status = 'logged_in'
+              AND api_id IS NOT NULL
+              AND api_hash IS NOT NULL
+              AND session_string IS NOT NULL
+            """
+        )
+    except Exception as e:
+        print(f"[!] prewarm query failed: {e}")
+        return
+    if not accounts:
+        return
+    print(f"[i] Pre-warming {len(accounts)} logged-in userbot(s)...")
+    warmed = await userbot.prewarm(accounts)
+    print(f"[i] {warmed}/{len(accounts)} userbot(s) connected and ready.\n")
+
+
 async def main() -> None:
     print(f"[i] Iamhear agent '{AGENT_ID}' starting on {HOSTNAME}")
     print(f"[i] Polling every {POLL_SECONDS}s. Press Ctrl+C to stop.\n")
+
+    # Warm all logged-in userbots up front so join jobs only run calls.play().
+    await prewarm_accounts()
+
     last_beat = 0.0
     while True:
         # Heartbeat so the website shows the agent as online.
@@ -230,18 +260,21 @@ async def main() -> None:
             last_beat = now
 
         try:
-            job = db.claim_next_job()
+            jobs = db.claim_next_jobs(BATCH_SIZE)
         except Exception as e:
             print(f"[!] DB poll error: {e}")
             await asyncio.sleep(POLL_SECONDS)
             continue
 
-        if not job:
+        if not jobs:
             await asyncio.sleep(POLL_SECONDS)
             continue
 
-        print(f"[>] Got job #{job['id']} type={job['type']} account={job['account_id']}")
-        await process_one(job)
+        print(f"[>] Got {len(jobs)} job(s); processing concurrently.")
+        # Run the whole batch at once. These are network-bound (Telegram) jobs,
+        # so asyncio handles many in parallel; total time ~= the slowest job,
+        # not the sum. This is what turns minutes of joins into seconds.
+        await asyncio.gather(*(process_one(job) for job in jobs))
 
 
 if __name__ == "__main__":

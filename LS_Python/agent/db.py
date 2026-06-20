@@ -81,6 +81,39 @@ def claim_next_job() -> Optional[dict[str, Any]]:
             return cur.fetchone()
 
 
+def claim_next_jobs(limit: int = 50) -> list[dict[str, Any]]:
+    """
+    Atomically grab up to `limit` of the oldest queued jobs and mark them
+    'processing' in a single round-trip. This lets the worker run many jobs
+    (e.g. 100 livestream joins) concurrently instead of one-at-a-time.
+
+    FOR UPDATE SKIP LOCKED keeps this safe across multiple agents.
+    """
+    if limit < 1:
+        limit = 1
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE jobs
+                SET status = 'processing',
+                    attempts = attempts + 1,
+                    claimed_at = now(),
+                    updated_at = now()
+                WHERE id IN (
+                    SELECT id FROM jobs
+                    WHERE status = 'queued'
+                    ORDER BY created_at
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT %s
+                )
+                RETURNING *
+                """,
+                (limit,),
+            )
+            return cur.fetchall()
+
+
 def finish_job(job_id: int, result: dict[str, Any] | None = None) -> None:
     query(
         "UPDATE jobs SET status = 'done', result = %s::jsonb, error = NULL, updated_at = now() WHERE id = %s",
