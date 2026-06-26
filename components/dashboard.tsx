@@ -1,12 +1,13 @@
 "use client"
 
-import { Radio, Users, LogOut } from "lucide-react"
+import { Radio, Users, LogOut, Eye } from "lucide-react"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Button } from "@/components/ui/button"
 import { logoutAction } from "@/app/actions/auth"
 import { AgentStatusBar } from "@/components/agent-status-bar"
 import { AccountsSection } from "@/components/accounts-section"
 import { LivestreamSection } from "@/components/livestream-section"
+import { ViewTargetsSection } from "@/components/view-targets-section"
 
 export function Dashboard() {
   return (
@@ -44,6 +45,10 @@ export function Dashboard() {
               <Radio className="size-4" />
               Live Stream Join
             </TabsTrigger>
+            <TabsTrigger value="view" className="gap-2">
+              <Eye className="size-4" />
+              Live View
+            </TabsTrigger>
           </TabsList>
 
           <TabsContent value="accounts" className="mt-6">
@@ -51,6 +56,9 @@ export function Dashboard() {
           </TabsContent>
           <TabsContent value="livestream" className="mt-6">
             <LivestreamSection />
+          </TabsContent>
+          <TabsContent value="view" className="mt-6">
+            <ViewTargetsSection />
           </TabsContent>
         </Tabs>
       </main>

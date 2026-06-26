@@ -41,6 +41,11 @@ POLL_SECONDS = float(os.environ.get("AGENT_POLL_SECONDS", "3"))
 # How many queued jobs to claim and run concurrently per loop. Raise this if you
 # have many userbots (e.g. 100) so they all join in one parallel batch.
 BATCH_SIZE = int(os.environ.get("AGENT_BATCH_SIZE", "100"))
+# How often to poll watched channels for new posts (live-handler fallback).
+VIEW_POLL_SECONDS = float(os.environ.get("AGENT_VIEW_POLL_SECONDS", "5"))
+# Safety cap: never enqueue more than this many posts at once from one detection
+# (prevents a huge backfill if last_seen somehow falls far behind).
+VIEW_MAX_BACKFILL = int(os.environ.get("AGENT_VIEW_MAX_BACKFILL", "30"))
 AGENT_ID = os.environ.get("AGENT_ID") or f"agent-{uuid.uuid4().hex[:8]}"
 HOSTNAME = socket.gethostname()
 
@@ -176,6 +181,22 @@ async def handle_leave_livestream(job: dict) -> dict:
     return {"stage": "left", "target_id": target_id}
 
 
+async def handle_view_post(job: dict) -> dict:
+    """
+    View a single channel post from EVERY warm userbot. One of these jobs is
+    queued per new post; it fans out across the whole pool concurrently.
+    """
+    payload = job["payload"]
+    chat_id = int(payload["chat_id"])
+    message_id = int(payload["message_id"])
+    target_id = payload.get("target_id")
+
+    count = await userbot.view_post_all(chat_id, message_id)
+    if target_id:
+        db.bump_view_sent(int(target_id), count)
+    return {"stage": "viewed", "views": count, "message_id": message_id}
+
+
 HANDLERS = {
     "create_app": handle_create_app,
     "submit_mtproto_code": handle_submit_mtproto_code,
@@ -183,6 +204,7 @@ HANDLERS = {
     "submit_login_code": handle_submit_login_code,
     "join_livestream": handle_join_livestream,
     "leave_livestream": handle_leave_livestream,
+    "view_post": handle_view_post,
 }
 
 # Jobs that are part of the login / auth flow. ONLY these may flip an account
@@ -238,6 +260,68 @@ async def prewarm_accounts() -> None:
     print(f"[i] {warmed}/{len(accounts)} userbot(s) connected and ready.\n")
 
 
+async def dispatch_views_for_target(target_id: int, chat_id: int, latest_id: int) -> None:
+    """
+    Atomically claim the new post range and queue one view_post job per post.
+    Safe to call from both the polling loop and the live handler - claim_view_advance
+    guarantees each post is only dispatched once.
+    """
+    old = db.claim_view_advance(target_id, latest_id)
+    if old is None:
+        return  # already handled by the other detection path
+    start = max(int(old) + 1, latest_id - VIEW_MAX_BACKFILL + 1)
+    post_ids = list(range(start, latest_id + 1))
+    if not post_ids:
+        return
+    for mid in post_ids:
+        db.enqueue_view_job(chat_id, mid, target_id)
+    db.bump_view_posts(target_id, len(post_ids))
+    print(f"[view] target {target_id}: queued {len(post_ids)} new post(s) up to #{latest_id}")
+
+
+async def live_view_dispatch(chat_id: int, message_id: int) -> None:
+    """Live-handler callback: a watched channel just got a new post."""
+    target = db.get_view_target_by_chat(chat_id)
+    # Skip until the baseline is set by the polling loop (honors future-only).
+    if not target or target["status"] != "active" or target["last_seen_message_id"] == 0:
+        return
+    await dispatch_views_for_target(target["id"], chat_id, message_id)
+
+
+async def poll_view_targets() -> None:
+    """
+    Fallback detector: for each active channel, look up the latest post id and
+    queue views for anything new. Also resolves chat_id/title on first sight and
+    sets the future-only baseline for freshly added channels.
+    """
+    try:
+        targets = db.get_active_view_targets()
+    except Exception as e:
+        print(f"[!] view targets query failed: {e}")
+        return
+
+    for t in targets:
+        try:
+            ref = t["chat_id"] if t["chat_id"] is not None else t["channel_link"]
+            chat_id, title, latest = await userbot.resolve_channel_latest(ref)
+
+            if t["chat_id"] is None or not t["title"]:
+                db.set_view_target_meta(t["id"], chat_id, title)
+
+            if t["last_seen_message_id"] == 0:
+                # New channel: start the cutoff at the current latest, view nothing old.
+                db.init_view_baseline(t["id"], latest)
+                continue
+
+            await dispatch_views_for_target(t["id"], chat_id, latest)
+        except userbot.UserbotError:
+            # No warm userbots yet - try again next cycle, don't spam errors.
+            return
+        except Exception as e:
+            db.set_view_target_error(t["id"], str(e)[:500])
+            print(f"[!] view poll failed for target {t['id']}: {e}")
+
+
 async def main() -> None:
     print(f"[i] Iamhear agent '{AGENT_ID}' starting on {HOSTNAME}")
     print(f"[i] Polling every {POLL_SECONDS}s. Press Ctrl+C to stop.\n")
@@ -245,7 +329,14 @@ async def main() -> None:
     # Warm all logged-in userbots up front so join jobs only run calls.play().
     await prewarm_accounts()
 
+    # Live-detect new posts on channels our userbots are members of.
+    userbot.set_view_dispatch(live_view_dispatch)
+    attached = userbot.attach_view_handlers()
+    if attached:
+        print(f"[i] Live View handlers attached to {attached} userbot(s).")
+
     last_beat = 0.0
+    last_view_poll = 0.0
     while True:
         # Heartbeat so the website shows the agent as online.
         now = time.time()
@@ -258,6 +349,11 @@ async def main() -> None:
             except Exception as e:
                 print(f"[!] heartbeat failed: {e}")
             last_beat = now
+
+        # Watch channels for new posts (live handler is primary; this is fallback).
+        if now - last_view_poll > VIEW_POLL_SECONDS:
+            await poll_view_targets()
+            last_view_poll = now
 
         try:
             jobs = db.claim_next_jobs(BATCH_SIZE)

@@ -80,3 +80,25 @@ CREATE TABLE IF NOT EXISTS agents (
   note            TEXT,
   last_seen       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Live View targets: channels whose future posts get auto-viewed by userbots ---
+-- The Python agent watches each active channel (live handler + polling fallback)
+-- and, when a NEW post appears, dispatches a view_post job for every logged-in
+-- userbot. Only posts newer than last_seen_message_id are viewed (clean cutoff).
+CREATE TABLE IF NOT EXISTS view_targets (
+  id                   SERIAL PRIMARY KEY,
+  channel_link         TEXT NOT NULL UNIQUE,
+  chat_id              BIGINT,
+  title                TEXT,
+  status               TEXT NOT NULL DEFAULT 'active',  -- active | paused
+  last_seen_message_id BIGINT NOT NULL DEFAULT 0,
+  posts_viewed         INTEGER NOT NULL DEFAULT 0,       -- distinct posts processed
+  views_sent           INTEGER NOT NULL DEFAULT 0,       -- total view jobs dispatched
+  last_post_at         TIMESTAMPTZ,
+  last_checked_at      TIMESTAMPTZ,
+  last_error           TEXT,
+  created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS view_targets_status_idx ON view_targets (status);

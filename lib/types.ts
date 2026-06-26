@@ -45,6 +45,7 @@ export type JobType =
   | "submit_login_code" // pass the userbot login code (+ 2FA password) to the agent
   | "join_livestream" // join the live stream / video chat of a chat
   | "leave_livestream" // leave the live stream
+  | "view_post" // view a channel post from every logged-in userbot
 
 export type JobStatus = "queued" | "processing" | "done" | "failed"
 
@@ -82,4 +83,22 @@ export interface Agent {
   last_seen: string
   active_accounts: number
   note: string | null
+}
+
+export type ViewTargetStatus = "active" | "paused"
+
+export interface ViewTarget {
+  id: number
+  channel_link: string
+  chat_id: number | null
+  title: string | null
+  status: ViewTargetStatus
+  last_seen_message_id: number
+  posts_viewed: number
+  views_sent: number
+  last_post_at: string | null
+  last_checked_at: string | null
+  last_error: string | null
+  created_at: string
+  updated_at: string
 }

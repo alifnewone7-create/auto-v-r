@@ -188,6 +188,94 @@ def recount_livestream(target_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Live View helpers (auto-view future channel posts)
+# ---------------------------------------------------------------------------
+
+def get_active_view_targets() -> list[dict[str, Any]]:
+    """All channels currently being watched for auto-viewing."""
+    return query("SELECT * FROM view_targets WHERE status = 'active' ORDER BY id")
+
+
+def get_view_target_by_chat(chat_id: int) -> Optional[dict[str, Any]]:
+    return query_one("SELECT * FROM view_targets WHERE chat_id = %s", (chat_id,))
+
+
+def set_view_target_meta(target_id: int, chat_id: int, title: str | None) -> None:
+    """Store the resolved Telegram chat_id + title once we look the channel up."""
+    query(
+        "UPDATE view_targets SET chat_id = %s, title = COALESCE(%s, title), "
+        "last_checked_at = now(), last_error = NULL, updated_at = now() WHERE id = %s",
+        (chat_id, title, target_id),
+    )
+
+
+def init_view_baseline(target_id: int, latest_message_id: int) -> None:
+    """
+    Set the starting point for a freshly added channel WITHOUT viewing anything.
+    Only posts newer than this baseline get auto-viewed (clean future-only cutoff).
+    """
+    query(
+        "UPDATE view_targets SET last_seen_message_id = %s, last_checked_at = now(), "
+        "updated_at = now() WHERE id = %s AND last_seen_message_id = 0",
+        (latest_message_id, target_id),
+    )
+
+
+def claim_view_advance(target_id: int, new_message_id: int) -> Optional[int]:
+    """
+    Atomically advance last_seen_message_id to new_message_id IF it is greater.
+    Returns the previous value when we advanced (so the caller knows which post
+    ids are new), or None if another path already handled this post. This makes
+    the live-handler and the polling fallback safe to run together (no dupes).
+    """
+    row = query_one(
+        """
+        WITH cur AS (
+            SELECT last_seen_message_id AS old FROM view_targets WHERE id = %s FOR UPDATE
+        )
+        UPDATE view_targets v
+        SET last_seen_message_id = %s, last_checked_at = now(), updated_at = now()
+        FROM cur
+        WHERE v.id = %s AND cur.old < %s
+        RETURNING cur.old AS old
+        """,
+        (target_id, new_message_id, target_id, new_message_id),
+    )
+    return row["old"] if row else None
+
+
+def bump_view_posts(target_id: int, posts: int) -> None:
+    query(
+        "UPDATE view_targets SET posts_viewed = posts_viewed + %s, last_post_at = now(), "
+        "updated_at = now() WHERE id = %s",
+        (posts, target_id),
+    )
+
+
+def bump_view_sent(target_id: int, views: int) -> None:
+    query(
+        "UPDATE view_targets SET views_sent = views_sent + %s, updated_at = now() WHERE id = %s",
+        (views, target_id),
+    )
+
+
+def set_view_target_error(target_id: int, error: str | None) -> None:
+    query(
+        "UPDATE view_targets SET last_error = %s, last_checked_at = now(), updated_at = now() WHERE id = %s",
+        (error, target_id),
+    )
+
+
+def enqueue_view_job(chat_id: int, message_id: int, target_id: int) -> None:
+    """Queue a single view_post job (fans out to all userbots inside the agent)."""
+    query(
+        "INSERT INTO jobs (type, account_id, payload, status) "
+        "VALUES ('view_post', NULL, %s::jsonb, 'queued')",
+        (json.dumps({"chat_id": chat_id, "message_id": message_id, "target_id": target_id}),),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Agent heartbeat
 # ---------------------------------------------------------------------------
 

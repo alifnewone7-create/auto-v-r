@@ -19,13 +19,15 @@ from __future__ import annotations
 import asyncio
 from typing import Optional
 
-from pyrogram import Client
+from pyrogram import Client, filters
 from pyrogram.errors import (
     SessionPasswordNeeded,
     PhoneCodeInvalid,
     PhoneCodeExpired,
     ChatAdminRequired,
 )
+from pyrogram.handlers import MessageHandler
+from pyrogram.raw.functions.messages import GetMessagesViews
 from pytgcalls import PyTgCalls
 from pytgcalls.types import MediaStream
 
@@ -304,3 +306,104 @@ def _normalize_link(chat_link: str) -> str:
     if "/" not in s and not s.startswith("+"):
         return s
     return chat_link  # private invite link: pass through as-is
+
+
+# ===========================================================================
+# Live View: auto-view future channel posts with every logged-in userbot
+# ===========================================================================
+
+# Set by the worker. Called as: await _VIEW_DISPATCH(chat_id, message_id)
+_VIEW_DISPATCH = None
+
+
+def set_view_dispatch(callback) -> None:
+    """Register the worker callback that turns a detected post into view jobs."""
+    global _VIEW_DISPATCH
+    _VIEW_DISPATCH = callback
+
+
+def _first_client() -> Optional[Client]:
+    """Any warm client we can use to read public channel info / history."""
+    for entry in _POOL.values():
+        return entry["client"]
+    return None
+
+
+async def resolve_channel_latest(link_or_chat_id) -> tuple[int, str, int]:
+    """
+    Resolve a channel and return (chat_id, title, latest_message_id).
+
+    Uses any warm userbot. Works for public channels without joining; private
+    channels require at least one userbot to be a member.
+    """
+    client = _first_client()
+    if client is None:
+        raise UserbotError("No warm userbots available yet.")
+
+    target = link_or_chat_id
+    if isinstance(link_or_chat_id, str):
+        target = _normalize_link(link_or_chat_id)
+    chat = await client.get_chat(target)
+
+    latest = 0
+    async for msg in client.get_chat_history(chat.id, limit=1):
+        latest = msg.id
+        break
+
+    title = chat.title or (f"@{chat.username}" if chat.username else str(chat.id))
+    return chat.id, title, latest
+
+
+async def view_post_all(chat_id: int, message_id: int) -> int:
+    """
+    Increment the view count of a post from EVERY warm userbot concurrently.
+    Returns how many userbots successfully registered a view.
+    """
+    clients = [entry["client"] for entry in _POOL.values()]
+    if not clients:
+        return 0
+
+    async def _one(client: Client) -> bool:
+        try:
+            peer = await client.resolve_peer(chat_id)
+            await client.invoke(
+                GetMessagesViews(peer=peer, id=[int(message_id)], increment=True)
+            )
+            return True
+        except Exception as e:
+            print(f"[!] view failed (msg {message_id}): {e.__class__.__name__}: {e}")
+            return False
+
+    results = await asyncio.gather(*(_one(c) for c in clients))
+    return sum(1 for ok in results if ok)
+
+
+async def _on_channel_post(client: Client, message) -> None:
+    """Live handler: a new post arrived in a channel this userbot is in."""
+    if _VIEW_DISPATCH is None:
+        return
+    try:
+        chat = getattr(message, "chat", None)
+        if chat is None:
+            return
+        await _VIEW_DISPATCH(chat.id, message.id)
+    except Exception as e:
+        print(f"[!] live view dispatch failed: {e}")
+
+
+def attach_view_handlers() -> int:
+    """
+    Attach the new-post handler to every warm client. Whichever userbot is a
+    member of a watched channel will detect new posts instantly; the worker's
+    polling loop is the fallback. Returns how many handlers were attached.
+    """
+    count = 0
+    for entry in _POOL.values():
+        client: Client = entry["client"]
+        if entry.get("view_handler"):
+            continue  # already attached
+        handler = MessageHandler(_on_channel_post, filters.channel)
+        client.add_handler(handler)
+        entry["view_handler"] = handler
+        count += 1
+    return count
