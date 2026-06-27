@@ -3,7 +3,12 @@
 -- =============================================================================
 -- Safe to run any time on any Neon database. Uses IF NOT EXISTS everywhere so
 -- it will set up a fresh DB and leave an already-configured DB untouched.
--- Run this whenever a new Neon database is integrated/connected.
+--
+-- NOTE: You normally do NOT need to run this manually. The app auto-creates all
+-- tables on the first database query (see SCHEMA_SQL / ensureSchema in
+-- lib/db.ts). This file is the mirrored, human-readable copy. Whenever you add
+-- a new table/column/index, update BOTH this file and SCHEMA_SQL in lib/db.ts
+-- (always with IF NOT EXISTS) so creation stays automatic on integration.
 -- =============================================================================
 
 -- Telegram accounts (userbots) managed by the panel ---------------------------
