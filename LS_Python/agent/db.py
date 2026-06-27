@@ -276,6 +276,63 @@ def enqueue_view_job(chat_id: int, message_id: int, target_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Vote helpers (detect a poll, then vote / un-vote on it)
+# ---------------------------------------------------------------------------
+
+def set_vote_target_meta(
+    target_id: int,
+    *,
+    chat_id: int,
+    message_id: int,
+    poll_id: str,
+    question: str | None,
+    options: list[dict[str, Any]],
+    multiple_choice: bool,
+) -> None:
+    """Store the detected poll details and flip the target to 'ready'."""
+    query(
+        """
+        UPDATE vote_targets
+        SET chat_id = %s, message_id = %s, poll_id = %s, question = %s,
+            options = %s::jsonb, multiple_choice = %s,
+            status = 'ready', last_error = NULL, updated_at = now()
+        WHERE id = %s
+        """,
+        (chat_id, message_id, poll_id, question, json.dumps(options), multiple_choice, target_id),
+    )
+
+
+def set_vote_target_error(target_id: int, error: str | None) -> None:
+    query(
+        "UPDATE vote_targets SET status = 'failed', last_error = %s, updated_at = now() WHERE id = %s",
+        ((error or "")[:500], target_id),
+    )
+
+
+def set_vote_cast(target_id: int, account_id: int, status: str, error: str | None = None) -> None:
+    """Update a single account's cast row on a poll (identified by target+account)."""
+    query(
+        """
+        UPDATE vote_casts SET status = %s, last_error = %s, updated_at = now()
+        WHERE target_id = %s AND account_id = %s
+        """,
+        (status, error, target_id, account_id),
+    )
+
+
+def set_vote_cast_by_id(cast_id: int, status: str, error: str | None = None) -> None:
+    query(
+        "UPDATE vote_casts SET status = %s, last_error = %s, updated_at = now() WHERE id = %s",
+        (status, error, cast_id),
+    )
+
+
+def delete_vote_cast(cast_id: int) -> None:
+    """Remove a cast row entirely - frees that account to vote again on this poll."""
+    query("DELETE FROM vote_casts WHERE id = %s", (cast_id,))
+
+
+# ---------------------------------------------------------------------------
 # Agent heartbeat
 # ---------------------------------------------------------------------------
 

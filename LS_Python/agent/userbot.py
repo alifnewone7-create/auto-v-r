@@ -407,3 +407,114 @@ def attach_view_handlers() -> int:
         entry["view_handler"] = handler
         count += 1
     return count
+
+
+# ===========================================================================
+# Vote: detect the most recent poll in a channel and vote / un-vote on it
+# ===========================================================================
+
+class NoPollFound(UserbotError):
+    """Raised when the channel has no poll in its recent messages."""
+
+
+# How many recent messages to scan when looking for the latest poll.
+_POLL_SCAN_LIMIT = 100
+
+
+async def detect_recent_poll(link_or_chat_id) -> dict:
+    """
+    Open a public/private channel and return info about its MOST RECENT poll:
+      { chat_id, message_id, poll_id, question, options:[{index,text}],
+        multiple_choice }
+
+    Uses any warm userbot. For a private channel at least one userbot must be a
+    member (we attempt to join from the link first).
+    """
+    client = _first_client()
+    if client is None:
+        raise UserbotError("No warm userbots available yet.")
+
+    # Make sure the reader userbot can actually see the channel.
+    try:
+        chat_id = await _resolve_and_join_chat(client, str(link_or_chat_id))
+    except Exception:
+        target = link_or_chat_id
+        if isinstance(link_or_chat_id, str):
+            target = _normalize_link(link_or_chat_id)
+        chat = await client.get_chat(target)
+        chat_id = chat.id
+
+    poll_msg = None
+    async for msg in client.get_chat_history(chat_id, limit=_POLL_SCAN_LIMIT):
+        if getattr(msg, "poll", None) is not None:
+            poll_msg = msg
+            break
+
+    if poll_msg is None:
+        raise NoPollFound(
+            "No poll found in the recent messages of this channel. "
+            "Make sure the link points to a channel that has a poll."
+        )
+
+    poll = poll_msg.poll
+    options = []
+    for i, opt in enumerate(poll.options):
+        text = getattr(opt, "text", None) or getattr(opt, "option", "") or f"Option {i + 1}"
+        options.append({"index": i, "text": str(text)})
+
+    return {
+        "chat_id": int(chat_id),
+        "message_id": int(poll_msg.id),
+        "poll_id": str(getattr(poll, "id", "") or ""),
+        "question": getattr(poll, "question", None),
+        "options": options,
+        "multiple_choice": bool(getattr(poll, "allows_multiple_answers", False)),
+    }
+
+
+async def vote_on_poll(
+    account_id: int,
+    api_id: int,
+    api_hash: str,
+    session_string: str,
+    chat_link: str,
+    chat_id: Optional[int],
+    message_id: int,
+    option_index: int,
+) -> None:
+    """Make one userbot vote for `option_index` on a poll (joins the chat first)."""
+    entry = await _ensure_online(account_id, api_id, api_hash, session_string)
+    client: Client = entry["client"]
+
+    # Ensure this userbot is a member so it is allowed to vote.
+    resolved = chat_id
+    try:
+        joined = await _resolve_and_join_chat(client, chat_link or str(chat_id))
+        resolved = joined or chat_id
+    except Exception:
+        resolved = chat_id
+
+    await client.vote_poll(resolved, int(message_id), int(option_index))
+
+
+async def retract_poll_vote(
+    account_id: int,
+    api_id: int,
+    api_hash: str,
+    session_string: str,
+    chat_link: str,
+    chat_id: Optional[int],
+    message_id: int,
+) -> None:
+    """
+    Remove this userbot's vote from a poll. Pyrogram's high-level vote_poll
+    cannot send an empty selection, so we use the raw messages.SendVote with no
+    options, which retracts the vote.
+    """
+    from pyrogram.raw.functions.messages import SendVote
+
+    entry = await _ensure_online(account_id, api_id, api_hash, session_string)
+    client: Client = entry["client"]
+
+    peer = await client.resolve_peer(chat_id if chat_id is not None else _normalize_link(chat_link))
+    await client.invoke(SendVote(peer=peer, msg_id=int(message_id), options=[]))

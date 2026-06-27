@@ -10,6 +10,10 @@ website uses, polls the `jobs` table, and executes each job:
   submit_login_code   -> finish userbot login (+2FA), store the session string
   join_livestream     -> join a chat's live stream (listen-only)
   leave_livestream    -> leave the live stream
+  view_post           -> view a channel post from every logged-in userbot
+  detect_poll         -> read the most recent poll in a channel
+  cast_vote           -> make one userbot vote on a poll option
+  retract_vote        -> make one userbot remove its vote from a poll
 
 Start it with:  python -m agent.worker      (from the LS_Python folder)
 """
@@ -197,6 +201,75 @@ async def handle_view_post(job: dict) -> dict:
     return {"stage": "viewed", "views": count, "message_id": message_id}
 
 
+async def handle_detect_poll(job: dict) -> dict:
+    """Read the channel's most recent poll and fill in the vote_target."""
+    target_id = job["payload"]["target_id"]
+    link = job["payload"]["poll_link"]
+    try:
+        info = await userbot.detect_recent_poll(link)
+    except Exception as e:
+        db.set_vote_target_error(target_id, str(e))
+        raise
+    db.set_vote_target_meta(
+        target_id,
+        chat_id=info["chat_id"],
+        message_id=info["message_id"],
+        poll_id=info["poll_id"],
+        question=info["question"],
+        options=info["options"],
+        multiple_choice=info["multiple_choice"],
+    )
+    return {"stage": "poll_detected", "options": len(info["options"])}
+
+
+async def handle_cast_vote(job: dict) -> dict:
+    """Make one userbot vote on a poll option."""
+    account_id = job["account_id"]
+    p = job["payload"]
+    target_id = p["target_id"]
+    acc = db.get_account(account_id)
+    try:
+        await userbot.vote_on_poll(
+            account_id,
+            int(acc["api_id"]),
+            acc["api_hash"],
+            acc["session_string"],
+            p.get("poll_link", ""),
+            int(p["chat_id"]) if p.get("chat_id") is not None else None,
+            int(p["message_id"]),
+            int(p["option_index"]),
+        )
+        db.set_vote_cast(target_id, account_id, "voted", None)
+    except Exception as e:
+        db.set_vote_cast(target_id, account_id, "failed", str(e)[:500])
+        raise
+    return {"stage": "voted", "target_id": target_id}
+
+
+async def handle_retract_vote(job: dict) -> dict:
+    """Make one userbot remove its vote; on success the cast row is deleted."""
+    account_id = job["account_id"]
+    p = job["payload"]
+    cast_id = p["cast_id"]
+    acc = db.get_account(account_id)
+    try:
+        await userbot.retract_poll_vote(
+            account_id,
+            int(acc["api_id"]),
+            acc["api_hash"],
+            acc["session_string"],
+            p.get("poll_link", ""),
+            int(p["chat_id"]) if p.get("chat_id") is not None else None,
+            int(p["message_id"]),
+        )
+        db.delete_vote_cast(cast_id)
+    except Exception as e:
+        # Keep the vote counted (revert to 'voted') and surface the error.
+        db.set_vote_cast_by_id(cast_id, "voted", str(e)[:500])
+        raise
+    return {"stage": "retracted", "cast_id": cast_id}
+
+
 HANDLERS = {
     "create_app": handle_create_app,
     "submit_mtproto_code": handle_submit_mtproto_code,
@@ -205,6 +278,9 @@ HANDLERS = {
     "join_livestream": handle_join_livestream,
     "leave_livestream": handle_leave_livestream,
     "view_post": handle_view_post,
+    "detect_poll": handle_detect_poll,
+    "cast_vote": handle_cast_vote,
+    "retract_vote": handle_retract_vote,
 }
 
 # Jobs that are part of the login / auth flow. ONLY these may flip an account
