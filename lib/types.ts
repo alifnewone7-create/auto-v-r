@@ -46,6 +46,9 @@ export type JobType =
   | "join_livestream" // join the live stream / video chat of a chat
   | "leave_livestream" // leave the live stream
   | "view_post" // view a channel post from every logged-in userbot
+  | "detect_poll" // read the most recent poll in a channel and fill in vote_targets
+  | "cast_vote" // make one userbot vote on a poll option
+  | "retract_vote" // make one userbot remove its vote from a poll
 
 export type JobStatus = "queued" | "processing" | "done" | "failed"
 
@@ -83,6 +86,46 @@ export interface Agent {
   last_seen: string
   active_accounts: number
   note: string | null
+}
+
+export interface PollOption {
+  index: number
+  text: string
+}
+
+export type VoteTargetStatus = "detecting" | "ready" | "failed"
+export type VoteCastStatus = "pending" | "voted" | "removing" | "failed"
+
+export interface VoteTarget {
+  id: number
+  poll_link: string
+  chat_id: number | null
+  message_id: number | null
+  poll_id: string | null
+  question: string | null
+  options: PollOption[]
+  multiple_choice: boolean
+  status: VoteTargetStatus
+  last_error: string | null
+  created_at: string
+  updated_at: string
+}
+
+// Per-option aggregate of how our userbots have voted, returned by the API.
+export interface VoteOptionTally {
+  index: number
+  text: string
+  pending: number
+  voted: number
+  failed: number
+  total: number // active casts (pending + voted) on this option
+}
+
+// A vote_targets row enriched with per-option tallies + availability counts.
+export interface VoteTargetRow extends VoteTarget {
+  tallies: VoteOptionTally[]
+  used_accounts: number // accounts with an active cast on this poll
+  available_accounts: number // logged-in userbots free to vote on this poll
 }
 
 export type ViewTargetStatus = "active" | "paused"

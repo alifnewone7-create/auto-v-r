@@ -124,6 +124,44 @@ CREATE TABLE IF NOT EXISTS view_targets (
 );
 
 CREATE INDEX IF NOT EXISTS view_targets_status_idx ON view_targets (status);
+
+-- Vote targets: a Telegram poll (in a public/private channel) we want to vote on
+-- The agent detects the most recent poll in the channel and fills in the
+-- question/options/poll_id/chat_id/message_id, then the panel casts votes.
+CREATE TABLE IF NOT EXISTS vote_targets (
+  id              SERIAL PRIMARY KEY,
+  poll_link       TEXT NOT NULL,
+  chat_id         BIGINT,
+  message_id      BIGINT,
+  poll_id         TEXT,
+  question        TEXT,
+  options         JSONB NOT NULL DEFAULT '[]'::jsonb,
+  multiple_choice BOOLEAN NOT NULL DEFAULT false,
+  status          TEXT NOT NULL DEFAULT 'detecting',
+  last_error      TEXT,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS vote_targets_status_idx ON vote_targets (status);
+
+-- One row per account per poll. Enforces "each userbot votes only once per
+-- poll" via the UNIQUE (target_id, account_id) constraint. Removing a vote
+-- deletes the row (or marks it 'removed'), freeing that account to be reused.
+CREATE TABLE IF NOT EXISTS vote_casts (
+  id           SERIAL PRIMARY KEY,
+  target_id    INTEGER NOT NULL REFERENCES vote_targets(id)     ON DELETE CASCADE,
+  account_id   INTEGER NOT NULL REFERENCES telegram_accounts(id) ON DELETE CASCADE,
+  option_index INTEGER NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'pending',
+  last_error   TEXT,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (target_id, account_id)
+);
+
+CREATE INDEX IF NOT EXISTS vote_casts_target_idx ON vote_casts (target_id);
+CREATE INDEX IF NOT EXISTS vote_casts_target_option_idx ON vote_casts (target_id, option_index);
 `
 
 // Runs the schema exactly once per process. The cached promise guarantees that
