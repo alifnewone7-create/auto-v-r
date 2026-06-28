@@ -162,6 +162,34 @@ CREATE TABLE IF NOT EXISTS vote_casts (
 
 CREATE INDEX IF NOT EXISTS vote_casts_target_idx ON vote_casts (target_id);
 CREATE INDEX IF NOT EXISTS vote_casts_target_option_idx ON vote_casts (target_id, option_index);
+
+-- Reaction targets: channels whose FUTURE posts get auto-reacted to by userbots.
+-- Each target stores the emoji set to react with and the pacing mode. The agent
+-- watches the channel (same future-only baseline as view_targets), and for every
+-- new post spreads the userbots' reactions over a time window so it looks human.
+--   mode: 'slow' | 'medium' | 'fast' | 'custom'
+--   custom_minutes: only used when mode = 'custom'; the exact window (>= 1 min)
+--   emojis: JSON array of emoji strings, e.g. ["👍","🔥","❤️"]
+CREATE TABLE IF NOT EXISTS reaction_targets (
+  id                   SERIAL PRIMARY KEY,
+  channel_link         TEXT NOT NULL UNIQUE,
+  chat_id              BIGINT,
+  title                TEXT,
+  emojis               JSONB NOT NULL DEFAULT '[]'::jsonb,
+  mode                 TEXT NOT NULL DEFAULT 'medium',
+  custom_minutes       INTEGER NOT NULL DEFAULT 5,
+  status               TEXT NOT NULL DEFAULT 'active',
+  last_seen_message_id BIGINT NOT NULL DEFAULT 0,
+  posts_reacted        INTEGER NOT NULL DEFAULT 0,
+  reactions_sent       INTEGER NOT NULL DEFAULT 0,
+  last_post_at         TIMESTAMPTZ,
+  last_checked_at      TIMESTAMPTZ,
+  last_error           TEXT,
+  created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS reaction_targets_status_idx ON reaction_targets (status);
 `
 
 // Runs the schema exactly once per process. The cached promise guarantees that

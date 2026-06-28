@@ -333,6 +333,109 @@ def delete_vote_cast(cast_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Reaction helpers (auto-react to future channel posts)
+# ---------------------------------------------------------------------------
+
+def get_active_reaction_targets() -> list[dict[str, Any]]:
+    """All channels currently being watched for auto-reacting."""
+    return query("SELECT * FROM reaction_targets WHERE status = 'active' ORDER BY id")
+
+
+def get_reaction_target_by_chat(chat_id: int) -> Optional[dict[str, Any]]:
+    return query_one("SELECT * FROM reaction_targets WHERE chat_id = %s", (chat_id,))
+
+
+def set_reaction_target_meta(target_id: int, chat_id: int, title: str | None) -> None:
+    """Store the resolved Telegram chat_id + title once we look the channel up."""
+    query(
+        "UPDATE reaction_targets SET chat_id = %s, title = COALESCE(%s, title), "
+        "last_checked_at = now(), last_error = NULL, updated_at = now() WHERE id = %s",
+        (chat_id, title, target_id),
+    )
+
+
+def init_reaction_baseline(target_id: int, latest_message_id: int) -> None:
+    """Set the future-only cutoff for a freshly added channel (reacts to nothing old)."""
+    query(
+        "UPDATE reaction_targets SET last_seen_message_id = %s, last_checked_at = now(), "
+        "updated_at = now() WHERE id = %s AND last_seen_message_id = 0",
+        (latest_message_id, target_id),
+    )
+
+
+def claim_reaction_advance(target_id: int, new_message_id: int) -> Optional[int]:
+    """
+    Atomically advance last_seen_message_id IF new_message_id is greater. Returns
+    the previous value when advanced (so the caller knows which posts are new),
+    or None if another path already handled this post. Keeps the live handler and
+    the polling fallback from double-reacting.
+    """
+    row = query_one(
+        """
+        WITH cur AS (
+            SELECT last_seen_message_id AS old FROM reaction_targets WHERE id = %s FOR UPDATE
+        )
+        UPDATE reaction_targets v
+        SET last_seen_message_id = %s, last_checked_at = now(), updated_at = now()
+        FROM cur
+        WHERE v.id = %s AND cur.old < %s
+        RETURNING cur.old AS old
+        """,
+        (target_id, new_message_id, target_id, new_message_id),
+    )
+    return row["old"] if row else None
+
+
+def bump_reaction_posts(target_id: int, posts: int) -> None:
+    query(
+        "UPDATE reaction_targets SET posts_reacted = posts_reacted + %s, last_post_at = now(), "
+        "updated_at = now() WHERE id = %s",
+        (posts, target_id),
+    )
+
+
+def bump_reaction_sent(target_id: int, reactions: int) -> None:
+    query(
+        "UPDATE reaction_targets SET reactions_sent = reactions_sent + %s, updated_at = now() WHERE id = %s",
+        (reactions, target_id),
+    )
+
+
+def set_reaction_target_error(target_id: int, error: str | None) -> None:
+    query(
+        "UPDATE reaction_targets SET last_error = %s, last_checked_at = now(), updated_at = now() WHERE id = %s",
+        (error, target_id),
+    )
+
+
+def enqueue_reaction_job(
+    chat_id: int,
+    message_id: int,
+    target_id: int,
+    emojis: list[str],
+    mode: str,
+    custom_minutes: int,
+) -> None:
+    """Queue a single react_post job (fans out to all userbots inside the agent)."""
+    query(
+        "INSERT INTO jobs (type, account_id, payload, status) "
+        "VALUES ('react_post', NULL, %s::jsonb, 'queued')",
+        (
+            json.dumps(
+                {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "target_id": target_id,
+                    "emojis": emojis,
+                    "mode": mode,
+                    "custom_minutes": custom_minutes,
+                }
+            ),
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Agent heartbeat
 # ---------------------------------------------------------------------------
 

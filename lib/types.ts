@@ -145,3 +145,27 @@ export interface ViewTarget {
   created_at: string
   updated_at: string
 }
+
+// Pacing presets for auto-reactions. 'custom' uses custom_minutes as the exact
+// window in which all userbots finish reacting.
+export type ReactionMode = "slow" | "medium" | "fast" | "custom"
+export type ReactionTargetStatus = "active" | "paused"
+
+export interface ReactionTarget {
+  id: number
+  channel_link: string
+  chat_id: number | null
+  title: string | null
+  emojis: string[]
+  mode: ReactionMode
+  custom_minutes: number
+  status: ReactionTargetStatus
+  last_seen_message_id: number
+  posts_reacted: number
+  reactions_sent: number
+  last_post_at: string | null
+  last_checked_at: string | null
+  last_error: string | null
+  created_at: string
+  updated_at: string
+}

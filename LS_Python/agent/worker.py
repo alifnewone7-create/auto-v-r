@@ -14,6 +14,7 @@ website uses, polls the `jobs` table, and executes each job:
   detect_poll         -> read the most recent poll in a channel
   cast_vote           -> make one userbot vote on a poll option
   retract_vote        -> make one userbot remove its vote from a poll
+  react_post          -> react to a channel post from all userbots, time-spread
 
 Start it with:  python -m agent.worker      (from the LS_Python folder)
 """
@@ -270,6 +271,39 @@ async def handle_retract_vote(job: dict) -> dict:
     return {"stage": "retracted", "cast_id": cast_id}
 
 
+# Reaction pacing windows (seconds) for the non-custom presets. The userbots
+# spread their reactions randomly across the window so it looks human.
+REACTION_WINDOWS = {
+    "fast": 30.0,
+    "medium": 180.0,
+    "slow": 600.0,
+}
+
+
+async def handle_react_post(job: dict) -> dict:
+    """
+    React to a single channel post from EVERY warm userbot, staggered over a
+    time window. One of these jobs is queued per new post on a watched channel.
+    """
+    p = job["payload"]
+    chat_id = int(p["chat_id"])
+    message_id = int(p["message_id"])
+    target_id = p.get("target_id")
+    emojis = p.get("emojis") or []
+    mode = p.get("mode", "medium")
+
+    if mode == "custom":
+        # Exact window the user asked for (minimum 1 minute).
+        window = max(1, int(p.get("custom_minutes", 1))) * 60.0
+    else:
+        window = REACTION_WINDOWS.get(mode, REACTION_WINDOWS["medium"])
+
+    count = await userbot.react_post_scheduled(chat_id, message_id, emojis, window)
+    if target_id:
+        db.bump_reaction_sent(int(target_id), count)
+    return {"stage": "reacted", "reactions": count, "message_id": message_id}
+
+
 HANDLERS = {
     "create_app": handle_create_app,
     "submit_mtproto_code": handle_submit_mtproto_code,
@@ -281,6 +315,7 @@ HANDLERS = {
     "detect_poll": handle_detect_poll,
     "cast_vote": handle_cast_vote,
     "retract_vote": handle_retract_vote,
+    "react_post": handle_react_post,
 }
 
 # Jobs that are part of the login / auth flow. ONLY these may flip an account
@@ -398,6 +433,73 @@ async def poll_view_targets() -> None:
             print(f"[!] view poll failed for target {t['id']}: {e}")
 
 
+async def dispatch_reactions_for_target(target: dict, chat_id: int, latest_id: int) -> None:
+    """
+    Atomically claim the new post range for a reaction target and queue one
+    react_post job per new post. Mirrors the Live View dispatch so the live
+    handler and polling fallback never double-react.
+    """
+    old = db.claim_reaction_advance(target["id"], latest_id)
+    if old is None:
+        return  # already handled by the other detection path
+    start = max(int(old) + 1, latest_id - VIEW_MAX_BACKFILL + 1)
+    post_ids = list(range(start, latest_id + 1))
+    if not post_ids:
+        return
+
+    emojis = target.get("emojis") or []
+    if isinstance(emojis, str):  # safety: in case the driver returns raw JSON text
+        import json as _json
+        emojis = _json.loads(emojis)
+    mode = target.get("mode", "medium")
+    custom_minutes = int(target.get("custom_minutes", 5) or 5)
+
+    for mid in post_ids:
+        db.enqueue_reaction_job(chat_id, mid, target["id"], emojis, mode, custom_minutes)
+    db.bump_reaction_posts(target["id"], len(post_ids))
+    print(f"[react] target {target['id']}: queued {len(post_ids)} new post(s) up to #{latest_id}")
+
+
+async def live_reaction_dispatch(chat_id: int, message_id: int) -> None:
+    """Live-handler callback: a watched (reaction) channel just got a new post."""
+    target = db.get_reaction_target_by_chat(chat_id)
+    if not target or target["status"] != "active" or target["last_seen_message_id"] == 0:
+        return
+    await dispatch_reactions_for_target(target, chat_id, message_id)
+
+
+async def poll_reaction_targets() -> None:
+    """
+    Fallback detector for reaction channels: resolve chat_id/title on first sight,
+    set the future-only baseline, then queue reactions for any new posts.
+    """
+    try:
+        targets = db.get_active_reaction_targets()
+    except Exception as e:
+        print(f"[!] reaction targets query failed: {e}")
+        return
+
+    for t in targets:
+        try:
+            ref = t["chat_id"] if t["chat_id"] is not None else t["channel_link"]
+            chat_id, title, latest = await userbot.resolve_channel_latest(ref)
+
+            if t["chat_id"] is None or not t["title"]:
+                db.set_reaction_target_meta(t["id"], chat_id, title)
+
+            if t["last_seen_message_id"] == 0:
+                db.init_reaction_baseline(t["id"], latest)
+                continue
+
+            t = {**t, "chat_id": chat_id}
+            await dispatch_reactions_for_target(t, chat_id, latest)
+        except userbot.UserbotError:
+            return  # no warm userbots yet
+        except Exception as e:
+            db.set_reaction_target_error(t["id"], str(e)[:500])
+            print(f"[!] reaction poll failed for target {t['id']}: {e}")
+
+
 async def main() -> None:
     print(f"[i] Iamhear agent '{AGENT_ID}' starting on {HOSTNAME}")
     print(f"[i] Polling every {POLL_SECONDS}s. Press Ctrl+C to stop.\n")
@@ -407,9 +509,10 @@ async def main() -> None:
 
     # Live-detect new posts on channels our userbots are members of.
     userbot.set_view_dispatch(live_view_dispatch)
+    userbot.set_reaction_dispatch(live_reaction_dispatch)
     attached = userbot.attach_view_handlers()
     if attached:
-        print(f"[i] Live View handlers attached to {attached} userbot(s).")
+        print(f"[i] Live View + Reaction handlers attached to {attached} userbot(s).")
 
     last_beat = 0.0
     last_view_poll = 0.0
@@ -429,6 +532,7 @@ async def main() -> None:
         # Watch channels for new posts (live handler is primary; this is fallback).
         if now - last_view_poll > VIEW_POLL_SECONDS:
             await poll_view_targets()
+            await poll_reaction_targets()
             last_view_poll = now
 
         try:

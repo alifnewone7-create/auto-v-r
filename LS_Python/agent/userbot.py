@@ -314,12 +314,20 @@ def _normalize_link(chat_link: str) -> str:
 
 # Set by the worker. Called as: await _VIEW_DISPATCH(chat_id, message_id)
 _VIEW_DISPATCH = None
+# Set by the worker. Called as: await _REACTION_DISPATCH(chat_id, message_id)
+_REACTION_DISPATCH = None
 
 
 def set_view_dispatch(callback) -> None:
     """Register the worker callback that turns a detected post into view jobs."""
     global _VIEW_DISPATCH
     _VIEW_DISPATCH = callback
+
+
+def set_reaction_dispatch(callback) -> None:
+    """Register the worker callback that turns a detected post into reaction jobs."""
+    global _REACTION_DISPATCH
+    _REACTION_DISPATCH = callback
 
 
 def _first_client() -> Optional[Client]:
@@ -380,15 +388,19 @@ async def view_post_all(chat_id: int, message_id: int) -> int:
 
 async def _on_channel_post(client: Client, message) -> None:
     """Live handler: a new post arrived in a channel this userbot is in."""
-    if _VIEW_DISPATCH is None:
+    chat = getattr(message, "chat", None)
+    if chat is None:
         return
-    try:
-        chat = getattr(message, "chat", None)
-        if chat is None:
-            return
-        await _VIEW_DISPATCH(chat.id, message.id)
-    except Exception as e:
-        print(f"[!] live view dispatch failed: {e}")
+    if _VIEW_DISPATCH is not None:
+        try:
+            await _VIEW_DISPATCH(chat.id, message.id)
+        except Exception as e:
+            print(f"[!] live view dispatch failed: {e}")
+    if _REACTION_DISPATCH is not None:
+        try:
+            await _REACTION_DISPATCH(chat.id, message.id)
+        except Exception as e:
+            print(f"[!] live reaction dispatch failed: {e}")
 
 
 def attach_view_handlers() -> int:
@@ -518,3 +530,58 @@ async def retract_poll_vote(
 
     peer = await client.resolve_peer(chat_id if chat_id is not None else _normalize_link(chat_link))
     await client.invoke(SendVote(peer=peer, msg_id=int(message_id), options=[]))
+
+
+# ===========================================================================
+# Reactions: react to a post from many userbots, spread over a time window so
+# it looks like real users reacting one by one.
+# ===========================================================================
+
+import random  # noqa: E402  (local to the reaction feature)
+
+
+async def _react_once(client: Client, chat_id: int, message_id: int, emojis: list[str]) -> bool:
+    """
+    Make ONE userbot react with a random emoji from `emojis`. If the channel does
+    not allow that emoji on this post, quietly try the next one. If none are
+    allowed, skip without raising (returns False). Returns True on success.
+    """
+    for emoji in random.sample(emojis, len(emojis)):
+        try:
+            await client.send_reaction(chat_id, int(message_id), emoji=emoji)
+            return True
+        except Exception:
+            # ReactionInvalid / not allowed / transient -> try the next emoji.
+            continue
+    return False
+
+
+async def react_post_scheduled(
+    chat_id: int,
+    message_id: int,
+    emojis: list[str],
+    window_seconds: float,
+) -> int:
+    """
+    React to a single post from EVERY warm userbot, but stagger each userbot's
+    reaction at a random offset inside [0, window_seconds] so the reactions don't
+    all land at once. All reactions are guaranteed to complete within the window.
+
+    Returns how many userbots successfully reacted (emojis the channel rejects
+    are skipped, so the count can be lower than the number of userbots).
+    """
+    clients = [entry["client"] for entry in _POOL.values()]
+    if not clients or not emojis:
+        return 0
+
+    window = max(0.0, float(window_seconds))
+    # Keep the very last reactions just inside the window, never after it.
+    span = window * 0.97
+
+    async def _scheduled(client: Client) -> bool:
+        if span > 0:
+            await asyncio.sleep(random.uniform(0, span))
+        return await _react_once(client, chat_id, message_id, emojis)
+
+    results = await asyncio.gather(*(_scheduled(c) for c in clients))
+    return sum(1 for ok in results if ok)

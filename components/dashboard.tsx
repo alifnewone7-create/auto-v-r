@@ -1,6 +1,6 @@
 "use client"
 
-import { Radio, Users, LogOut, Eye, Vote } from "lucide-react"
+import { Radio, Users, LogOut, Eye, Vote, Smile } from "lucide-react"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Button } from "@/components/ui/button"
 import { logoutAction } from "@/app/actions/auth"
@@ -9,6 +9,7 @@ import { AccountsSection } from "@/components/accounts-section"
 import { LivestreamSection } from "@/components/livestream-section"
 import { ViewTargetsSection } from "@/components/view-targets-section"
 import { VoteSection } from "@/components/vote-section"
+import { ReactionsSection } from "@/components/reactions-section"
 
 export function Dashboard() {
   return (
@@ -54,6 +55,10 @@ export function Dashboard() {
               <Vote className="size-4" />
               Vote
             </TabsTrigger>
+            <TabsTrigger value="reactions" className="gap-2">
+              <Smile className="size-4" />
+              Reactions
+            </TabsTrigger>
           </TabsList>
 
           <TabsContent value="accounts" className="mt-6">
@@ -67,6 +72,9 @@ export function Dashboard() {
           </TabsContent>
           <TabsContent value="vote" className="mt-6">
             <VoteSection />
+          </TabsContent>
+          <TabsContent value="reactions" className="mt-6">
+            <ReactionsSection />
           </TabsContent>
         </Tabs>
       </main>
