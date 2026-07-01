@@ -51,6 +51,9 @@ VIEW_POLL_SECONDS = float(os.environ.get("AGENT_VIEW_POLL_SECONDS", "5"))
 # Safety cap: never enqueue more than this many posts at once from one detection
 # (prevents a huge backfill if last_seen somehow falls far behind).
 VIEW_MAX_BACKFILL = int(os.environ.get("AGENT_VIEW_MAX_BACKFILL", "30"))
+# Views are trickled in over this window (front-loaded, uneven gaps) instead of
+# firing all at once, so a post's view count climbs like real viewers arriving.
+VIEW_SPREAD_SECONDS = float(os.environ.get("AGENT_VIEW_SPREAD_SECONDS", "45"))
 AGENT_ID = os.environ.get("AGENT_ID") or f"agent-{uuid.uuid4().hex[:8]}"
 HOSTNAME = socket.gethostname()
 
@@ -196,7 +199,7 @@ async def handle_view_post(job: dict) -> dict:
     message_id = int(payload["message_id"])
     target_id = payload.get("target_id")
 
-    count = await userbot.view_post_all(chat_id, message_id)
+    count = await userbot.view_post_all(chat_id, message_id, VIEW_SPREAD_SECONDS)
     if target_id:
         db.bump_view_sent(int(target_id), count)
     return {"stage": "viewed", "views": count, "message_id": message_id}
@@ -271,12 +274,14 @@ async def handle_retract_vote(job: dict) -> dict:
     return {"stage": "retracted", "cast_id": cast_id}
 
 
-# Reaction pacing windows (seconds) for the non-custom presets. The userbots
-# spread their reactions randomly across the window so it looks human.
+# Reaction pacing windows (seconds) for the non-custom presets. Reactions are
+# front-loaded inside the window (a quick burst after the post, then a tail), so
+# the FIRST reactions always land within a few seconds - these are the full
+# spread, not the delay before the first one. Override via env if you want.
 REACTION_WINDOWS = {
-    "fast": 30.0,
-    "medium": 180.0,
-    "slow": 600.0,
+    "fast": float(os.environ.get("AGENT_REACT_FAST_SECONDS", "30")),
+    "medium": float(os.environ.get("AGENT_REACT_MEDIUM_SECONDS", "120")),
+    "slow": float(os.environ.get("AGENT_REACT_SLOW_SECONDS", "360")),
 }
 
 
@@ -514,6 +519,11 @@ async def main() -> None:
     if attached:
         print(f"[i] Live View + Reaction handlers attached to {attached} userbot(s).")
 
+    # Keep references to in-flight jobs so they aren't garbage-collected. Some
+    # jobs (staggered views/reactions) intentionally stay alive for their whole
+    # window, so we must NOT block the loop waiting for them.
+    background: set[asyncio.Task] = set()
+
     last_beat = 0.0
     last_view_poll = 0.0
     while True:
@@ -546,11 +556,16 @@ async def main() -> None:
             await asyncio.sleep(POLL_SECONDS)
             continue
 
-        print(f"[>] Got {len(jobs)} job(s); processing concurrently.")
-        # Run the whole batch at once. These are network-bound (Telegram) jobs,
-        # so asyncio handles many in parallel; total time ~= the slowest job,
-        # not the sum. This is what turns minutes of joins into seconds.
-        await asyncio.gather(*(process_one(job) for job in jobs))
+        print(f"[>] Got {len(jobs)} job(s); dispatching concurrently.")
+        # Fire each job as its own background task so the loop keeps polling and
+        # heartbeating. This lets long, time-spread reaction jobs run in parallel
+        # with views (and everything else) - so on a channel with BOTH enabled,
+        # views and reactions trickle in together instead of one burst then the
+        # other. Jobs are already claimed in the DB, so they won't be re-run.
+        for job in jobs:
+            task = asyncio.create_task(process_one(job))
+            background.add(task)
+            task.add_done_callback(background.discard)
 
 
 if __name__ == "__main__":

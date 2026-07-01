@@ -17,6 +17,7 @@ it can join multiple live streams without re-logging-in.
 from __future__ import annotations
 
 import asyncio
+import random
 from typing import Optional
 
 from pyrogram import Client, filters
@@ -362,16 +363,48 @@ async def resolve_channel_latest(link_or_chat_id) -> tuple[int, str, int]:
     return chat.id, title, latest
 
 
-async def view_post_all(chat_id: int, message_id: int) -> int:
+def _natural_arrival_offsets(n: int, window_seconds: float, *, front_load: bool = True) -> list[float]:
     """
-    Increment the view count of a post from EVERY warm userbot concurrently.
+    Return `n` arrival offsets in seconds (sorted) spread across [0, window] the
+    way real people trickle in rather than all at once:
+
+      * uneven gaps - some arrivals bunch together, some have longer pauses,
+        because we draw random points and sort them (never a robotic even cadence).
+      * front-loaded - when front_load is set, most arrivals happen soon after
+        the post with a thinning tail toward the end of the window, which is how
+        real reactions/views on a fresh post actually behave.
+
+    Every offset is <= window, so all actions finish inside the window (this is
+    what makes 'custom = exactly N minutes' hold: the last one lands within N min).
+    """
+    if n <= 0:
+        return []
+    window = max(0.0, float(window_seconds))
+    if window == 0.0:
+        return [0.0] * n
+    pts = sorted(random.random() for _ in range(n))
+    if front_load:
+        # p in [0,1]; p**1.7 < p, so mass shifts earlier, leaving a natural tail.
+        pts = [p ** 1.7 for p in pts]
+    return [round(p * window, 3) for p in pts]
+
+
+async def view_post_all(chat_id: int, message_id: int, spread_seconds: float = 0.0) -> int:
+    """
+    Increment the view count of a post from EVERY warm userbot, but trickle the
+    views in over `spread_seconds` (front-loaded, uneven gaps) so they look like
+    real viewers arriving one after another instead of a single instant spike.
     Returns how many userbots successfully registered a view.
     """
     clients = [entry["client"] for entry in _POOL.values()]
     if not clients:
         return 0
 
-    async def _one(client: Client) -> bool:
+    offsets = _natural_arrival_offsets(len(clients), spread_seconds)
+
+    async def _one(client: Client, delay: float) -> bool:
+        if delay > 0:
+            await asyncio.sleep(delay)
         try:
             peer = await client.resolve_peer(chat_id)
             await client.invoke(
@@ -382,7 +415,7 @@ async def view_post_all(chat_id: int, message_id: int) -> int:
             print(f"[!] view failed (msg {message_id}): {e.__class__.__name__}: {e}")
             return False
 
-    results = await asyncio.gather(*(_one(c) for c in clients))
+    results = await asyncio.gather(*(_one(c, d) for c, d in zip(clients, offsets)))
     return sum(1 for ok in results if ok)
 
 
@@ -537,9 +570,6 @@ async def retract_poll_vote(
 # it looks like real users reacting one by one.
 # ===========================================================================
 
-import random  # noqa: E402  (local to the reaction feature)
-
-
 async def _react_once(client: Client, chat_id: int, message_id: int, emojis: list[str]) -> bool:
     """
     Make ONE userbot react with a random emoji from `emojis`. If the channel does
@@ -574,14 +604,14 @@ async def react_post_scheduled(
     if not clients or not emojis:
         return 0
 
-    window = max(0.0, float(window_seconds))
-    # Keep the very last reactions just inside the window, never after it.
-    span = window * 0.97
+    # Front-loaded, uneven arrival times inside the window: a burst of early
+    # reactions right after the post, then a thinning tail - just like real users.
+    offsets = _natural_arrival_offsets(len(clients), window_seconds)
 
-    async def _scheduled(client: Client) -> bool:
-        if span > 0:
-            await asyncio.sleep(random.uniform(0, span))
+    async def _scheduled(client: Client, delay: float) -> bool:
+        if delay > 0:
+            await asyncio.sleep(delay)
         return await _react_once(client, chat_id, message_id, emojis)
 
-    results = await asyncio.gather(*(_scheduled(c) for c in clients))
+    results = await asyncio.gather(*(_scheduled(c, d) for c, d in zip(clients, offsets)))
     return sum(1 for ok in results if ok)
