@@ -313,9 +313,12 @@ async def handle_react_post(job: dict) -> dict:
 async def handle_update_profile(job: dict) -> dict:
     """
     Change one account's name / username / profile photo. The website queues one
-    of these per selected account (with a shared photo asset id). We write the
-    result back to the matching profile_updates row so the UI shows per-account
-    progress, and we mirror the new name onto telegram_accounts.label for display.
+    of these per selected account. When several photos are uploaded the website
+    picks a RANDOM one per account, so each job carries its own photo_asset_id
+    (a single upload means every job shares the same id). We just fetch whatever
+    asset id this job references. We write the result back to the matching
+    profile_updates row so the UI shows per-account progress, and we mirror the
+    new name onto telegram_accounts.label for display.
     """
     account_id = job["account_id"]
     p = job["payload"]
