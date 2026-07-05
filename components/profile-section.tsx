@@ -26,6 +26,38 @@ const STATUS_META: Record<
   failed: { label: "Failed", className: "bg-destructive/15 text-destructive border-transparent", icon: AlertCircle },
 }
 
+// Load a file into an <img>, draw it onto a square-capped canvas, and export a
+// compressed JPEG data URL. Keeps profile photos small enough for the Server
+// Action body limit while staying sharp at Telegram's display sizes.
+function compressImage(file: File, maxSize: number, quality: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file)
+    const img = new Image()
+    img.crossOrigin = "anonymous"
+    img.onload = () => {
+      URL.revokeObjectURL(url)
+      const scale = Math.min(1, maxSize / Math.max(img.width, img.height))
+      const w = Math.round(img.width * scale)
+      const h = Math.round(img.height * scale)
+      const canvas = document.createElement("canvas")
+      canvas.width = w
+      canvas.height = h
+      const ctx = canvas.getContext("2d")
+      if (!ctx) {
+        reject(new Error("no canvas context"))
+        return
+      }
+      ctx.drawImage(img, 0, 0, w, h)
+      resolve(canvas.toDataURL("image/jpeg", quality))
+    }
+    img.onerror = () => {
+      URL.revokeObjectURL(url)
+      reject(new Error("image load failed"))
+    }
+    img.src = url
+  })
+}
+
 export function ProfileSection() {
   const { data, mutate } = useSWR<{ accounts: ProfileAccountRow[] }>("/api/profile-accounts", fetcher, {
     refreshInterval: 3000,
@@ -56,20 +88,26 @@ export function ProfileSection() {
     setSelected((prev) => (prev.size === accounts.length ? new Set() : new Set(accounts.map((a) => a.id))))
   }
 
-  function onPickPhoto(e: React.ChangeEvent<HTMLInputElement>) {
+  async function onPickPhoto(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
     if (!file) return
     if (!/^image\/(jpeg|jpg|png|webp)$/i.test(file.type)) {
       toast.error("Please choose a JPEG, PNG, or WebP image.")
       return
     }
-    if (file.size > 5 * 1024 * 1024) {
-      toast.error("Image is too large. Use one under 5MB.")
+    if (file.size > 15 * 1024 * 1024) {
+      toast.error("Image is too large. Use one under 15MB.")
       return
     }
-    const reader = new FileReader()
-    reader.onload = () => setPhotoDataUrl(String(reader.result))
-    reader.readAsDataURL(file)
+    try {
+      // Downscale + re-encode as JPEG on the client. Telegram profile photos are
+      // shown small, so 640px is plenty, and this keeps the payload well under
+      // the 1MB Server Action body limit that caused the previous server error.
+      const dataUrl = await compressImage(file, 640, 0.85)
+      setPhotoDataUrl(dataUrl)
+    } catch {
+      toast.error("Could not read that image. Try a different file.")
+    }
   }
 
   function clearPhoto() {
@@ -186,7 +224,7 @@ export function ProfileSection() {
                     </Button>
                   ) : null}
                 </div>
-                <p className="text-xs text-muted-foreground">JPEG, PNG or WebP, up to 5MB. Same photo for all selected.</p>
+                <p className="text-xs text-muted-foreground">JPEG, PNG or WebP. Auto-resized. Same photo for all selected.</p>
               </div>
               <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={onPickPhoto} />
             </div>
