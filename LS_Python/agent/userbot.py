@@ -656,6 +656,31 @@ def _username_candidates(base: str) -> list[str]:
     return candidates
 
 
+async def _flood_retry(make_coro, *, what: str, attempts: int = 3, max_wait: int = 300):
+    """
+    Run a Telegram call, transparently waiting out FloodWait rate limits.
+
+    `make_coro` is a zero-arg callable that returns a FRESH awaitable each time, so
+    we can re-issue the request after sleeping. On FloodWait we sleep the exact
+    number of seconds Telegram asks for (plus a small random buffer) and retry, up
+    to `attempts` times. If the demanded wait is absurdly long (> max_wait) or we
+    run out of attempts, we raise a friendly UserbotError so the job is marked
+    failed instead of hanging forever.
+    """
+    from pyrogram.errors import FloodWait
+
+    for i in range(attempts):
+        try:
+            return await make_coro()
+        except FloodWait as e:
+            wait = int(getattr(e, "value", 0) or 0)
+            if wait > max_wait or i == attempts - 1:
+                raise UserbotError(f"Rate limited by Telegram on {what}, retry in {wait}s.")
+            print(f"[flood] {what}: waiting {wait}s then retrying ({i + 1}/{attempts - 1})...")
+            await asyncio.sleep(wait + random.uniform(1.0, 3.0))
+    raise UserbotError(f"Rate limited by Telegram on {what}.")
+
+
 async def update_profile(
     account_id: int,
     api_id: int,
@@ -687,7 +712,6 @@ async def update_profile(
         UsernameOccupied,
         UsernameInvalid,
         UsernameNotModified,
-        FloodWait,
         BadRequest,
     )
 
@@ -704,7 +728,10 @@ async def update_profile(
         # An empty last name is intentional (list entry had no surname), so only
         # keep the existing surname when last_name was not supplied at all.
         new_last = last_name.strip() if last_name is not None else (me.last_name or "")
-        await client.update_profile(first_name=new_first, last_name=new_last)
+        await _flood_retry(
+            lambda: client.update_profile(first_name=new_first, last_name=new_last),
+            what="name update",
+        )
         changed.append("name")
 
     # --- username ---
@@ -714,7 +741,7 @@ async def update_profile(
         last_err: Optional[str] = None
         for cand in candidates:
             try:
-                await client.set_username(cand)
+                await _flood_retry(lambda c=cand: client.set_username(c), what="setting username")
                 final_username = cand
                 changed.append("username")
                 break
@@ -726,8 +753,6 @@ async def update_profile(
                 # Already taken / not a valid handle -> just try the next one.
                 last_err = cand
                 continue
-            except FloodWait as e:
-                raise UserbotError(f"Rate limited by Telegram, retry in {e.value}s.")
             except BadRequest as e:
                 # Covers USERNAME_PURCHASE_AVAILABLE (reserved for sale on
                 # fragment.com) and any other "can't use this handle" 400s.
@@ -741,7 +766,7 @@ async def update_profile(
     elif username and username.strip():
         uname = username.strip().lstrip("@")
         try:
-            await client.set_username(uname)
+            await _flood_retry(lambda: client.set_username(uname), what=f"setting @{uname}")
             final_username = uname
             changed.append("username")
         except UsernameNotModified:
@@ -751,8 +776,6 @@ async def update_profile(
             raise UserbotError(f"Username @{uname} is already taken.")
         except UsernameInvalid:
             raise UserbotError(f"Username @{uname} is invalid.")
-        except FloodWait as e:
-            raise UserbotError(f"Rate limited by Telegram, retry in {e.value}s.")
         except BadRequest as e:
             # e.g. USERNAME_PURCHASE_AVAILABLE (reserved for sale on fragment.com).
             if "PURCHASE_AVAILABLE" in str(e):
@@ -765,10 +788,12 @@ async def update_profile(
     if photo_bytes:
         bio = io.BytesIO(photo_bytes)
         bio.name = "profile.jpg"
-        try:
-            await client.set_profile_photo(photo=bio)
-            changed.append("photo")
-        except FloodWait as e:
-            raise UserbotError(f"Rate limited by Telegram, retry in {e.value}s.")
+
+        def _do_photo():
+            bio.seek(0)  # rewind so a retry after FloodWait re-reads the full image
+            return client.set_profile_photo(photo=bio)
+
+        await _flood_retry(_do_photo, what="photo update")
+        changed.append("photo")
 
     return {"changed": changed, "username": final_username}

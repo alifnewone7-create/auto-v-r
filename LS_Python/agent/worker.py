@@ -31,6 +31,7 @@ except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
 import os
+import random
 import socket
 import time
 import uuid
@@ -57,6 +58,24 @@ VIEW_MAX_BACKFILL = int(os.environ.get("AGENT_VIEW_MAX_BACKFILL", "30"))
 VIEW_SPREAD_SECONDS = float(os.environ.get("AGENT_VIEW_SPREAD_SECONDS", "45"))
 AGENT_ID = os.environ.get("AGENT_ID") or f"agent-{uuid.uuid4().hex[:8]}"
 HOSTNAME = socket.gethostname()
+
+# Profile edits (name/username/photo) hit STRICT Telegram rate limits, so unlike
+# other jobs we must not fire a whole batch at once. We run at most
+# PROFILE_MAX_CONCURRENCY profile jobs at a time and pause PROFILE_JOB_DELAY_SECONDS
+# (plus jitter) between them, turning a flood-triggering burst into a steady
+# trickle. Raise concurrency / lower delay only if you stop seeing FloodWaits.
+PROFILE_MAX_CONCURRENCY = int(os.environ.get("AGENT_PROFILE_CONCURRENCY", "1"))
+PROFILE_JOB_DELAY_SECONDS = float(os.environ.get("AGENT_PROFILE_DELAY_SECONDS", "4"))
+
+# Created lazily inside the running event loop (see _get_profile_sem).
+_profile_sem: asyncio.Semaphore | None = None
+
+
+def _get_profile_sem() -> asyncio.Semaphore:
+    global _profile_sem
+    if _profile_sem is None:
+        _profile_sem = asyncio.Semaphore(max(1, PROFILE_MAX_CONCURRENCY))
+    return _profile_sem
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +330,21 @@ async def handle_react_post(job: dict) -> dict:
 
 
 async def handle_update_profile(job: dict) -> dict:
+    """
+    Throttled entry point for profile jobs. Telegram rate-limits name/username/
+    photo changes hard, so we serialize them through a semaphore and pause between
+    each one (see PROFILE_* config) instead of firing the whole batch at once,
+    which is what triggers the "Rate limited by Telegram" FloodWaits.
+    """
+    async with _get_profile_sem():
+        try:
+            return await _run_update_profile(job)
+        finally:
+            # Pause before releasing so the NEXT profile job starts spaced out.
+            await asyncio.sleep(PROFILE_JOB_DELAY_SECONDS + random.uniform(0.0, 1.5))
+
+
+async def _run_update_profile(job: dict) -> dict:
     """
     Change one account's name / username / profile photo. The website queues one
     of these per selected account. When several photos are uploaded the website
