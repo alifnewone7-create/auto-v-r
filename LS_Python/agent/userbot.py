@@ -45,6 +45,19 @@ class NoActiveLivestream(UserbotError):
     """Raised when the chat has no live stream / video chat running to join."""
 
 
+class FloodWaitError(UserbotError):
+    """
+    Raised when Telegram rate-limits a call and the required wait is too long to
+    sit through inline. Carries `.seconds` so the worker can RESCHEDULE the job
+    to run later (durable retry) instead of failing it permanently.
+    """
+
+    def __init__(self, seconds: int, what: str = "request"):
+        self.seconds = int(seconds)
+        self.what = what
+        super().__init__(f"Rate limited by Telegram on {what}, retry in {self.seconds}s.")
+
+
 # In-memory pool of live userbots, keyed by account_id.
 # { account_id: {"client": Client, "calls": PyTgCalls} }
 _POOL: dict[int, dict] = {}
@@ -656,16 +669,19 @@ def _username_candidates(base: str) -> list[str]:
     return candidates
 
 
-async def _flood_retry(make_coro, *, what: str, attempts: int = 3, max_wait: int = 300):
+async def _flood_retry(make_coro, *, what: str, attempts: int = 3, inline_max: int = 30):
     """
-    Run a Telegram call, transparently waiting out FloodWait rate limits.
+    Run a Telegram call, handling FloodWait rate limits gracefully.
 
-    `make_coro` is a zero-arg callable that returns a FRESH awaitable each time, so
-    we can re-issue the request after sleeping. On FloodWait we sleep the exact
-    number of seconds Telegram asks for (plus a small random buffer) and retry, up
-    to `attempts` times. If the demanded wait is absurdly long (> max_wait) or we
-    run out of attempts, we raise a friendly UserbotError so the job is marked
-    failed instead of hanging forever.
+    `make_coro` is a zero-arg callable that returns a FRESH awaitable each time so
+    we can re-issue the request after sleeping.
+
+    Strategy tuned for bulk (500+ account) runs:
+      - SHORT floods (<= inline_max seconds): sleep it out and retry inline, up to
+        `attempts` times. Cheap, avoids queue churn.
+      - LONG floods (> inline_max): raise FloodWaitError carrying the wait so the
+        worker RESCHEDULES the whole job to run later, freeing this slot to make
+        progress on other accounts instead of blocking for minutes.
     """
     from pyrogram.errors import FloodWait
 
@@ -674,11 +690,11 @@ async def _flood_retry(make_coro, *, what: str, attempts: int = 3, max_wait: int
             return await make_coro()
         except FloodWait as e:
             wait = int(getattr(e, "value", 0) or 0)
-            if wait > max_wait or i == attempts - 1:
-                raise UserbotError(f"Rate limited by Telegram on {what}, retry in {wait}s.")
+            if wait > inline_max or i == attempts - 1:
+                raise FloodWaitError(wait, what)
             print(f"[flood] {what}: waiting {wait}s then retrying ({i + 1}/{attempts - 1})...")
             await asyncio.sleep(wait + random.uniform(1.0, 3.0))
-    raise UserbotError(f"Rate limited by Telegram on {what}.")
+    raise FloodWaitError(0, what)
 
 
 async def update_profile(

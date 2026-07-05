@@ -67,6 +67,11 @@ HOSTNAME = socket.gethostname()
 PROFILE_MAX_CONCURRENCY = int(os.environ.get("AGENT_PROFILE_CONCURRENCY", "1"))
 PROFILE_JOB_DELAY_SECONDS = float(os.environ.get("AGENT_PROFILE_DELAY_SECONDS", "4"))
 
+# How many times a job may be rescheduled after a long Telegram FloodWait before
+# we give up and mark it failed. High enough that even heavily rate-limited bulk
+# runs finish; `attempts` is incremented on every claim (see claim_next_jobs).
+MAX_FLOOD_RETRIES = int(os.environ.get("AGENT_MAX_FLOOD_RETRIES", "25"))
+
 # Created lazily inside the running event loop (see _get_profile_sem).
 _profile_sem: asyncio.Semaphore | None = None
 
@@ -428,6 +433,19 @@ async def process_one(job: dict) -> None:
         result = await handler(job)
         db.finish_job(job["id"], result)
         print(f"[OK] job #{job['id']} {job['type']} -> {result.get('stage', 'done')}")
+    except userbot.FloodWaitError as e:
+        # Telegram rate limit that's too long to wait out inline. Don't fail the
+        # job - put it back on the queue to run after the demanded wait (plus a
+        # jittered buffer) so it eventually succeeds. This is what lets 500+
+        # account runs complete without permanent errors.
+        if job["attempts"] >= MAX_FLOOD_RETRIES:
+            db.fail_job(job["id"], f"Gave up after {job['attempts']} rate-limit retries: {e}")
+            print(f"[FAIL] job #{job['id']} {job['type']}: exhausted flood retries ({e})")
+        else:
+            delay = e.seconds + random.uniform(3.0, 10.0)
+            db.reschedule_job(job["id"], delay, f"Rate limited, retrying in ~{int(delay)}s")
+            print(f"[WAIT] job #{job['id']} {job['type']}: rate limited, retry in ~{int(delay)}s "
+                  f"(attempt {job['attempts']}/{MAX_FLOOD_RETRIES})")
     except Exception as e:
         db.fail_job(job["id"], str(e))
         # Only auth/login jobs may mark the account as failed. A livestream

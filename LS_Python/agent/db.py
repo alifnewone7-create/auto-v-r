@@ -71,6 +71,7 @@ def claim_next_job() -> Optional[dict[str, Any]]:
                 WHERE id = (
                     SELECT id FROM jobs
                     WHERE status = 'queued'
+                      AND run_after <= now()
                     ORDER BY created_at
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
@@ -103,6 +104,7 @@ def claim_next_jobs(limit: int = 50) -> list[dict[str, Any]]:
                 WHERE id IN (
                     SELECT id FROM jobs
                     WHERE status = 'queued'
+                      AND run_after <= now()
                     ORDER BY created_at
                     FOR UPDATE SKIP LOCKED
                     LIMIT %s
@@ -125,6 +127,27 @@ def fail_job(job_id: int, error: str) -> None:
     query(
         "UPDATE jobs SET status = 'failed', error = %s, updated_at = now() WHERE id = %s",
         (error[:2000], job_id),
+    )
+
+
+def reschedule_job(job_id: int, delay_seconds: float, note: str | None = None) -> None:
+    """
+    Put a claimed job back on the queue to run after `delay_seconds`. Used for
+    Telegram FloodWait rate limits: instead of permanently failing the job, we
+    retry it later so every account eventually succeeds. `error` holds the last
+    reason for visibility but the job stays 'queued', not 'failed'.
+    """
+    delay = max(0.0, float(delay_seconds))
+    query(
+        """
+        UPDATE jobs
+        SET status = 'queued',
+            run_after = now() + (%s || ' seconds')::interval,
+            error = %s,
+            updated_at = now()
+        WHERE id = %s
+        """,
+        (delay, (note or "")[:2000], job_id),
     )
 
 
