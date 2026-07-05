@@ -22,9 +22,10 @@ export interface ProfileEditInput {
   // (e.g. "Rahim Hasan" -> "rahimhasan" + random digits). The Python agent keeps
   // trying new random suffixes until it finds one that isn't already taken.
   autoUsername?: boolean
-  // A data URL ("data:image/jpeg;base64,....") for the new profile photo, or
-  // empty/omitted to leave the photo unchanged.
-  photoDataUrl?: string
+  // A pool of data URLs ("data:image/jpeg;base64,....") for the new profile
+  // photos. When more than one is supplied, each selected account is assigned a
+  // RANDOM photo from the pool. Empty/omitted leaves the photo unchanged.
+  photoDataUrls?: string[]
 }
 
 // "Rahim Hasan" -> { first: "Rahim", last: "Hasan" }; "Afiya" -> { first: "Afiya", last: "" }
@@ -80,7 +81,7 @@ export async function updateProfiles(input: ProfileEditInput) {
   const firstName = (input.firstName ?? "").trim()
   const lastName = (input.lastName ?? "").trim()
   const baseUsername = (input.username ?? "").trim().replace(/^@/, "")
-  const photoDataUrl = input.photoDataUrl ?? ""
+  const photoDataUrls = (input.photoDataUrls ?? []).filter((u) => typeof u === "string" && u.length > 0)
   const autoUsername = Boolean(input.autoUsername)
 
   // Clean up the name pool: drop blank lines, keep only lines with a usable name.
@@ -97,30 +98,32 @@ export async function updateProfiles(input: ProfileEditInput) {
     }
   }
 
-  if (!useNamePool && !firstName && !lastName && !baseUsername && !photoDataUrl) {
+  if (!useNamePool && !firstName && !lastName && !baseUsername && photoDataUrls.length === 0) {
     return { error: "Enter a name, a name list, a username, or choose a photo to change." }
   }
 
-  // Store the uploaded photo once and reuse the asset id across every account.
-  let photoAssetId: number | null = null
-  if (photoDataUrl) {
-    const match = /^data:([^;]+);base64,(.+)$/.exec(photoDataUrl)
-    if (!match) return { error: "Invalid image. Please choose a JPEG or PNG file." }
+  // Store every uploaded photo as its own asset. When several are supplied we
+  // assign one at random per account below (like the name pool).
+  const photoAssetIds: number[] = []
+  for (const dataUrl of photoDataUrls) {
+    const match = /^data:([^;]+);base64,(.+)$/.exec(dataUrl)
+    if (!match) return { error: "Invalid image. Please choose JPEG or PNG files." }
     const mime = match[1]
     const b64 = match[2]
     if (!/^image\/(jpeg|jpg|png|webp)$/i.test(mime)) {
-      return { error: "Photo must be a JPEG, PNG, or WebP image." }
+      return { error: "Photos must be JPEG, PNG, or WebP images." }
     }
     const approxBytes = Math.floor((b64.length * 3) / 4)
     if (approxBytes > MAX_PHOTO_BYTES) {
-      return { error: "Photo is too large. Please use an image under 5MB." }
+      return { error: "One of the photos is too large. Please use images under 5MB." }
     }
     const asset = await queryOne<{ id: number }>(
       `INSERT INTO profile_assets (data, mime) VALUES ($1, $2) RETURNING id`,
       [b64, mime],
     )
-    photoAssetId = asset!.id
+    photoAssetIds.push(asset!.id)
   }
+  const usesPhotoPool = photoAssetIds.length > 0
 
   // Only touch accounts that are actually logged in.
   const accounts = await query<{ id: number }>(
@@ -138,6 +141,15 @@ export async function updateProfiles(input: ProfileEditInput) {
   const nextName = () => {
     if (bag.length === 0) bag = shuffle(namePool)
     return bag.pop()!
+  }
+
+  // Same shuffle-and-cycle strategy for photos: each account gets a random image
+  // from the pool, reshuffling once the bag empties so distribution stays even.
+  let photoBag: number[] = []
+  const nextPhotoAssetId = (): number | null => {
+    if (!usesPhotoPool) return null
+    if (photoBag.length === 0) photoBag = shuffle(photoAssetIds)
+    return photoBag.pop()!
   }
 
   // Queue one profile_updates row + one update_profile job per account.
@@ -171,7 +183,7 @@ export async function updateProfiles(input: ProfileEditInput) {
         username,
         usernameBase,
         autoUsername,
-        photoAssetId,
+        photoAssetId: nextPhotoAssetId(),
       })
     }),
   )

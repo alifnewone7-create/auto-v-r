@@ -72,7 +72,7 @@ export function ProfileSection() {
   const [lastName, setLastName] = useState("")
   const [username, setUsername] = useState("")
   const [autoUsername, setAutoUsername] = useState(true) // generate username from name
-  const [photoDataUrl, setPhotoDataUrl] = useState("")
+  const [photoDataUrls, setPhotoDataUrls] = useState<string[]>([]) // pool of images, randomly assigned per account
   const [pending, startTransition] = useTransition()
   const fileRef = useRef<HTMLInputElement>(null)
 
@@ -98,29 +98,37 @@ export function ProfileSection() {
   }
 
   async function onPickPhoto(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0]
-    if (!file) return
-    if (!/^image\/(jpeg|jpg|png|webp)$/i.test(file.type)) {
-      toast.error("Please choose a JPEG, PNG, or WebP image.")
-      return
+    const files = Array.from(e.target.files ?? [])
+    if (files.length === 0) return
+
+    const added: string[] = []
+    let rejected = 0
+    for (const file of files) {
+      if (!/^image\/(jpeg|jpg|png|webp)$/i.test(file.type) || file.size > 15 * 1024 * 1024) {
+        rejected++
+        continue
+      }
+      try {
+        // Downscale + re-encode as JPEG on the client. Telegram profile photos are
+        // shown small, so 640px is plenty, and this keeps each payload well under
+        // the Server Action body limit even with several images.
+        added.push(await compressImage(file, 640, 0.85))
+      } catch {
+        rejected++
+      }
     }
-    if (file.size > 15 * 1024 * 1024) {
-      toast.error("Image is too large. Use one under 15MB.")
-      return
-    }
-    try {
-      // Downscale + re-encode as JPEG on the client. Telegram profile photos are
-      // shown small, so 640px is plenty, and this keeps the payload well under
-      // the 1MB Server Action body limit that caused the previous server error.
-      const dataUrl = await compressImage(file, 640, 0.85)
-      setPhotoDataUrl(dataUrl)
-    } catch {
-      toast.error("Could not read that image. Try a different file.")
-    }
+
+    if (added.length > 0) setPhotoDataUrls((prev) => [...prev, ...added])
+    if (rejected > 0) toast.error(`${rejected} file(s) skipped (must be JPEG, PNG or WebP under 15MB).`)
+    if (fileRef.current) fileRef.current.value = "" // allow re-picking the same file(s)
   }
 
-  function clearPhoto() {
-    setPhotoDataUrl("")
+  function removePhoto(index: number) {
+    setPhotoDataUrls((prev) => prev.filter((_, i) => i !== index))
+  }
+
+  function clearPhotos() {
+    setPhotoDataUrls([])
     if (fileRef.current) fileRef.current.value = ""
   }
 
@@ -131,7 +139,7 @@ export function ProfileSection() {
       toast.error("Select at least one account.")
       return
     }
-    if (nameMode && parsedNames.length === 0 && !photoDataUrl && !(autoUsername ? false : username.trim())) {
+    if (nameMode && parsedNames.length === 0 && photoDataUrls.length === 0 && !(autoUsername ? false : username.trim())) {
       toast.error("Add at least one name to the list (or a photo).")
       return
     }
@@ -145,7 +153,7 @@ export function ProfileSection() {
         // In auto mode the agent derives the username from the assigned name.
         username: autoUsername ? "" : username,
         autoUsername,
-        photoDataUrl,
+        photoDataUrls,
       })
       if (res?.error) {
         toast.error(res.error)
@@ -160,9 +168,9 @@ export function ProfileSection() {
     const parts: string[] = []
     if (nameMode ? parsedNames.length > 0 : firstName.trim() || lastName.trim()) parts.push("name")
     if (autoUsername || username.trim()) parts.push("username")
-    if (photoDataUrl) parts.push("photo")
+    if (photoDataUrls.length > 0) parts.push(photoDataUrls.length === 1 ? "photo" : `photo (×${photoDataUrls.length})`)
     return parts
-  }, [nameMode, parsedNames, firstName, lastName, autoUsername, username, photoDataUrl])
+  }, [nameMode, parsedNames, firstName, lastName, autoUsername, username, photoDataUrls])
 
   return (
     <div className="flex flex-col gap-5">
@@ -275,32 +283,63 @@ export function ProfileSection() {
           </div>
 
           <div className="flex flex-col gap-2">
-            <Label>Profile photo</Label>
-            <div className="flex items-center gap-3">
-              <div className="flex size-16 shrink-0 items-center justify-center overflow-hidden rounded-full border border-border bg-muted text-muted-foreground">
-                {photoDataUrl ? (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img src={photoDataUrl || "/placeholder.svg"} alt="New profile" className="size-full object-cover" />
-                ) : (
-                  <ImageIcon className="size-6" />
-                )}
-              </div>
-              <div className="flex flex-col gap-2">
-                <div className="flex items-center gap-2">
-                  <Button type="button" variant="outline" size="sm" onClick={() => fileRef.current?.click()}>
-                    Choose image
-                  </Button>
-                  {photoDataUrl ? (
-                    <Button type="button" variant="ghost" size="sm" className="gap-1 text-muted-foreground" onClick={clearPhoto}>
-                      <X className="size-3.5" />
-                      Remove
-                    </Button>
-                  ) : null}
-                </div>
-                <p className="text-xs text-muted-foreground">JPEG, PNG or WebP. Auto-resized. Same photo for all selected.</p>
-              </div>
-              <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={onPickPhoto} />
+            <div className="flex items-center justify-between gap-2">
+              <Label>Profile photos</Label>
+              {photoDataUrls.length > 0 ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-auto gap-1 px-2 py-1 text-xs text-muted-foreground"
+                  onClick={clearPhotos}
+                >
+                  <X className="size-3.5" />
+                  Clear all
+                </Button>
+              ) : null}
             </div>
+
+            {photoDataUrls.length > 0 ? (
+              <div className="flex flex-wrap gap-2">
+                {photoDataUrls.map((url, i) => (
+                  <div key={i} className="group relative size-16 overflow-hidden rounded-lg border border-border">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={url || "/placeholder.svg"} alt={`Profile option ${i + 1}`} className="size-full object-cover" />
+                    <button
+                      type="button"
+                      onClick={() => removePhoto(i)}
+                      aria-label={`Remove image ${i + 1}`}
+                      className="absolute right-0.5 top-0.5 flex size-5 items-center justify-center rounded-full bg-background/80 text-foreground opacity-0 transition-opacity group-hover:opacity-100"
+                    >
+                      <X className="size-3" />
+                    </button>
+                  </div>
+                ))}
+                <button
+                  type="button"
+                  onClick={() => fileRef.current?.click()}
+                  aria-label="Add more images"
+                  className="flex size-16 items-center justify-center rounded-lg border border-dashed border-border text-muted-foreground transition-colors hover:bg-muted/50"
+                >
+                  <ImageIcon className="size-5" />
+                </button>
+              </div>
+            ) : (
+              <div className="flex items-center gap-3">
+                <div className="flex size-16 shrink-0 items-center justify-center rounded-full border border-border bg-muted text-muted-foreground">
+                  <ImageIcon className="size-6" />
+                </div>
+                <Button type="button" variant="outline" size="sm" onClick={() => fileRef.current?.click()}>
+                  Choose images
+                </Button>
+              </div>
+            )}
+
+            <p className="text-xs text-muted-foreground">
+              JPEG, PNG or WebP. Auto-resized. Add multiple images and each selected account gets a random one.
+              {photoDataUrls.length > 0 ? ` ${photoDataUrls.length} image(s) in the pool.` : ""}
+            </p>
+            <input ref={fileRef} type="file" accept="image/*" multiple className="hidden" onChange={onPickPhoto} />
           </div>
 
           <Separator />
