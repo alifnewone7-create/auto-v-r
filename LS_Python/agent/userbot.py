@@ -688,6 +688,7 @@ async def update_profile(
         UsernameInvalid,
         UsernameNotModified,
         FloodWait,
+        BadRequest,
     )
 
     entry = await _ensure_online(account_id, api_id, api_hash, session_string)
@@ -722,10 +723,17 @@ async def update_profile(
                 changed.append("username")
                 break
             except (UsernameOccupied, UsernameInvalid):
+                # Already taken / not a valid handle -> just try the next one.
                 last_err = cand
                 continue
             except FloodWait as e:
                 raise UserbotError(f"Rate limited by Telegram, retry in {e.value}s.")
+            except BadRequest as e:
+                # Covers USERNAME_PURCHASE_AVAILABLE (reserved for sale on
+                # fragment.com) and any other "can't use this handle" 400s.
+                # None of these are fatal for us: move on to the next candidate.
+                last_err = f"{cand} ({e})"
+                continue
         if final_username is None:
             raise UserbotError(
                 f"Could not find a free username from '{seed}' after several tries."
@@ -745,6 +753,13 @@ async def update_profile(
             raise UserbotError(f"Username @{uname} is invalid.")
         except FloodWait as e:
             raise UserbotError(f"Rate limited by Telegram, retry in {e.value}s.")
+        except BadRequest as e:
+            # e.g. USERNAME_PURCHASE_AVAILABLE (reserved for sale on fragment.com).
+            if "PURCHASE_AVAILABLE" in str(e):
+                raise UserbotError(
+                    f"Username @{uname} is reserved for purchase on fragment.com. Pick another."
+                )
+            raise UserbotError(f"Could not set @{uname}: {e}")
 
     # --- profile photo ---
     if photo_bytes:
