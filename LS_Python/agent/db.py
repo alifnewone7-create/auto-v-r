@@ -449,12 +449,27 @@ def get_profile_photo(asset_id: int) -> Optional[bytes]:
     return base64.b64decode(row["data"])
 
 
-def set_profile_update(update_id: int, status: str, error: str | None = None) -> None:
-    """Record the outcome of a single profile edit request."""
-    query(
-        "UPDATE profile_updates SET status = %s, last_error = %s, updated_at = now() WHERE id = %s",
-        (status, error[:500] if error else None, update_id),
-    )
+def set_profile_update(
+    update_id: int,
+    status: str,
+    error: str | None = None,
+    username: str | None = None,
+) -> None:
+    """
+    Record the outcome of a single profile edit request. When `username` is given
+    (e.g. an auto-generated handle that was finalized), store it so the UI shows
+    the actual username applied rather than the placeholder base.
+    """
+    if username:
+        query(
+            "UPDATE profile_updates SET status = %s, last_error = %s, username = %s, updated_at = now() WHERE id = %s",
+            (status, error[:500] if error else None, username, update_id),
+        )
+    else:
+        query(
+            "UPDATE profile_updates SET status = %s, last_error = %s, updated_at = now() WHERE id = %s",
+            (status, error[:500] if error else None, update_id),
+        )
 
 
 # ---------------------------------------------------------------------------

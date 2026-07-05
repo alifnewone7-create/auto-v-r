@@ -8,11 +8,12 @@ import { fetcher } from "@/lib/fetcher"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { Textarea } from "@/components/ui/textarea"
 import { Label } from "@/components/ui/label"
 import { Badge } from "@/components/ui/badge"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Separator } from "@/components/ui/separator"
-import { UserCog, Loader2, ImageIcon, X, CheckCircle2, AlertCircle, Clock, Users } from "lucide-react"
+import { UserCog, Loader2, ImageIcon, X, CheckCircle2, AlertCircle, Clock, Users, ListPlus } from "lucide-react"
 import { toast } from "sonner"
 import { updateProfiles } from "@/app/actions/profile"
 import type { ProfileAccountRow } from "@/lib/types"
@@ -65,12 +66,20 @@ export function ProfileSection() {
   const accounts = data?.accounts ?? []
 
   const [selected, setSelected] = useState<Set<number>>(new Set())
+  const [nameMode, setNameMode] = useState(true) // random name-list mode vs manual name
+  const [nameList, setNameList] = useState("")
   const [firstName, setFirstName] = useState("")
   const [lastName, setLastName] = useState("")
   const [username, setUsername] = useState("")
+  const [autoUsername, setAutoUsername] = useState(true) // generate username from name
   const [photoDataUrl, setPhotoDataUrl] = useState("")
   const [pending, startTransition] = useTransition()
   const fileRef = useRef<HTMLInputElement>(null)
+
+  const parsedNames = useMemo(
+    () => nameList.split("\n").map((l) => l.trim()).filter(Boolean),
+    [nameList],
+  )
 
   const allSelected = accounts.length > 0 && selected.size === accounts.length
   const someSelected = selected.size > 0 && !allSelected
@@ -115,19 +124,27 @@ export function ProfileSection() {
     if (fileRef.current) fileRef.current.value = ""
   }
 
-  const multipleWithUsername = username.trim() !== "" && selected.size > 1
+  const multipleWithUsername = !autoUsername && username.trim() !== "" && selected.size > 1
 
   function handleApply() {
     if (selected.size === 0) {
       toast.error("Select at least one account.")
       return
     }
+    if (nameMode && parsedNames.length === 0 && !photoDataUrl && !(autoUsername ? false : username.trim())) {
+      toast.error("Add at least one name to the list (or a photo).")
+      return
+    }
     startTransition(async () => {
       const res = await updateProfiles({
         accountIds: Array.from(selected),
-        firstName,
-        lastName,
-        username,
+        // In name-list mode we send the pool; otherwise the manual first/last.
+        names: nameMode ? parsedNames : undefined,
+        firstName: nameMode ? "" : firstName,
+        lastName: nameMode ? "" : lastName,
+        // In auto mode the agent derives the username from the assigned name.
+        username: autoUsername ? "" : username,
+        autoUsername,
         photoDataUrl,
       })
       if (res?.error) {
@@ -141,11 +158,11 @@ export function ProfileSection() {
 
   const summary = useMemo(() => {
     const parts: string[] = []
-    if (firstName.trim() || lastName.trim()) parts.push("name")
-    if (username.trim()) parts.push("username")
+    if (nameMode ? parsedNames.length > 0 : firstName.trim() || lastName.trim()) parts.push("name")
+    if (autoUsername || username.trim()) parts.push("username")
     if (photoDataUrl) parts.push("photo")
     return parts
-  }, [firstName, lastName, username, photoDataUrl])
+  }, [nameMode, parsedNames, firstName, lastName, autoUsername, username, photoDataUrl])
 
   return (
     <div className="flex flex-col gap-5">
@@ -157,47 +174,103 @@ export function ProfileSection() {
           </CardTitle>
         </CardHeader>
         <CardContent className="flex flex-col gap-4">
-          <div className="grid gap-3 sm:grid-cols-2">
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="first_name">First name</Label>
-              <Input
-                id="first_name"
-                value={firstName}
-                onChange={(e) => setFirstName(e.target.value)}
-                placeholder="Leave blank to keep"
-              />
-            </div>
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="last_name">Last name</Label>
-              <Input
-                id="last_name"
-                value={lastName}
-                onChange={(e) => setLastName(e.target.value)}
-                placeholder="Leave blank to keep"
-              />
-            </div>
+          {/* Name source: a random pool (list) or one manual name for everyone. */}
+          <div className="inline-flex w-fit rounded-lg border border-border bg-muted/40 p-1 text-sm">
+            <button
+              type="button"
+              onClick={() => setNameMode(true)}
+              className={`rounded-md px-3 py-1.5 font-medium transition-colors ${
+                nameMode ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"
+              }`}
+            >
+              Name list (random)
+            </button>
+            <button
+              type="button"
+              onClick={() => setNameMode(false)}
+              className={`rounded-md px-3 py-1.5 font-medium transition-colors ${
+                !nameMode ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"
+              }`}
+            >
+              Single name
+            </button>
           </div>
 
-          <div className="flex flex-col gap-2">
-            <Label htmlFor="username">Username</Label>
-            <div className="relative">
-              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">@</span>
-              <Input
-                id="username"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                placeholder="Leave blank to keep"
-                className="pl-7"
+          {nameMode ? (
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="name_list" className="flex items-center gap-1.5">
+                <ListPlus className="size-3.5" />
+                Name list
+              </Label>
+              <Textarea
+                id="name_list"
+                value={nameList}
+                onChange={(e) => setNameList(e.target.value)}
+                rows={7}
+                placeholder={"Rahim Hasan\nAfiya Noor\nTanvir Ahmed\nSadiya Islam\nImran Hossain"}
+                className="font-mono text-sm"
               />
-            </div>
-            {multipleWithUsername ? (
               <p className="text-xs text-muted-foreground">
-                {`Usernames are unique, so accounts get a suffix: @${username.trim().replace(/^@/, "")}, @${username
-                  .trim()
-                  .replace(/^@/, "")}1, @${username.trim().replace(/^@/, "")}2 …`}
+                One name per line. Each selected account gets a random name from the list. A single word sets only the
+                first name (no last name). {parsedNames.length > 0 ? `${parsedNames.length} name(s) ready.` : ""}
+              </p>
+            </div>
+          ) : (
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="first_name">First name</Label>
+                <Input
+                  id="first_name"
+                  value={firstName}
+                  onChange={(e) => setFirstName(e.target.value)}
+                  placeholder="Leave blank to keep"
+                />
+              </div>
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="last_name">Last name</Label>
+                <Input
+                  id="last_name"
+                  value={lastName}
+                  onChange={(e) => setLastName(e.target.value)}
+                  placeholder="Leave blank to keep"
+                />
+              </div>
+            </div>
+          )}
+
+          <div className="flex flex-col gap-2">
+            <label className="flex cursor-pointer items-center gap-2">
+              <Checkbox checked={autoUsername} onCheckedChange={(v) => setAutoUsername(Boolean(v))} />
+              <span className="text-sm font-medium">Auto-generate username from name</span>
+            </label>
+            {autoUsername ? (
+              <p className="text-xs text-muted-foreground">
+                Each account&apos;s username is built from its full name (e.g. &quot;Rahim Hasan&quot; &rarr;
+                @rahimhasan####). If it&apos;s taken, a new random one is tried until it&apos;s unique.
               </p>
             ) : (
-              <p className="text-xs text-muted-foreground">5-32 characters: letters, numbers, underscores.</p>
+              <>
+                <Label htmlFor="username">Username</Label>
+                <div className="relative">
+                  <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">@</span>
+                  <Input
+                    id="username"
+                    value={username}
+                    onChange={(e) => setUsername(e.target.value)}
+                    placeholder="Leave blank to keep"
+                    className="pl-7"
+                  />
+                </div>
+                {multipleWithUsername ? (
+                  <p className="text-xs text-muted-foreground">
+                    {`Usernames are unique, so accounts get a suffix: @${username.trim().replace(/^@/, "")}, @${username
+                      .trim()
+                      .replace(/^@/, "")}1, @${username.trim().replace(/^@/, "")}2 …`}
+                  </p>
+                ) : (
+                  <p className="text-xs text-muted-foreground">5-32 characters: letters, numbers, underscores.</p>
+                )}
+              </>
             )}
           </div>
 

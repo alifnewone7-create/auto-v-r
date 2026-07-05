@@ -621,6 +621,41 @@ async def react_post_scheduled(
 # Profile editing: change one account's name / username / profile photo.
 # ===========================================================================
 
+def _username_candidates(base: str) -> list[str]:
+    """
+    Build a list of username candidates from a seed. Telegram usernames must be
+    5-32 chars, start with a letter, and contain only letters/digits/underscore.
+    We try the clean base first, then progressively longer random-digit suffixes
+    so collisions get resolved with a unique handle.
+    """
+    import random
+
+    seed = "".join(ch for ch in (base or "").lower() if ch.isalnum())
+    seed = seed.lstrip("0123456789")  # must start with a letter
+    if not seed:
+        seed = "user"
+    seed = seed[:32]
+
+    candidates: list[str] = []
+
+    def _add(u: str) -> None:
+        u = u[:32]
+        if 5 <= len(u) <= 32 and u not in candidates:
+            candidates.append(u)
+
+    # Bare base only if already long enough on its own.
+    if len(seed) >= 5:
+        _add(seed)
+
+    # Random numeric suffixes with widening range for more uniqueness attempts.
+    for digits in (2, 3, 4, 5):
+        for _ in range(6):
+            suffix = str(random.randint(0, 10 ** digits - 1)).zfill(digits)
+            _add(f"{seed}{suffix}")
+
+    return candidates
+
+
 async def update_profile(
     account_id: int,
     api_id: int,
@@ -629,14 +664,22 @@ async def update_profile(
     first_name: Optional[str] = None,
     last_name: Optional[str] = None,
     username: Optional[str] = None,
+    username_base: Optional[str] = None,
+    auto_username: bool = False,
     photo_bytes: Optional[bytes] = None,
 ) -> dict:
     """
     Apply profile changes to a single userbot account. Any argument left as None
     (or empty) is skipped, so you can change just the name, just the photo, etc.
 
-    Returns a dict describing what actually changed. Raises UserbotError with a
-    friendly message if the username is already taken / invalid.
+    Username handling:
+      - If `auto_username` is set, a username is generated from `username_base`
+        (falling back to the name). We try candidate handles until one sticks,
+        so "already taken" collisions are resolved automatically.
+      - Otherwise, if an explicit `username` is given, we try just that one.
+
+    Returns a dict describing what changed (and the final username, if set).
+    Raises UserbotError with a friendly message on unrecoverable failures.
     """
     import io
 
@@ -651,22 +694,50 @@ async def update_profile(
     client: Client = entry["client"]
 
     changed: list[str] = []
+    final_username: Optional[str] = None
 
     # --- name (first / last) ---
     if (first_name and first_name.strip()) or (last_name and last_name.strip()):
         me = await client.get_me()
         new_first = first_name.strip() if (first_name and first_name.strip()) else (me.first_name or "")
-        new_last = last_name.strip() if (last_name and last_name.strip()) else (me.last_name or "")
+        # An empty last name is intentional (list entry had no surname), so only
+        # keep the existing surname when last_name was not supplied at all.
+        new_last = last_name.strip() if last_name is not None else (me.last_name or "")
         await client.update_profile(first_name=new_first, last_name=new_last)
         changed.append("name")
 
     # --- username ---
-    if username and username.strip():
+    if auto_username:
+        seed = username_base or " ".join(x for x in [first_name, last_name] if x)
+        candidates = _username_candidates(seed)
+        last_err: Optional[str] = None
+        for cand in candidates:
+            try:
+                await client.set_username(cand)
+                final_username = cand
+                changed.append("username")
+                break
+            except UsernameNotModified:
+                final_username = cand
+                changed.append("username")
+                break
+            except (UsernameOccupied, UsernameInvalid):
+                last_err = cand
+                continue
+            except FloodWait as e:
+                raise UserbotError(f"Rate limited by Telegram, retry in {e.value}s.")
+        if final_username is None:
+            raise UserbotError(
+                f"Could not find a free username from '{seed}' after several tries."
+            )
+    elif username and username.strip():
         uname = username.strip().lstrip("@")
         try:
             await client.set_username(uname)
+            final_username = uname
             changed.append("username")
         except UsernameNotModified:
+            final_username = uname
             changed.append("username")  # already set to this value; treat as success
         except UsernameOccupied:
             raise UserbotError(f"Username @{uname} is already taken.")
@@ -685,4 +756,4 @@ async def update_profile(
         except FloodWait as e:
             raise UserbotError(f"Rate limited by Telegram, retry in {e.value}s.")
 
-    return {"changed": changed}
+    return {"changed": changed, "username": final_username}

@@ -337,11 +337,19 @@ async def handle_update_profile(job: dict) -> dict:
             first_name=p.get("first_name"),
             last_name=p.get("last_name"),
             username=p.get("username"),
+            username_base=p.get("username_base"),
+            auto_username=bool(p.get("auto_username")),
             photo_bytes=photo_bytes,
         )
+        # Persist the username that actually stuck (auto-generated ones differ
+        # from the placeholder base we stored when queuing).
+        final_username = result.get("username")
         if update_id:
-            db.set_profile_update(int(update_id), "done", None)
-        return {"stage": "profile_updated", "changed": result.get("changed", [])}
+            if final_username:
+                db.set_profile_update(int(update_id), "done", None, username=final_username)
+            else:
+                db.set_profile_update(int(update_id), "done", None)
+        return {"stage": "profile_updated", "changed": result.get("changed", []), "username": final_username}
     except Exception as e:
         if update_id:
             db.set_profile_update(int(update_id), "failed", str(e))
