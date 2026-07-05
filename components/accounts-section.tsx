@@ -3,6 +3,7 @@
 import useSWR from "swr"
 import { fetcher } from "@/lib/fetcher"
 import { AddAccountDialog } from "@/components/add-account-dialog"
+import { ImportAccountsDialog } from "@/components/import-accounts-dialog"
 import { AccountCard } from "@/components/account-card"
 import { Users } from "lucide-react"
 import type { TelegramAccount } from "@/lib/types"
@@ -25,7 +26,10 @@ export function AccountsSection() {
             {accounts.filter((a) => a.status === "logged_in").length} ready
           </p>
         </div>
-        <AddAccountDialog onAdded={() => mutate()} />
+        <div className="flex items-center gap-2">
+          <ImportAccountsDialog onImported={() => mutate()} />
+          <AddAccountDialog onAdded={() => mutate()} />
+        </div>
       </div>
 
       {accounts.length === 0 ? (

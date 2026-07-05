@@ -97,6 +97,157 @@ export async function submitLoginCode(formData: FormData) {
   return { ok: true }
 }
 
+/**
+ * Minimal RFC-4180-ish CSV parser: handles quoted fields, escaped double quotes
+ * ("") and commas/newlines inside quotes. Returns an array of string arrays.
+ */
+function parseCsv(text: string): string[][] {
+  const rows: string[][] = []
+  let field = ""
+  let row: string[] = []
+  let inQuotes = false
+  const s = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n")
+
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]
+    if (inQuotes) {
+      if (c === '"') {
+        if (s[i + 1] === '"') {
+          field += '"'
+          i++
+        } else {
+          inQuotes = false
+        }
+      } else {
+        field += c
+      }
+    } else if (c === '"') {
+      inQuotes = true
+    } else if (c === ",") {
+      row.push(field)
+      field = ""
+    } else if (c === "\n") {
+      row.push(field)
+      rows.push(row)
+      row = []
+      field = ""
+    } else {
+      field += c
+    }
+  }
+  // flush last field/row (ignore a trailing empty line)
+  if (field.length > 0 || row.length > 0) {
+    row.push(field)
+    rows.push(row)
+  }
+  return rows
+}
+
+/**
+ * Bulk-import accounts from an uploaded CSV export (same shape as the
+ * telegram_accounts table). Upserts by phone_number so re-uploading updates
+ * existing rows instead of duplicating them. Empty api_id/api_hash/session
+ * fields are preserved as NULL.
+ */
+export async function importAccountsCsv(formData: FormData) {
+  await requireAuth()
+  const file = formData.get("file")
+  if (!(file instanceof File) || file.size === 0) return { error: "Please choose a CSV file." }
+
+  const text = await file.text()
+  const rows = parseCsv(text)
+  if (rows.length < 2) return { error: "CSV has no data rows." }
+
+  const header = rows[0].map((h) => h.trim().toLowerCase())
+  const idx = (name: string) => header.indexOf(name)
+  const phoneIdx = idx("phone_number")
+  if (phoneIdx === -1) return { error: "CSV must include a 'phone_number' column." }
+
+  const iLabel = idx("label")
+  const iAppTitle = idx("app_title")
+  const iShortName = idx("short_name")
+  const iApiId = idx("api_id")
+  const iApiHash = idx("api_hash")
+  const iSession = idx("session_string")
+  const iStatus = idx("status")
+  const i2fa = idx("two_factor_required")
+  const iLastError = idx("last_error")
+  const iMtproto = idx("mtproto_hash")
+  const iLogin = idx("login_hash")
+
+  const cell = (row: string[], i: number) => (i >= 0 && i < row.length ? row[i].trim() : "")
+  const orNull = (v: string) => (v === "" ? null : v)
+
+  let inserted = 0
+  let updated = 0
+  let skipped = 0
+  const errors: string[] = []
+
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r]
+    const phone = cell(row, phoneIdx)
+    if (!phone) {
+      skipped++
+      continue
+    }
+    if (!/^\+?\d{6,15}$/.test(phone.replace(/\s/g, ""))) {
+      errors.push(`Row ${r + 1}: invalid phone "${phone}"`)
+      skipped++
+      continue
+    }
+
+    const twoFactorRaw = cell(row, i2fa).toLowerCase()
+    const twoFactor = twoFactorRaw === "true" || twoFactorRaw === "t" || twoFactorRaw === "1"
+    const status = orNull(cell(row, iStatus)) ?? "new"
+
+    try {
+      const res = await queryOne<{ inserted: boolean }>(
+        `INSERT INTO telegram_accounts
+           (label, phone_number, app_title, short_name, api_id, api_hash,
+            session_string, status, two_factor_required, last_error,
+            mtproto_hash, login_hash)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+         ON CONFLICT (phone_number) DO UPDATE SET
+           label               = EXCLUDED.label,
+           app_title           = EXCLUDED.app_title,
+           short_name          = EXCLUDED.short_name,
+           api_id              = EXCLUDED.api_id,
+           api_hash            = EXCLUDED.api_hash,
+           session_string      = EXCLUDED.session_string,
+           status              = EXCLUDED.status,
+           two_factor_required = EXCLUDED.two_factor_required,
+           last_error          = EXCLUDED.last_error,
+           mtproto_hash        = EXCLUDED.mtproto_hash,
+           login_hash          = EXCLUDED.login_hash,
+           updated_at          = now()
+         RETURNING (xmax = 0) AS inserted`,
+        [
+          orNull(cell(row, iLabel)),
+          phone,
+          orNull(cell(row, iAppTitle)) ?? "Iamhear",
+          orNull(cell(row, iShortName)) ?? "iamheardeveloper",
+          orNull(cell(row, iApiId)),
+          orNull(cell(row, iApiHash)),
+          orNull(cell(row, iSession)),
+          status,
+          twoFactor,
+          orNull(cell(row, iLastError)),
+          orNull(cell(row, iMtproto)),
+          orNull(cell(row, iLogin)),
+        ],
+      )
+      if (res?.inserted) inserted++
+      else updated++
+    } catch (err: any) {
+      errors.push(`Row ${r + 1} (${phone}): ${err?.message ?? "insert failed"}`)
+      skipped++
+    }
+  }
+
+  revalidatePath("/")
+  return { ok: true, inserted, updated, skipped, errors }
+}
+
 export async function deleteAccount(accountId: number) {
   await requireAuth()
   await query(`DELETE FROM livestream_participants WHERE account_id = $1`, [accountId])
