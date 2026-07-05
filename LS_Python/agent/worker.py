@@ -15,6 +15,7 @@ website uses, polls the `jobs` table, and executes each job:
   cast_vote           -> make one userbot vote on a poll option
   retract_vote        -> make one userbot remove its vote from a poll
   react_post          -> react to a channel post from all userbots, time-spread
+  update_profile      -> change an account's name / username / profile photo
 
 Start it with:  python -m agent.worker      (from the LS_Python folder)
 """
@@ -309,6 +310,44 @@ async def handle_react_post(job: dict) -> dict:
     return {"stage": "reacted", "reactions": count, "message_id": message_id}
 
 
+async def handle_update_profile(job: dict) -> dict:
+    """
+    Change one account's name / username / profile photo. The website queues one
+    of these per selected account (with a shared photo asset id). We write the
+    result back to the matching profile_updates row so the UI shows per-account
+    progress, and we mirror the new name onto telegram_accounts.label for display.
+    """
+    account_id = job["account_id"]
+    p = job["payload"]
+    update_id = p.get("profile_update_id")
+    acc = db.get_account(account_id)
+    if not acc:
+        raise RuntimeError(f"account {account_id} not found")
+
+    photo_bytes = None
+    if p.get("photo_asset_id"):
+        photo_bytes = db.get_profile_photo(int(p["photo_asset_id"]))
+
+    try:
+        result = await userbot.update_profile(
+            account_id,
+            int(acc["api_id"]),
+            acc["api_hash"],
+            acc["session_string"],
+            first_name=p.get("first_name"),
+            last_name=p.get("last_name"),
+            username=p.get("username"),
+            photo_bytes=photo_bytes,
+        )
+        if update_id:
+            db.set_profile_update(int(update_id), "done", None)
+        return {"stage": "profile_updated", "changed": result.get("changed", [])}
+    except Exception as e:
+        if update_id:
+            db.set_profile_update(int(update_id), "failed", str(e))
+        raise
+
+
 HANDLERS = {
     "create_app": handle_create_app,
     "submit_mtproto_code": handle_submit_mtproto_code,
@@ -321,6 +360,7 @@ HANDLERS = {
     "cast_vote": handle_cast_vote,
     "retract_vote": handle_retract_vote,
     "react_post": handle_react_post,
+    "update_profile": handle_update_profile,
 }
 
 # Jobs that are part of the login / auth flow. ONLY these may flip an account

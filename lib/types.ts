@@ -49,6 +49,7 @@ export type JobType =
   | "detect_poll" // read the most recent poll in a channel and fill in vote_targets
   | "cast_vote" // make one userbot vote on a poll option
   | "retract_vote" // make one userbot remove its vote from a poll
+  | "update_profile" // change an account's name / username / profile photo
 
 export type JobStatus = "queued" | "processing" | "done" | "failed"
 
@@ -168,4 +169,35 @@ export interface ReactionTarget {
   last_error: string | null
   created_at: string
   updated_at: string
+}
+
+// Lifecycle of a single profile edit request against one account.
+//  pending -> queued, agent hasn't run it yet
+//  done    -> profile changed successfully
+//  failed  -> something went wrong (see last_error), e.g. username taken
+export type ProfileUpdateStatus = "pending" | "done" | "failed"
+
+export interface ProfileUpdate {
+  id: number
+  account_id: number
+  first_name: string | null
+  last_name: string | null
+  username: string | null
+  photo_asset_id: number | null
+  status: ProfileUpdateStatus
+  last_error: string | null
+  created_at: string
+  updated_at: string
+}
+
+// A telegram account row enriched with the latest profile-edit result, used by
+// the bulk profile editor UI.
+export interface ProfileAccountRow {
+  id: number
+  label: string | null
+  phone_number: string
+  status: AccountStatus
+  profile_status: ProfileUpdateStatus | null
+  profile_error: string | null
+  profile_updated_at: string | null
 }

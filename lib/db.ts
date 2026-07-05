@@ -190,6 +190,34 @@ CREATE TABLE IF NOT EXISTS reaction_targets (
 );
 
 CREATE INDEX IF NOT EXISTS reaction_targets_status_idx ON reaction_targets (status);
+
+-- Profile assets: uploaded profile photos (base64), shared across accounts when
+-- the same image is applied to many accounts in one bulk edit. -----------------
+CREATE TABLE IF NOT EXISTS profile_assets (
+  id         SERIAL PRIMARY KEY,
+  data       TEXT NOT NULL,
+  mime       TEXT NOT NULL DEFAULT 'image/jpeg',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Profile updates: one row per account per bulk profile edit. The agent applies
+-- the name / username / photo change and writes back the status so the panel can
+-- show per-account progress (pending -> done / failed). ------------------------
+CREATE TABLE IF NOT EXISTS profile_updates (
+  id             SERIAL PRIMARY KEY,
+  account_id     INTEGER NOT NULL REFERENCES telegram_accounts(id) ON DELETE CASCADE,
+  first_name     TEXT,
+  last_name      TEXT,
+  username       TEXT,
+  photo_asset_id INTEGER REFERENCES profile_assets(id) ON DELETE SET NULL,
+  status         TEXT NOT NULL DEFAULT 'pending',
+  last_error     TEXT,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS profile_updates_account_idx ON profile_updates (account_id);
+CREATE INDEX IF NOT EXISTS profile_updates_created_idx ON profile_updates (created_at DESC);
 `
 
 // Runs the schema exactly once per process. The cached promise guarantees that

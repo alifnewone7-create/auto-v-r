@@ -615,3 +615,74 @@ async def react_post_scheduled(
 
     results = await asyncio.gather(*(_scheduled(c, d) for c, d in zip(clients, offsets)))
     return sum(1 for ok in results if ok)
+
+
+# ===========================================================================
+# Profile editing: change one account's name / username / profile photo.
+# ===========================================================================
+
+async def update_profile(
+    account_id: int,
+    api_id: int,
+    api_hash: str,
+    session_string: str,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    username: Optional[str] = None,
+    photo_bytes: Optional[bytes] = None,
+) -> dict:
+    """
+    Apply profile changes to a single userbot account. Any argument left as None
+    (or empty) is skipped, so you can change just the name, just the photo, etc.
+
+    Returns a dict describing what actually changed. Raises UserbotError with a
+    friendly message if the username is already taken / invalid.
+    """
+    import io
+
+    from pyrogram.errors import (
+        UsernameOccupied,
+        UsernameInvalid,
+        UsernameNotModified,
+        FloodWait,
+    )
+
+    entry = await _ensure_online(account_id, api_id, api_hash, session_string)
+    client: Client = entry["client"]
+
+    changed: list[str] = []
+
+    # --- name (first / last) ---
+    if (first_name and first_name.strip()) or (last_name and last_name.strip()):
+        me = await client.get_me()
+        new_first = first_name.strip() if (first_name and first_name.strip()) else (me.first_name or "")
+        new_last = last_name.strip() if (last_name and last_name.strip()) else (me.last_name or "")
+        await client.update_profile(first_name=new_first, last_name=new_last)
+        changed.append("name")
+
+    # --- username ---
+    if username and username.strip():
+        uname = username.strip().lstrip("@")
+        try:
+            await client.set_username(uname)
+            changed.append("username")
+        except UsernameNotModified:
+            changed.append("username")  # already set to this value; treat as success
+        except UsernameOccupied:
+            raise UserbotError(f"Username @{uname} is already taken.")
+        except UsernameInvalid:
+            raise UserbotError(f"Username @{uname} is invalid.")
+        except FloodWait as e:
+            raise UserbotError(f"Rate limited by Telegram, retry in {e.value}s.")
+
+    # --- profile photo ---
+    if photo_bytes:
+        bio = io.BytesIO(photo_bytes)
+        bio.name = "profile.jpg"
+        try:
+            await client.set_profile_photo(photo=bio)
+            changed.append("photo")
+        except FloodWait as e:
+            raise UserbotError(f"Rate limited by Telegram, retry in {e.value}s.")
+
+    return {"changed": changed}

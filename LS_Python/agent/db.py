@@ -436,6 +436,28 @@ def enqueue_reaction_job(
 
 
 # ---------------------------------------------------------------------------
+# Profile edit helpers (change an account's name / username / photo)
+# ---------------------------------------------------------------------------
+
+def get_profile_photo(asset_id: int) -> Optional[bytes]:
+    """Fetch a stored profile photo (base64 in profile_assets) as raw bytes."""
+    import base64
+
+    row = query_one("SELECT data FROM profile_assets WHERE id = %s", (asset_id,))
+    if not row or not row.get("data"):
+        return None
+    return base64.b64decode(row["data"])
+
+
+def set_profile_update(update_id: int, status: str, error: str | None = None) -> None:
+    """Record the outcome of a single profile edit request."""
+    query(
+        "UPDATE profile_updates SET status = %s, last_error = %s, updated_at = now() WHERE id = %s",
+        (status, error[:500] if error else None, update_id),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Agent heartbeat
 # ---------------------------------------------------------------------------
 
