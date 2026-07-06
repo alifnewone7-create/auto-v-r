@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
 from typing import Optional
 
 from pyrogram import Client, filters
@@ -432,10 +433,41 @@ async def view_post_all(chat_id: int, message_id: int, spread_seconds: float = 0
     return sum(1 for ok in results if ok)
 
 
+# Cross-client dedup: the SAME post is delivered to every warm userbot that is a
+# member of the channel, so with many accounts one post would fire this handler
+# hundreds of times. We remember (chat_id, message_id) briefly and only let the
+# first delivery dispatch; the rest return immediately. This keeps detection
+# instant while avoiding a burst of redundant DB lookups per post, which matters
+# once you watch 5-10+ channels with a large account pool.
+_SEEN_POSTS: dict[tuple[int, int], float] = {}
+_SEEN_TTL_SECONDS = 120.0
+
+
+def _already_dispatched(chat_id: int, message_id: int) -> bool:
+    """
+    True if this (chat_id, message_id) was already handled recently. Safe on the
+    single-threaded event loop: the check-and-set below has no await in between,
+    so two concurrent deliveries can't both pass. Prunes expired keys opportunistically.
+    """
+    now = time.monotonic()
+    key = (int(chat_id), int(message_id))
+    if key in _SEEN_POSTS:
+        return True
+    _SEEN_POSTS[key] = now
+    if len(_SEEN_POSTS) > 5000:
+        for k, ts in list(_SEEN_POSTS.items()):
+            if now - ts > _SEEN_TTL_SECONDS:
+                _SEEN_POSTS.pop(k, None)
+    return False
+
+
 async def _on_channel_post(client: Client, message) -> None:
-    """Live handler: a new post arrived in a channel this userbot is in."""
+    """Live handler: a new post arrived in a channel/group this userbot is in."""
     chat = getattr(message, "chat", None)
     if chat is None:
+        return
+    # Only dispatch once per post, no matter how many userbots received it.
+    if _already_dispatched(chat.id, message.id):
         return
     if _VIEW_DISPATCH is not None:
         try:
@@ -456,11 +488,15 @@ def attach_view_handlers() -> int:
     polling loop is the fallback. Returns how many handlers were attached.
     """
     count = 0
+    # Cover broadcast channels AND groups/supergroups (discussion groups, comment
+    # groups) so posts in any watched chat type are detected live, not just
+    # broadcast channels.
+    post_filter = filters.channel | filters.group
     for entry in _POOL.values():
         client: Client = entry["client"]
         if entry.get("view_handler"):
             continue  # already attached
-        handler = MessageHandler(_on_channel_post, filters.channel)
+        handler = MessageHandler(_on_channel_post, post_filter)
         client.add_handler(handler)
         entry["view_handler"] = handler
         count += 1
