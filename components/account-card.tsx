@@ -1,11 +1,21 @@
 "use client"
 
-import { useTransition } from "react"
+import { useState, useTransition } from "react"
 import { Card, CardContent, CardHeader } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Separator } from "@/components/ui/separator"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
 import { StatusBadge } from "@/components/status-badge"
 import { Trash2, Loader2, KeyRound, ShieldCheck, Phone, AlertCircle } from "lucide-react"
 import { toast } from "sonner"
@@ -24,6 +34,8 @@ const WAITING: AccountStatus[] = ["api_pending", "login_pending"]
 
 export function AccountCard({ account, onChange }: { account: AccountRow; onChange: () => void }) {
   const [pending, startTransition] = useTransition()
+  // Two-step delete confirmation: 0 = closed, 1 = first prompt, 2 = final prompt
+  const [deleteStep, setDeleteStep] = useState<0 | 1 | 2>(0)
 
   function run(fn: () => Promise<{ error?: string; ok?: boolean } | void>, success?: string) {
     startTransition(async () => {
@@ -56,11 +68,61 @@ export function AccountCard({ account, onChange }: { account: AccountRow; onChan
             size="icon"
             className="size-8 text-muted-foreground hover:text-destructive"
             disabled={pending}
-            onClick={() => run(() => deleteAccount(account.id))}
+            onClick={() => setDeleteStep(1)}
             aria-label="Delete account"
           >
             <Trash2 className="size-4" />
           </Button>
+
+          {/* Step 1: initial confirmation */}
+          <AlertDialog open={deleteStep === 1} onOpenChange={(open) => !open && setDeleteStep(0)}>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Delete this userbot?</AlertDialogTitle>
+                <AlertDialogDescription>
+                  {`You're about to delete ${account.label || account.phone_number}. Its stored session and all related data will be removed.`}
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                <AlertDialogAction
+                  className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                  onClick={(e) => {
+                    e.preventDefault()
+                    setDeleteStep(2)
+                  }}
+                >
+                  Continue
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+
+          {/* Step 2: final confirmation */}
+          <AlertDialog open={deleteStep === 2} onOpenChange={(open) => !open && setDeleteStep(0)}>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Are you absolutely sure?</AlertDialogTitle>
+                <AlertDialogDescription>
+                  This action cannot be undone. This will permanently delete the userbot and its session. Confirm once
+                  more to proceed.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                <AlertDialogAction
+                  className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                  onClick={(e) => {
+                    e.preventDefault()
+                    setDeleteStep(0)
+                    run(() => deleteAccount(account.id), "Userbot deleted.")
+                  }}
+                >
+                  Delete permanently
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
         </div>
       </CardHeader>
 
