@@ -102,6 +102,10 @@ async def begin_login(api_id: int, api_hash: str, phone: str) -> tuple[str, str]
         api_hash=api_hash,
         in_memory=True,
         phone_number=phone,
+        # Login only signs in / sets a session; it never consumes updates. Off it
+        # goes so no background handle_updates() task races with disconnect() and
+        # throws "Cannot operate on a closed database".
+        no_updates=True,
     )
     await client.connect()
     sent = await client.send_code(phone)
@@ -205,6 +209,13 @@ async def provision_userbot(
         api_hash=api_hash,
         in_memory=True,
         phone_number=phone,
+        # We only sign in and set 2FA here — we never consume incoming updates.
+        # Leaving update dispatching on means pyrogram spawns a background
+        # handle_updates() task that writes to the session's SQLite storage; when
+        # we disconnect() below that storage closes, and any in-flight update
+        # throws "Cannot operate on a closed database". Turning updates off
+        # removes that task entirely and the harmless error with it.
+        no_updates=True,
     )
     await client.connect()
     had_2fa = False
