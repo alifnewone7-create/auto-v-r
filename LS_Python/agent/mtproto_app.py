@@ -60,9 +60,24 @@ def send_login_code(phone: str) -> str:
         r = c.post("/auth/send_password", data={"phone": phone})
         if r.status_code != 200:
             raise MtprotoError(f"send_password failed: HTTP {r.status_code}")
-        data = r.json()
+        body = (r.text or "").strip()
+        if not body:
+            raise MtprotoError(
+                "my.telegram.org returned an empty response for send_password. "
+                "This usually means the IP is temporarily blocked/rate-limited or "
+                "the phone number is invalid. Wait a bit and try again."
+            )
+        try:
+            data = r.json()
+        except ValueError:
+            # Not JSON - Telegram served an HTML error/redirect page. Surface the
+            # real body instead of the cryptic "Expecting value: line 1 column 1".
+            raise MtprotoError(
+                f"my.telegram.org did not return JSON for send_password "
+                f"(likely blocked, rate-limited, or the endpoint changed): {body[:200]}"
+            )
         if not isinstance(data, dict) or "random_hash" not in data:
-            raise MtprotoError(f"Unexpected send_password response: {r.text[:200]}")
+            raise MtprotoError(f"Unexpected send_password response: {body[:200]}")
         return data["random_hash"]
 
 
