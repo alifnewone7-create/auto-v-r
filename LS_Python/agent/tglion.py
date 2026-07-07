@@ -35,6 +35,12 @@ import httpx
 # page, not the JSON API.
 BASE_URL = os.environ.get("TGLION_BASE_URL", "https://tg-lion.net").rstrip("/")
 
+# Telegram can take a while to deliver a login code (an in-app code is near
+# instant, but an SMS fallback can take 1-2 minutes). Poll generously; both
+# knobs are overridable from the .env.
+CODE_ATTEMPTS = int(os.environ.get("TGLION_CODE_ATTEMPTS", "40"))  # 40 * 5s = ~3.3 min
+CODE_DELAY = float(os.environ.get("TGLION_CODE_DELAY", "5"))
+
 
 class TgLionError(Exception):
     pass
@@ -125,28 +131,48 @@ def get_code(number: str) -> dict[str, Any]:
     Read the most recent login code Telegram sent to `number`, plus the account's
     current cloud password. Returns { 'code': ..., 'pass': ... } (keys may be
     absent until Telegram has actually delivered a code).
+
+    NOTE (from the docs): calling getCode also makes the tg-lion bot DISABLE the
+    account's 2FA password by default, so after this the account usually has no
+    cloud password at login time.
     """
     if not number:
         raise TgLionError("number is required to read a code.")
     return _call("getCode", {"number": number})
 
 
+def read_code_now(number: str) -> tuple[Optional[str], Optional[str]]:
+    """
+    Best-effort single read of the current code/password. Never raises for the
+    normal 'no code yet' case — returns (None, None) instead. Used to snapshot a
+    BASELINE code before we trigger a fresh login, so we can tell a new code
+    apart from a stale one left over from a previous step/attempt.
+    """
+    try:
+        data = get_code(number)
+    except TgLionError:
+        return None, None
+    code = str(data.get("code") or "").strip() or None
+    passwd = data.get("pass")
+    passwd = str(passwd).strip() if passwd not in (None, "") else None
+    return code, passwd
+
+
 def poll_code(
     number: str,
     *,
-    attempts: int = 20,
-    delay: float = 3.0,
-    different_from: Optional[str] = None,
+    attempts: int = CODE_ATTEMPTS,
+    delay: float = CODE_DELAY,
+    baseline: Optional[str] = None,
 ) -> tuple[str, Optional[str]]:
     """
-    Poll getCode until Telegram has delivered a login code, returning
-    (code, password). Telegram takes a few seconds to send the code after we
-    trigger a login, so we retry.
+    Poll getCode until Telegram delivers a login code, returning (code, password).
 
-    `different_from`: when we've already consumed one code in this provisioning
-    run (e.g. the my.telegram.org code) and now need the NEXT one, pass the old
-    code so we keep polling until a genuinely new code arrives instead of
-    re-reading the stale one.
+    `baseline`: the code value that was already present BEFORE we triggered this
+    login. We keep polling until a code that differs from the baseline arrives,
+    which prevents us from grabbing a stale code (either left over from a
+    previous provisioning attempt, or the code consumed in an earlier step of
+    the same run). Snapshot it with read_code_now() right before triggering.
     """
     last_err: Optional[str] = None
     for _ in range(max(1, attempts)):
@@ -155,13 +181,14 @@ def poll_code(
             code = str(data.get("code") or "").strip()
             passwd = data.get("pass")
             passwd = str(passwd).strip() if passwd not in (None, "") else None
-            if code and (different_from is None or code != different_from):
+            if code and (baseline is None or code != baseline):
                 return code, passwd
         except TgLionError as e:
             last_err = str(e)
         time.sleep(delay)
     raise TgLionError(
         last_err
-        or f"tg-lion did not deliver a login code for {number} in time. "
-        "Telegram may be slow — the provision job will retry."
+        or f"tg-lion did not deliver a login code for {number} within "
+        f"~{int(attempts * delay)}s. Telegram may be slow — the provision job "
+        "will retry automatically."
     )

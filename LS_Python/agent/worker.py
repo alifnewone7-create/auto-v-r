@@ -124,15 +124,17 @@ async def handle_provision_tglion(job: dict) -> dict:
     # The tg-lion cloud password (used to unlock 2FA at login). We learn it from
     # the first getCode call and persist it so a retry can reuse it.
     tg_pass = acc.get("tglion_pass")
-    first_code: str | None = None
 
     # ---- STEP 1: collect api_id / api_hash from my.telegram.org -------------
     api_id = acc.get("api_id")
     api_hash = acc.get("api_hash")
     if not (api_id and api_hash):
+        # Snapshot whatever code is currently sitting on tg-lion BEFORE we
+        # trigger a new one, so poll_code waits for a genuinely fresh code
+        # rather than reusing a stale/previous-attempt code.
+        baseline1, _ = tglion.read_code_now(phone)
         random_hash = mtproto_app.send_login_code(phone)
-        code1, pass1 = tglion.poll_code(phone)
-        first_code = code1
+        code1, pass1 = tglion.poll_code(phone, baseline=baseline1)
         if pass1:
             tg_pass = pass1
             db.update_account(account_id, tglion_pass=pass1)
@@ -143,10 +145,14 @@ async def handle_provision_tglion(job: dict) -> dict:
         db.update_account(account_id, api_id=api_id, api_hash=api_hash, last_error=None)
 
     # ---- STEP 2 + 3: userbot login, then 2FA off + new 2FA set --------------
-    # tg-lion returns the newest code; keep polling until it differs from the
-    # my.telegram.org code we just consumed so we don't reuse a stale one.
+    # Snapshot the code sitting on tg-lion NOW, before provision_userbot fires a
+    # fresh login code via pyrogram's send_code. poll_code then waits for a code
+    # that differs from this baseline, so we never grab the STEP 1 code or a
+    # stale one from a previous attempt.
+    baseline2, _ = tglion.read_code_now(phone)
+
     def _fetch_login_code() -> str:
-        code, passwd = tglion.poll_code(phone, different_from=first_code)
+        code, passwd = tglion.poll_code(phone, baseline=baseline2)
         if passwd:
             # Refresh the stored password in case tg-lion rotated it.
             nonlocal tg_pass
