@@ -35,6 +35,7 @@ import random
 import socket
 import time
 import uuid
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 
@@ -121,42 +122,78 @@ async def handle_provision_tglion(job: dict) -> dict:
 
     db.set_account_status(account_id, "provisioning", None)
 
+    def progress(step: str, code: str | None = None) -> None:
+        """
+        Write a live status line (and, when we have one, the actual login code
+        read from tg-lion) onto the account row so the website can show the user
+        exactly what is happening and which code was used. `code=None` leaves the
+        stored code untouched; pass a code string to surface it in the UI.
+        """
+        fields: dict[str, Any] = {"provision_step": step}
+        if code is not None:
+            fields["provision_code"] = code
+        try:
+            db.update_account(account_id, **fields)
+        except Exception as e:  # never let a progress write kill provisioning
+            print(f"[prov] {phone}: progress write failed: {e}")
+        print(f"[prov] {phone}: {step}" + (f" (code {code})" if code else ""))
+
     # The tg-lion cloud password (used to unlock 2FA at login). We learn it from
     # the first getCode call and persist it so a retry can reuse it.
     tg_pass = acc.get("tglion_pass")
+
+    # IMPORTANT: tg-lion + my.telegram.org calls are SYNCHRONOUS and block (the
+    # code poll can sleep for minutes). Running them directly on the event loop
+    # freezes the whole agent — heartbeats stop and the website reports the agent
+    # as offline ("connection lost") mid-provision. So every blocking call below
+    # is pushed onto a worker thread via asyncio.to_thread, keeping the loop free
+    # to heartbeat, poll jobs, and drive other userbots the entire time.
 
     # ---- STEP 1: collect api_id / api_hash from my.telegram.org -------------
     api_id = acc.get("api_id")
     api_hash = acc.get("api_hash")
     if not (api_id and api_hash):
-        # Snapshot whatever code is currently sitting on tg-lion BEFORE we
-        # trigger a new one, so poll_code waits for a genuinely fresh code
-        # rather than reusing a stale/previous-attempt code.
-        baseline1, _ = tglion.read_code_now(phone)
-        random_hash = mtproto_app.send_login_code(phone)
-        code1, pass1 = tglion.poll_code(phone, baseline=baseline1)
+        progress("Requesting the my.telegram.org login code…")
+
+        def _collect_api() -> tuple[str, str, Optional[str]]:
+            # Snapshot whatever code is currently sitting on tg-lion BEFORE we
+            # trigger a new one, so poll_code waits for a genuinely fresh code
+            # rather than reusing a stale/previous-attempt code.
+            baseline1, _ = tglion.read_code_now(phone)
+            random_hash = mtproto_app.send_login_code(phone)
+            progress("Waiting for Telegram to deliver the login code…")
+            code1, pass1 = tglion.poll_code(phone, baseline=baseline1)
+            progress(f"Got login code {code1}. Creating the app on my.telegram.org…", code=code1)
+            cookies = mtproto_app.login(phone, random_hash, code1)
+            aid, ahash = mtproto_app.get_or_create_app(
+                cookies, acc["app_title"], acc["short_name"]
+            )
+            return aid, ahash, pass1
+
+        api_id, api_hash, pass1 = await asyncio.to_thread(_collect_api)
         if pass1:
             tg_pass = pass1
             db.update_account(account_id, tglion_pass=pass1)
-        cookies = mtproto_app.login(phone, random_hash, code1)
-        api_id, api_hash = mtproto_app.get_or_create_app(
-            cookies, acc["app_title"], acc["short_name"]
-        )
         db.update_account(account_id, api_id=api_id, api_hash=api_hash, last_error=None)
+        progress("API collected. Logging the userbot in…")
 
     # ---- STEP 2 + 3: userbot login, then 2FA off + new 2FA set --------------
     # Snapshot the code sitting on tg-lion NOW, before provision_userbot fires a
     # fresh login code via pyrogram's send_code. poll_code then waits for a code
     # that differs from this baseline, so we never grab the STEP 1 code or a
     # stale one from a previous attempt.
-    baseline2, _ = tglion.read_code_now(phone)
+    baseline2, _ = await asyncio.to_thread(tglion.read_code_now, phone)
 
-    def _fetch_login_code() -> str:
-        code, passwd = tglion.poll_code(phone, baseline=baseline2)
+    async def _fetch_login_code() -> str:
+        # Poll tg-lion off the event loop so the agent keeps heartbeating while
+        # we wait (this can take a couple of minutes for an SMS fallback).
+        progress("Waiting for the userbot login code from tg-lion…")
+        code, passwd = await asyncio.to_thread(tglion.poll_code, phone, baseline=baseline2)
         if passwd:
             # Refresh the stored password in case tg-lion rotated it.
             nonlocal tg_pass
             tg_pass = passwd
+        progress(f"Got userbot login code {code}. Signing in…", code=code)
         return code
 
     result = await userbot.provision_userbot(
@@ -179,6 +216,8 @@ async def handle_provision_tglion(job: dict) -> dict:
         mtproto_hash=None,
         status="logged_in",
         last_error=None,
+        provision_step=None,  # clear the live progress once we're done
+        provision_code=None,
     )
     return {
         "stage": "logged_in",

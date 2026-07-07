@@ -42,6 +42,11 @@ export interface TelegramAccount {
   source: "manual" | "tglion"
   country_code: string | null
   two_step_password: string | null
+  // Live progress of the automatic tg-lion provisioning flow (buy -> api -> login).
+  // provision_step is a human-readable status line; provision_code is the actual
+  // Telegram login code the agent read from tg-lion. Both are null once done.
+  provision_step: string | null
+  provision_code: string | null
   created_at: string
   updated_at: string
 }

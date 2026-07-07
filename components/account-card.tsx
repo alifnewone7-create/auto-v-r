@@ -17,7 +17,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import { StatusBadge } from "@/components/status-badge"
-import { Trash2, Loader2, KeyRound, ShieldCheck, Phone, AlertCircle } from "lucide-react"
+import { Trash2, Loader2, KeyRound, ShieldCheck, Phone, AlertCircle, MessageSquare } from "lucide-react"
 import { toast } from "sonner"
 import { submitMtprotoCode, startLogin, submitLoginCode, deleteAccount } from "@/app/actions/accounts"
 import type { AccountStatus, TelegramAccount } from "@/lib/types"
@@ -157,11 +157,25 @@ export function AccountCard({ account, onChange }: { account: AccountRow; onChan
 
         {/* Step-driven action area */}
         {account.status === "purchased" || account.status === "provisioning" ? (
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <Loader2 className="size-4 animate-spin" />
-            {account.status === "purchased"
-              ? "Number purchased — auto-provisioning is queued…"
-              : "Auto-provisioning: collecting API, logging in, setting 2FA…"}
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Loader2 className="size-4 animate-spin" />
+              {account.provision_step ||
+                (account.status === "purchased"
+                  ? "Number purchased — auto-provisioning is queued…"
+                  : "Auto-provisioning: collecting API, logging in, setting 2FA…")}
+            </div>
+            {account.provision_code ? (
+              <div className="flex items-center justify-between gap-2 rounded-md border border-border bg-secondary/50 p-2">
+                <span className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <MessageSquare className="size-3.5" />
+                  Telegram login code from tg-lion
+                </span>
+                <span className="font-mono text-base font-semibold tracking-widest text-foreground">
+                  {account.provision_code}
+                </span>
+              </div>
+            ) : null}
           </div>
         ) : null}
 
