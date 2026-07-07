@@ -50,15 +50,18 @@ from agent import userbot
 # OUR control. A single fixed password across all bought accounts (per config).
 NEW_2FA_PASSWORD = os.environ.get("TGLION_NEW_2FA_PASSWORD", "").strip()
 
-# A SINGLE shared Telegram api_id / api_hash (from my.telegram.org, created once
-# by hand) that is reused to log EVERY bought account in over MTProto. One app
-# credential can sign in unlimited accounts, so when these are set we skip the
-# fragile per-account my.telegram.org scraping entirely and go straight to the
-# userbot login: buy number -> send_code -> read code from tg-lion -> sign in.
-# This is the flow the user wants. my.telegram.org is only used as a fallback
-# when these are NOT configured.
-DEFAULT_API_ID = os.environ.get("TGLION_API_ID", "").strip()
-DEFAULT_API_HASH = os.environ.get("TGLION_API_HASH", "").strip()
+# A SINGLE shared Telegram api_id / api_hash that is reused to log EVERY bought
+# account in over MTProto. One app credential can sign in unlimited accounts, so
+# we NEVER touch my.telegram.org: the flow is simply
+#   buy number -> send_code -> read login code from tg-lion -> sign in.
+#
+# By default we use Telegram Desktop's well-known public app credentials so the
+# whole thing works out-of-the-box with zero extra setup. You can still override
+# them with your own app (TGLION_API_ID / TGLION_API_HASH) in .env if you prefer.
+_BUILTIN_API_ID = "2040"
+_BUILTIN_API_HASH = "b18441a1ff607e10a989891a5462e627"
+DEFAULT_API_ID = os.environ.get("TGLION_API_ID", "").strip() or _BUILTIN_API_ID
+DEFAULT_API_HASH = os.environ.get("TGLION_API_HASH", "").strip() or _BUILTIN_API_HASH
 
 POLL_SECONDS = float(os.environ.get("AGENT_POLL_SECONDS", "3"))
 # How many queued jobs to claim and run concurrently per loop. Raise this if you
@@ -106,17 +109,15 @@ def _get_profile_sem() -> asyncio.Semaphore:
 async def handle_provision_tglion(job: dict) -> dict:
     """
     Fully automatic provisioning for a number bought via tg-lion. Runs the whole
-    chain the user asked for, reading every login code straight from tg-lion so
-    no human ever types one:
+    chain the user asked for, reading the login code straight from tg-lion so no
+    human ever types one and WITHOUT ever touching my.telegram.org:
 
-      1. my.telegram.org login (code from tg-lion) -> scrape api_id / api_hash
-      2. userbot login (a fresh code from tg-lion) with 2FA handled via the
-         tg-lion-provided password
+      1. use a shared app credential (api_id / api_hash) - no scraping
+      2. userbot login: send_code makes Telegram deliver a login code to the
+         number, we read that code from tg-lion, then sign in (2FA handled via
+         the tg-lion-provided password if the account had one)
       3. turn the OLD 2FA password OFF and set OUR new fixed password
       4. store the session string and mark the account 'logged_in'
-
-    The handler is resumable: if it already collected api_id/api_hash on a prior
-    attempt it skips straight to the userbot login step.
     """
     if not NEW_2FA_PASSWORD:
         raise RuntimeError(
@@ -152,47 +153,22 @@ async def handle_provision_tglion(job: dict) -> dict:
     # the first getCode call and persist it so a retry can reuse it.
     tg_pass = acc.get("tglion_pass")
 
-    # IMPORTANT: tg-lion + my.telegram.org calls are SYNCHRONOUS and block (the
-    # code poll can sleep for minutes). Running them directly on the event loop
-    # freezes the whole agent — heartbeats stop and the website reports the agent
-    # as offline ("connection lost") mid-provision. So every blocking call below
-    # is pushed onto a worker thread via asyncio.to_thread, keeping the loop free
-    # to heartbeat, poll jobs, and drive other userbots the entire time.
+    # IMPORTANT: tg-lion calls are SYNCHRONOUS and block (the code poll can sleep
+    # for a while). Running them directly on the event loop freezes the whole
+    # agent — heartbeats stop and the website reports the agent as offline
+    # ("connection lost") mid-provision. So every blocking call below is pushed
+    # onto a worker thread via asyncio.to_thread, keeping the loop free to
+    # heartbeat, poll jobs, and drive other userbots the entire time.
 
-    # ---- STEP 1: obtain api_id / api_hash -----------------------------------
-    api_id = acc.get("api_id")
-    api_hash = acc.get("api_hash")
-    if not (api_id and api_hash):
-        if DEFAULT_API_ID and DEFAULT_API_HASH:
-            # Preferred path (what the user wants): reuse one shared app
-            # credential for the MTProto login. No my.telegram.org login, no
-            # scraping — we go straight to the userbot login below, which is what
-            # actually triggers Telegram to send the login code to the number.
-            api_id, api_hash = DEFAULT_API_ID, DEFAULT_API_HASH
-            db.update_account(account_id, api_id=api_id, api_hash=api_hash, last_error=None)
-            progress("Using shared API credentials. Logging the userbot in…")
-        else:
-            # Fallback only: no shared credential configured, so scrape a
-            # per-account app from my.telegram.org (slower, IP-sensitive).
-            progress("Requesting the my.telegram.org login code…")
-
-            def _collect_api() -> tuple[str, str, Optional[str]]:
-                random_hash = mtproto_app.send_login_code(phone)
-                progress("Waiting for Telegram to deliver the login code…")
-                code1, pass1 = tglion.poll_code(phone)
-                progress(f"Got login code {code1}. Creating the app on my.telegram.org…", code=code1)
-                cookies = mtproto_app.login(phone, random_hash, code1)
-                aid, ahash = mtproto_app.get_or_create_app(
-                    cookies, acc["app_title"], acc["short_name"]
-                )
-                return aid, ahash, pass1
-
-            api_id, api_hash, pass1 = await asyncio.to_thread(_collect_api)
-            if pass1:
-                tg_pass = pass1
-                db.update_account(account_id, tglion_pass=pass1)
-            db.update_account(account_id, api_id=api_id, api_hash=api_hash, last_error=None)
-            progress("API collected. Logging the userbot in…")
+    # ---- STEP 1: api_id / api_hash ------------------------------------------
+    # We do NOT scrape my.telegram.org (tg-lion never delivers that web-login
+    # code). Instead every account signs in with ONE shared app credential, so
+    # buying a number goes straight to the userbot login below — and THAT login
+    # is what makes Telegram send the code to the number, which tg-lion returns.
+    api_id = acc.get("api_id") or DEFAULT_API_ID
+    api_hash = acc.get("api_hash") or DEFAULT_API_HASH
+    db.update_account(account_id, api_id=api_id, api_hash=api_hash, last_error=None)
+    progress("Logging the userbot in with the purchased number…")
 
     # ---- STEP 2 + 3: userbot login, then 2FA off + new 2FA set --------------
     async def _fetch_login_code() -> str:
