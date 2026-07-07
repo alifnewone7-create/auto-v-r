@@ -182,16 +182,16 @@ def poll_code(
     *,
     attempts: int = CODE_ATTEMPTS,
     delay: float = CODE_DELAY,
-    baseline: Optional[str] = None,
 ) -> tuple[str, Optional[str]]:
     """
     Poll getCode until Telegram delivers a login code, returning (code, password).
 
-    `baseline`: the code value that was already present BEFORE we triggered this
-    login. We keep polling until a code that differs from the baseline arrives,
-    which prevents us from grabbing a stale code (either left over from a
-    previous provisioning attempt, or the code consumed in an earlier step of
-    the same run). Snapshot it with read_code_now() right before triggering.
+    Behaviour matches doing it by hand: the moment you trigger a login, tg-lion
+    exposes the code, so we simply return the FIRST code we see. Telegram issues
+    a brand-new code for every fresh login request, so whatever is sitting on
+    tg-lion right after we triggered the login is the code we want — there is no
+    need to diff it against a previous value (that older approach hung forever
+    whenever tg-lion returned the same code string it had before).
     """
     last_err: Optional[str] = None
     for _ in range(max(1, attempts)):
@@ -200,7 +200,7 @@ def poll_code(
             code = str(data.get("code") or "").strip()
             passwd = data.get("pass")
             passwd = str(passwd).strip() if passwd not in (None, "") else None
-            if code and (baseline is None or code != baseline):
+            if code:
                 return code, passwd
         except TgLionError as e:
             last_err = str(e)

@@ -156,13 +156,12 @@ async def handle_provision_tglion(job: dict) -> dict:
         progress("Requesting the my.telegram.org login code…")
 
         def _collect_api() -> tuple[str, str, Optional[str]]:
-            # Snapshot whatever code is currently sitting on tg-lion BEFORE we
-            # trigger a new one, so poll_code waits for a genuinely fresh code
-            # rather than reusing a stale/previous-attempt code.
-            baseline1, _ = tglion.read_code_now(phone)
+            # Trigger the my.telegram.org login code, then read it straight off
+            # tg-lion. Telegram issues a fresh code for this request, so the
+            # first code tg-lion returns is the one we want.
             random_hash = mtproto_app.send_login_code(phone)
             progress("Waiting for Telegram to deliver the login code…")
-            code1, pass1 = tglion.poll_code(phone, baseline=baseline1)
+            code1, pass1 = tglion.poll_code(phone)
             progress(f"Got login code {code1}. Creating the app on my.telegram.org…", code=code1)
             cookies = mtproto_app.login(phone, random_hash, code1)
             aid, ahash = mtproto_app.get_or_create_app(
@@ -178,17 +177,12 @@ async def handle_provision_tglion(job: dict) -> dict:
         progress("API collected. Logging the userbot in…")
 
     # ---- STEP 2 + 3: userbot login, then 2FA off + new 2FA set --------------
-    # Snapshot the code sitting on tg-lion NOW, before provision_userbot fires a
-    # fresh login code via pyrogram's send_code. poll_code then waits for a code
-    # that differs from this baseline, so we never grab the STEP 1 code or a
-    # stale one from a previous attempt.
-    baseline2, _ = await asyncio.to_thread(tglion.read_code_now, phone)
-
     async def _fetch_login_code() -> str:
-        # Poll tg-lion off the event loop so the agent keeps heartbeating while
-        # we wait (this can take a couple of minutes for an SMS fallback).
+        # provision_userbot fires a fresh login code via pyrogram's send_code;
+        # this callback then reads that code off tg-lion. Poll off the event
+        # loop so the agent keeps heartbeating while we wait.
         progress("Waiting for the userbot login code from tg-lion…")
-        code, passwd = await asyncio.to_thread(tglion.poll_code, phone, baseline=baseline2)
+        code, passwd = await asyncio.to_thread(tglion.poll_code, phone)
         if passwd:
             # Refresh the stored password in case tg-lion rotated it.
             nonlocal tg_pass
