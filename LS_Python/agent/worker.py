@@ -171,25 +171,28 @@ async def handle_provision_tglion(job: dict) -> dict:
     progress("Logging the userbot in with the purchased number…")
 
     # ---- STEP 2 + 3: userbot login, then 2FA off + new 2FA set --------------
-    async def _fetch_login_code() -> str:
+    async def _fetch_login_code() -> tuple[str, Optional[str]]:
         # provision_userbot fires a fresh login code via pyrogram's send_code;
-        # this callback then reads that code off tg-lion. Poll off the event
-        # loop so the agent keeps heartbeating while we wait.
+        # this callback then reads that code — AND the account's current cloud
+        # password — off tg-lion. Both come from the same getCode response, so
+        # we hand them back together: the password is what unlocks 2FA during
+        # sign-in. Poll off the event loop so the agent keeps heartbeating.
         progress("Waiting for the userbot login code from tg-lion…")
         code, passwd = await asyncio.to_thread(tglion.poll_code, phone)
         if passwd:
-            # Refresh the stored password in case tg-lion rotated it.
+            # Persist it too, so a later retry can reuse it if needed.
             nonlocal tg_pass
             tg_pass = passwd
+            db.update_account(account_id, tglion_pass=passwd)
         progress(f"Got userbot login code {code}. Signing in…", code=code)
-        return code
+        return code, passwd
 
     result = await userbot.provision_userbot(
         int(api_id),
         api_hash,
         phone,
         _fetch_login_code,
-        old_password=tg_pass,
+        old_password=tg_pass,  # fallback; the password from getCode takes priority
         new_password=NEW_2FA_PASSWORD,
     )
 

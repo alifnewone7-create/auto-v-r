@@ -178,17 +178,25 @@ async def provision_userbot(
     code). Steps, all on ONE connected client:
 
       1. send_code(phone)               -> Telegram delivers a login code
-      2. code = await fetch_code()      -> read that code from tg-lion (getCode)
+      2. code, pw = await fetch_code()  -> read that code AND the account's
+                                           current cloud password from tg-lion
+                                           (both come from the SAME getCode call)
       3. sign_in(code)                  -> if 2FA is on, Telegram raises
                                            SessionPasswordNeeded; we then
-                                           check_password(old_password)
+                                           check_password with the password
+                                           tg-lion just gave us (falling back to
+                                           old_password)
       4. TWO-STEP HANDLING (per request):
            - if the account HAD a 2FA password -> remove it (turn it OFF), then
            - set OUR new 2FA password (enable). If a password somehow still
              exists we fall back to change_cloud_password.
       5. export the authorized session string.
 
-    `fetch_code` is an async-or-sync callable returning the login code string.
+    `fetch_code` is an async-or-sync callable returning either the login code
+    string, or a (code, password) tuple. The password is the account's current
+    cloud password as reported by tg-lion's getCode `pass` field, and is what
+    unlocks 2FA at sign-in — so it MUST be read from the same response as the
+    code (that is why it is returned here rather than passed in up front).
     Returns { session_string, had_2fa, two_step_set }.
     """
     client = Client(
@@ -203,24 +211,37 @@ async def provision_userbot(
     try:
         sent = await client.send_code(phone)
 
-        # Pull the freshly-sent login code from tg-lion.
-        code = fetch_code()
-        if asyncio.iscoroutine(code):
-            code = await code
+        # Pull the freshly-sent login code (and the account's current cloud
+        # password) from tg-lion. fetch_code may return just the code, or a
+        # (code, password) tuple — the password is what unlocks 2FA.
+        fetched = fetch_code()
+        if asyncio.iscoroutine(fetched):
+            fetched = await fetched
+        code_password: Optional[str] = None
+        if isinstance(fetched, (tuple, list)):
+            code = fetched[0]
+            code_password = fetched[1] if len(fetched) > 1 else None
+        else:
+            code = fetched
         code = str(code).strip()
         if not code:
             raise UserbotError("No login code was available from tg-lion.")
+
+        # The password that came WITH this code wins; fall back to whatever was
+        # passed in (e.g. a value persisted from an earlier attempt).
+        unlock_password = code_password or old_password
 
         try:
             await client.sign_in(phone, sent.phone_code_hash, code)
         except SessionPasswordNeeded:
             had_2fa = True
-            if not old_password:
+            if not unlock_password:
                 raise UserbotError(
                     "Account has a 2FA password but tg-lion did not provide one. "
                     "Cannot log in automatically."
                 )
-            await client.check_password(old_password)
+            await client.check_password(unlock_password)
+            old_password = unlock_password  # used again below to remove the 2FA
         except (PhoneCodeInvalid, PhoneCodeExpired) as e:
             raise UserbotError(f"Login code problem: {e.__class__.__name__}")
 
