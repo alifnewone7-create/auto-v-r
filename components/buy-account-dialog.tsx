@@ -48,8 +48,11 @@ export function BuyAccountDialog({ onBought }: { onBought: () => void }) {
         toast.error(res.error)
         return
       }
+      const qty = res?.quantity ?? 1
       toast.success(
-        `Bought ${res?.phone}. Auto-provisioning started — the agent will log in and set 2FA automatically.`,
+        qty > 1
+          ? `Ordered ${qty} accounts. The agent is buying and auto-provisioning them one by one — new accounts will appear as each is set up.`
+          : `Ordered 1 account. The agent is buying and auto-provisioning it now.`,
       )
       setOpen(false)
       onBought()
@@ -71,8 +74,8 @@ export function BuyAccountDialog({ onBought }: { onBought: () => void }) {
         <DialogHeader>
           <DialogTitle>Buy &amp; auto-provision from tg-lion</DialogTitle>
           <DialogDescription>
-            Pick a country and buy a ready number. The agent then logs in, collects the API, turns off the old 2FA and
-            sets your new one — fully automatic.
+            Pick a country and how many accounts you want. The agent buys them one by one and, for each, logs in,
+            collects the API, turns off the old 2FA and sets your new one — fully automatic.
           </DialogDescription>
         </DialogHeader>
 
@@ -114,10 +117,29 @@ export function BuyAccountDialog({ onBought }: { onBought: () => void }) {
             </select>
           </div>
 
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="quantity">Quantity</Label>
+            <Input
+              id="quantity"
+              name="quantity"
+              type="number"
+              min={1}
+              max={100}
+              step={1}
+              defaultValue={1}
+              required
+              inputMode="numeric"
+            />
+            <p className="text-xs text-muted-foreground">
+              How many accounts to buy in this country (1–100). They&apos;re bought &amp; set up one by one,
+              automatically.
+            </p>
+          </div>
+
           <div className="grid grid-cols-2 gap-3">
             <div className="flex flex-col gap-2">
               <Label htmlFor="label">Label (optional)</Label>
-              <Input id="label" name="label" placeholder="e.g. Bot #1" />
+              <Input id="label" name="label" placeholder="e.g. Bot" />
             </div>
             <div className="flex flex-col gap-2">
               <Label htmlFor="max_price">Max price (optional)</Label>

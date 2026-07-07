@@ -91,6 +91,17 @@ PROFILE_JOB_DELAY_SECONDS = float(os.environ.get("AGENT_PROFILE_DELAY_SECONDS", 
 # runs finish; `attempts` is incremented on every claim (see claim_next_jobs).
 MAX_FLOOD_RETRIES = int(os.environ.get("AGENT_MAX_FLOOD_RETRIES", "25"))
 
+# Bulk tg-lion buying: after each number is bought the buy job re-queues itself
+# to buy the next one BUY_PACING_SECONDS later, so a 100-account order trickles
+# in instead of hammering tg-lion / Telegram (which would trigger rate limits and
+# waste money on numbers that then fail to log in). A single getNumber call that
+# hits a transient tg-lion error (empty body / rate limit) is retried up to
+# BUY_RETRY_ATTEMPTS times, BUY_RETRY_DELAY seconds apart, before that one
+# purchase is given up on. All overridable from .env.
+BUY_PACING_SECONDS = float(os.environ.get("AGENT_BUY_PACING_SECONDS", "8"))
+BUY_RETRY_ATTEMPTS = int(os.environ.get("AGENT_BUY_RETRY_ATTEMPTS", "4"))
+BUY_RETRY_DELAY = float(os.environ.get("AGENT_BUY_RETRY_DELAY", "15"))
+
 # Created lazily inside the running event loop (see _get_profile_sem).
 _profile_sem: asyncio.Semaphore | None = None
 
@@ -105,6 +116,95 @@ def _get_profile_sem() -> asyncio.Semaphore:
 # ---------------------------------------------------------------------------
 # Job handlers. Each returns a dict that gets stored as the job result.
 # ---------------------------------------------------------------------------
+
+async def handle_buy_tglion_batch(job: dict) -> dict:
+    """
+    Buy ONE tg-lion number for a bulk order, create its account row, queue its
+    auto-provision job, then (if more remain) re-queue THIS job to buy the next
+    number after a short pacing delay.
+
+    This "chain" keeps the whole 1..N purchase running entirely on the agent:
+      * no serverless timeout (the website only ever queues the first job),
+      * money is spent one number at a time (not all up front), and
+      * a gap between buys keeps tg-lion / Telegram from rate-limiting us.
+
+    Each bought number is provisioned by its own `provision_tglion` job, so
+    provisioning runs concurrently with the next purchase — bought in the exact
+    country the user selected.
+    """
+    p = job["payload"]
+    country_code = str(p.get("country_code") or "").strip()
+    max_price = p.get("max_price")
+    label_prefix = (p.get("label") or None)
+    remaining = int(p.get("remaining") or 1)
+    total = int(p.get("total") or remaining)
+    index = total - remaining + 1  # 1-based position of this number in the order
+    if not country_code:
+        raise RuntimeError("buy_tglion_batch job is missing country_code")
+
+    # --- buy ONE number (retry transient tg-lion errors) --------------------
+    # tg-lion calls are synchronous/blocking, so run them off the event loop to
+    # keep the agent heartbeating and other jobs moving.
+    bought: Optional[dict] = None
+    last_err: Optional[Exception] = None
+    for attempt in range(1, max(1, BUY_RETRY_ATTEMPTS) + 1):
+        try:
+            bought = await asyncio.to_thread(tglion.get_number, country_code, max_price)
+            break
+        except tglion.TgLionError as e:
+            last_err = e
+            print(f"[buy] {country_code} {index}/{total}: attempt {attempt} failed: {e}")
+            if attempt < BUY_RETRY_ATTEMPTS:
+                await asyncio.sleep(BUY_RETRY_DELAY)
+    if bought is None:
+        raise RuntimeError(
+            f"tg-lion getNumber failed after {BUY_RETRY_ATTEMPTS} tries for "
+            f"{country_code}: {last_err}"
+        )
+
+    number = str(bought.get("Number") or "").strip()
+    if not number:
+        raise RuntimeError(f"tg-lion did not return a number: {str(bought)[:200]}")
+    phone = number if number.startswith("+") else f"+{number}"
+
+    label = None
+    if label_prefix:
+        label = f"{label_prefix} #{index}" if total > 1 else label_prefix
+
+    account_id = db.create_tglion_account(phone, country_code, label)
+    if account_id is not None:
+        db.enqueue_job("provision_tglion", account_id, {"phone": phone, "country_code": country_code})
+        print(f"[buy] {country_code} {index}/{total}: bought {phone} -> account {account_id}, provisioning queued")
+    else:
+        # Extremely rare: tg-lion handed back a number we already have. Don't spend
+        # the chain on it — just move on to the next purchase.
+        print(f"[buy] {country_code} {index}/{total}: {phone} already in system, skipped")
+
+    # --- chain the next purchase, paced -------------------------------------
+    if remaining > 1:
+        db.enqueue_job_later(
+            "buy_tglion_batch",
+            None,
+            {
+                "country_code": country_code,
+                "max_price": max_price,
+                "label": label_prefix,
+                "remaining": remaining - 1,
+                "total": total,
+            },
+            BUY_PACING_SECONDS,
+        )
+        print(f"[buy] {country_code}: {remaining - 1} more to buy, next in ~{int(BUY_PACING_SECONDS)}s")
+
+    return {
+        "stage": "bought",
+        "phone": phone,
+        "index": index,
+        "total": total,
+        "price": bought.get("price"),
+        "new_balance": bought.get("new_balance"),
+    }
+
 
 async def handle_provision_tglion(job: dict) -> dict:
     """
@@ -529,6 +629,7 @@ async def _run_update_profile(job: dict) -> dict:
 
 
 HANDLERS = {
+    "buy_tglion_batch": handle_buy_tglion_batch,
     "provision_tglion": handle_provision_tglion,
     "create_app": handle_create_app,
     "submit_mtproto_code": handle_submit_mtproto_code,

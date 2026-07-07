@@ -116,6 +116,32 @@ def claim_next_jobs(limit: int = 50) -> list[dict[str, Any]]:
             return cur.fetchall()
 
 
+def enqueue_job(job_type: str, account_id: int | None, payload: dict[str, Any] | None = None) -> None:
+    """Queue a new job to run as soon as the worker next polls."""
+    query(
+        "INSERT INTO jobs (type, account_id, payload, status) VALUES (%s, %s, %s::jsonb, 'queued')",
+        (job_type, account_id, json.dumps(payload or {})),
+    )
+
+
+def enqueue_job_later(
+    job_type: str,
+    account_id: int | None,
+    payload: dict[str, Any] | None,
+    delay_seconds: float,
+) -> None:
+    """
+    Queue a new job to run only after `delay_seconds`. Used to PACE bulk buys:
+    the buy handler re-queues itself with a small delay so we don't hammer
+    tg-lion / Telegram when ordering many numbers in one go.
+    """
+    query(
+        "INSERT INTO jobs (type, account_id, payload, status, run_after) "
+        "VALUES (%s, %s, %s::jsonb, 'queued', now() + (%s || ' seconds')::interval)",
+        (job_type, account_id, json.dumps(payload or {}), max(0.0, float(delay_seconds))),
+    )
+
+
 def finish_job(job_id: int, result: dict[str, Any] | None = None) -> None:
     query(
         "UPDATE jobs SET status = 'done', result = %s::jsonb, error = NULL, updated_at = now() WHERE id = %s",
@@ -157,6 +183,24 @@ def reschedule_job(job_id: int, delay_seconds: float, note: str | None = None) -
 
 def get_account(account_id: int) -> Optional[dict[str, Any]]:
     return query_one("SELECT * FROM telegram_accounts WHERE id = %s", (account_id,))
+
+
+def create_tglion_account(phone: str, country_code: str, label: str | None = None) -> Optional[int]:
+    """
+    Insert a freshly bought tg-lion account row (status 'purchased'). Returns the
+    new account id, or None if a row for this phone already existed (so the buy
+    handler can skip re-provisioning it).
+    """
+    row = query_one(
+        """
+        INSERT INTO telegram_accounts (label, phone_number, status, source, country_code)
+        VALUES (%s, %s, 'purchased', 'tglion', %s)
+        ON CONFLICT (phone_number) DO NOTHING
+        RETURNING id
+        """,
+        (label, phone, country_code),
+    )
+    return row["id"] if row else None
 
 
 def update_account(account_id: int, **fields: Any) -> None:

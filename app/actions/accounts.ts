@@ -3,7 +3,6 @@
 import { query, queryOne } from "@/lib/db"
 import { isAuthenticated } from "@/lib/auth"
 import { revalidatePath } from "next/cache"
-import { buyNumber, TgLionError } from "@/lib/tglion"
 import type { TelegramAccount } from "@/lib/types"
 
 async function requireAuth() {
@@ -48,43 +47,42 @@ export async function addAccount(formData: FormData) {
   return { ok: true }
 }
 
+// Max accounts allowed in a single bulk tg-lion order.
+const MAX_BULK_BUY = 100
+
 /**
- * tg-lion auto-buy: purchase a number from the chosen country, create the
- * account row, and queue ONE `provision_tglion` job. The Python agent then runs
- * the whole flow automatically (reads the login code from tg-lion, collects
- * api_id/api_hash, logs the userbot in, turns off the old 2FA and sets our new
- * one) — no codes are ever typed by hand.
+ * tg-lion bulk auto-buy: hand the whole order to the Python agent as ONE chained
+ * `buy_tglion_batch` job. The agent buys one number in the chosen country,
+ * creates its account row, queues auto-provisioning for it, then re-queues itself
+ * (after a short pacing delay) to buy the next — up to `quantity`.
+ *
+ * Doing it agent-side (instead of buying here) means: no serverless timeout on
+ * big orders, money is spent one number at a time rather than all up front, and
+ * buys are paced so tg-lion / Telegram don't rate-limit us. Every bought number
+ * is provisioned fully automatically (login code read from tg-lion, api creds,
+ * userbot login, old 2FA off + our new one set) — no codes typed by hand.
  */
 export async function buyTgLionNumber(formData: FormData) {
   await requireAuth()
   const countryCode = String(formData.get("country_code") ?? "").trim()
-  const maxPrice = String(formData.get("max_price") ?? "").trim() || undefined
+  const maxPrice = String(formData.get("max_price") ?? "").trim() || null
   const label = String(formData.get("label") ?? "").trim() || null
   if (!countryCode) return { error: "Please choose a country." }
 
-  let bought
-  try {
-    bought = await buyNumber(countryCode, maxPrice)
-  } catch (e: any) {
-    return { error: e instanceof TgLionError ? e.message : (e?.message ?? "Failed to buy a number.") }
-  }
+  const quantity = Math.floor(Number(formData.get("quantity") ?? 1))
+  if (!Number.isFinite(quantity) || quantity < 1) return { error: "Quantity must be at least 1." }
+  if (quantity > MAX_BULK_BUY) return { error: `You can buy at most ${MAX_BULK_BUY} accounts at once.` }
 
-  const phone = bought.Number.startsWith("+") ? bought.Number : `+${bought.Number}`
+  await enqueueJob("buy_tglion_batch", null, {
+    country_code: countryCode,
+    max_price: maxPrice,
+    label,
+    remaining: quantity,
+    total: quantity,
+  })
 
-  const existing = await queryOne<TelegramAccount>(`SELECT id FROM telegram_accounts WHERE phone_number = $1`, [phone])
-  if (existing) {
-    return { error: `tg-lion returned ${phone} which is already in the system.` }
-  }
-
-  const account = await queryOne<TelegramAccount>(
-    `INSERT INTO telegram_accounts (label, phone_number, status, source, country_code)
-     VALUES ($1, $2, 'purchased', 'tglion', $3) RETURNING *`,
-    [label, phone, countryCode],
-  )
-
-  await enqueueJob("provision_tglion", account!.id, { phone, country_code: countryCode })
   revalidatePath("/")
-  return { ok: true, phone, price: bought.price, new_balance: bought.new_balance }
+  return { ok: true, quantity }
 }
 
 /**
