@@ -28,8 +28,23 @@ export async function joinLivestream(formData: FormData) {
   const link = String(formData.get("chat_link") ?? "").trim()
   if (!link) return { error: "Channel / group link is required." }
 
-  const accounts = await query<TelegramAccount>(`SELECT * FROM telegram_accounts WHERE status = 'logged_in'`)
-  if (accounts.length === 0) return { error: "No logged-in userbots available. Add and log in an account first." }
+  // How many userbots to send in. Blank / 0 / "all" -> use every logged-in bot.
+  const rawCount = String(formData.get("count") ?? "").trim()
+  const requested = rawCount === "" ? 0 : Number.parseInt(rawCount, 10)
+  if (rawCount !== "" && (!Number.isFinite(requested) || requested < 0)) {
+    return { error: "Enter a valid number of userbots (or leave blank for all)." }
+  }
+
+  const allAccounts = await query<TelegramAccount>(
+    // Random order so repeated joins spread across different accounts, and so a
+    // partial count doesn't always pick the same bots.
+    `SELECT * FROM telegram_accounts WHERE status = 'logged_in' ORDER BY random()`,
+  )
+  if (allAccounts.length === 0) return { error: "No logged-in userbots available. Add and log in an account first." }
+
+  // Cap the request to what's actually available; 0/blank means "all".
+  const take = requested > 0 ? Math.min(requested, allAccounts.length) : allAccounts.length
+  const accounts = allAccounts.slice(0, take)
 
   const target = await queryOne<LivestreamTarget>(
     `INSERT INTO livestream_targets (chat_link, status, total_count, joined_count)
@@ -48,7 +63,7 @@ export async function joinLivestream(formData: FormData) {
   }
 
   revalidatePath("/")
-  return { ok: true, count: accounts.length }
+  return { ok: true, count: accounts.length, available: allAccounts.length }
 }
 
 /** Make all userbots leave a live stream target. */

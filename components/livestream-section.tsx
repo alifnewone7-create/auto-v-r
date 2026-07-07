@@ -46,7 +46,9 @@ export function LivestreamSection() {
         toast.error(res.error)
         return
       }
-      toast.success(`Dispatched join to ${res?.count} userbot${res?.count === 1 ? "" : "s"}.`)
+      toast.success(
+        `Dispatched join to ${res?.count} of ${res?.available} userbot${res?.available === 1 ? "" : "s"}.`,
+      )
       mutate()
     })
   }
@@ -64,26 +66,38 @@ export function LivestreamSection() {
           <form action={handleJoin} className="flex flex-col gap-3">
             <div className="flex flex-col gap-2">
               <Label htmlFor="chat_link">Channel / group link</Label>
-              <div className="flex flex-col gap-2 sm:flex-row">
-                <div className="relative flex-1">
-                  <Link2 className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-                  <Input
-                    id="chat_link"
-                    name="chat_link"
-                    placeholder="@channel, t.me/link or t.me/+invite"
-                    className="pl-9"
-                    required
-                  />
-                </div>
-                <Button type="submit" disabled={pending} className="gap-2">
-                  {pending ? <Loader2 className="size-4 animate-spin" /> : <Radio className="size-4" />}
-                  Join with all userbots
-                </Button>
+              <div className="relative">
+                <Link2 className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  id="chat_link"
+                  name="chat_link"
+                  placeholder="@channel, t.me/link or t.me/+invite"
+                  className="pl-9"
+                  required
+                />
               </div>
-              <p className="text-xs text-muted-foreground">
-                Public or private link. All logged-in userbots join the chat, then its active live stream (listen-only).
-              </p>
             </div>
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+              <div className="flex flex-col gap-2 sm:w-48">
+                <Label htmlFor="count">How many userbots</Label>
+                <Input
+                  id="count"
+                  name="count"
+                  type="number"
+                  min={1}
+                  inputMode="numeric"
+                  placeholder="All logged-in bots"
+                />
+              </div>
+              <Button type="submit" disabled={pending} className="gap-2 sm:ml-auto">
+                {pending ? <Loader2 className="size-4 animate-spin" /> : <Radio className="size-4" />}
+                Join live stream
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Public or private link. Enter how many userbots to send in (leave blank to use all). They join the chat,
+              then its active live stream in listen-only mode.
+            </p>
           </form>
         </CardContent>
       </Card>
