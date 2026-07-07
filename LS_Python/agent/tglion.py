@@ -16,7 +16,7 @@ API (all GET, all return JSON):
 Config comes from the environment (same .env the rest of the agent uses):
   TGLION_API_KEY   (required)
   TGLION_USER_ID   (required)   -> sent as the `YourID` parameter
-  TGLION_BASE_URL  (optional)   -> defaults to https://www.tg-lion.net
+  TGLION_BASE_URL  (optional)   -> defaults to https://tg-lion.net (APEX, not www.)
 
 Every call parses JSON defensively: if tg-lion returns an empty body or an HTML
 error page (rate-limit, maintenance, bad key), we raise a clear TgLionError
@@ -31,7 +31,9 @@ from typing import Any, Optional
 
 import httpx
 
-BASE_URL = os.environ.get("TGLION_BASE_URL", "https://www.tg-lion.net").rstrip("/")
+# NOTE: use the APEX domain (tg-lion.net). The www. host serves the docs HTML
+# page, not the JSON API.
+BASE_URL = os.environ.get("TGLION_BASE_URL", "https://tg-lion.net").rstrip("/")
 
 
 class TgLionError(Exception):

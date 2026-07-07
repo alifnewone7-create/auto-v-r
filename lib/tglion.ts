@@ -6,12 +6,15 @@
 // Config (project env vars):
 //   TGLION_API_KEY   (required)
 //   TGLION_USER_ID   (required)  -> sent as `YourID`
-//   TGLION_BASE_URL  (optional)  -> defaults to https://www.tg-lion.net
+//   TGLION_BASE_URL  (optional)  -> defaults to https://tg-lion.net
+//
+// IMPORTANT: use the APEX domain (tg-lion.net). The www. host serves the docs
+// HTML page, not the JSON API, which is why get_balance was returning HTML.
 //
 // Every call parses JSON defensively so an empty body or HTML error page raises
 // a clear error instead of the cryptic "Expecting value: line 1 column 1".
 
-const BASE_URL = (process.env.TGLION_BASE_URL || "https://www.tg-lion.net").replace(/\/+$/, "")
+const BASE_URL = (process.env.TGLION_BASE_URL || "https://tg-lion.net").replace(/\/+$/, "")
 
 export class TgLionError extends Error {}
 
