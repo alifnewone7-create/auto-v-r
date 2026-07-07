@@ -156,6 +156,15 @@ export function AccountCard({ account, onChange }: { account: AccountRow; onChan
         <Separator />
 
         {/* Step-driven action area */}
+        {account.status === "purchased" || account.status === "provisioning" ? (
+          <div className="flex items-center gap-2 text-sm text-muted-foreground">
+            <Loader2 className="size-4 animate-spin" />
+            {account.status === "purchased"
+              ? "Number purchased — auto-provisioning is queued…"
+              : "Auto-provisioning: collecting API, logging in, setting 2FA…"}
+          </div>
+        ) : null}
+
         {WAITING.includes(account.status) ? (
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
             <Loader2 className="size-4 animate-spin" />

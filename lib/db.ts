@@ -55,6 +55,17 @@ CREATE TABLE IF NOT EXISTS telegram_accounts (
 ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS mtproto_hash TEXT;
 ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS login_hash   TEXT;
 
+-- tg-lion auto-provisioning columns -------------------------------------------
+-- source: 'manual' (added by hand) or 'tglion' (bought via the tg-lion API).
+-- country_code: the tg-lion country the number was bought from.
+-- tglion_pass: the CURRENT 2FA password tg-lion returns with the login code
+--   (transient: cleared once we've turned it off / replaced it).
+-- two_step_password: the NEW 2FA password we set on the account (our own).
+ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS source            TEXT NOT NULL DEFAULT 'manual';
+ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS country_code      TEXT;
+ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS tglion_pass       TEXT;
+ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS two_step_password TEXT;
+
 -- Job queue (website enqueues, Python agent claims & executes) -----------------
 CREATE TABLE IF NOT EXISTS jobs (
   id          SERIAL PRIMARY KEY,

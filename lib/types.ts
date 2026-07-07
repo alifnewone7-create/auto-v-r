@@ -3,6 +3,8 @@
 
 // Lifecycle of a Telegram account inside the system:
 //  new            -> just added, nothing done yet
+//  purchased      -> bought via tg-lion, provision job queued (fully automatic)
+//  provisioning   -> agent is running the full tg-lion flow (api + login + 2FA)
 //  api_pending    -> create_app job queued, agent logging into my.telegram.org
 //  api_code       -> agent needs the my.telegram.org login code from you
 //  api_collected  -> api_id/api_hash captured and stored
@@ -13,6 +15,8 @@
 //  failed         -> something went wrong (see last_error)
 export type AccountStatus =
   | "new"
+  | "purchased"
+  | "provisioning"
   | "api_pending"
   | "api_code"
   | "api_collected"
@@ -34,11 +38,16 @@ export interface TelegramAccount {
   status: AccountStatus
   two_factor_required: boolean
   last_error: string | null
+  // tg-lion provisioning metadata.
+  source: "manual" | "tglion"
+  country_code: string | null
+  two_step_password: string | null
   created_at: string
   updated_at: string
 }
 
 export type JobType =
+  | "provision_tglion" // full auto flow for a bought number: api + userbot login + 2FA
   | "create_app" // log into my.telegram.org, create app, return api_id/api_hash
   | "submit_mtproto_code" // pass the my.telegram.org login code to the agent
   | "send_login_code" // request a userbot login code (sent to the phone)

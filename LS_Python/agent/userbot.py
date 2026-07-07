@@ -165,6 +165,108 @@ async def complete_login(
     return final_session
 
 
+async def provision_userbot(
+    api_id: int,
+    api_hash: str,
+    phone: str,
+    fetch_code,
+    old_password: Optional[str],
+    new_password: str,
+) -> dict:
+    """
+    Fully automatic userbot login used by the tg-lion flow (no human types a
+    code). Steps, all on ONE connected client:
+
+      1. send_code(phone)               -> Telegram delivers a login code
+      2. code = await fetch_code()      -> read that code from tg-lion (getCode)
+      3. sign_in(code)                  -> if 2FA is on, Telegram raises
+                                           SessionPasswordNeeded; we then
+                                           check_password(old_password)
+      4. TWO-STEP HANDLING (per request):
+           - if the account HAD a 2FA password -> remove it (turn it OFF), then
+           - set OUR new 2FA password (enable). If a password somehow still
+             exists we fall back to change_cloud_password.
+      5. export the authorized session string.
+
+    `fetch_code` is an async-or-sync callable returning the login code string.
+    Returns { session_string, had_2fa, two_step_set }.
+    """
+    client = Client(
+        name=f"prov_{phone}",
+        api_id=int(api_id),
+        api_hash=api_hash,
+        in_memory=True,
+        phone_number=phone,
+    )
+    await client.connect()
+    had_2fa = False
+    try:
+        sent = await client.send_code(phone)
+
+        # Pull the freshly-sent login code from tg-lion.
+        code = fetch_code()
+        if asyncio.iscoroutine(code):
+            code = await code
+        code = str(code).strip()
+        if not code:
+            raise UserbotError("No login code was available from tg-lion.")
+
+        try:
+            await client.sign_in(phone, sent.phone_code_hash, code)
+        except SessionPasswordNeeded:
+            had_2fa = True
+            if not old_password:
+                raise UserbotError(
+                    "Account has a 2FA password but tg-lion did not provide one. "
+                    "Cannot log in automatically."
+                )
+            await client.check_password(old_password)
+        except (PhoneCodeInvalid, PhoneCodeExpired) as e:
+            raise UserbotError(f"Login code problem: {e.__class__.__name__}")
+
+        # ---- Two-step (cloud password) management -------------------------
+        # Requirement: if a password exists, turn it OFF first, then set OUR new
+        # one. If none exists, just set ours.
+        two_step_set = False
+        try:
+            if had_2fa and old_password:
+                # Turn the existing password OFF, then enable our new one fresh.
+                try:
+                    await client.remove_cloud_password(old_password)
+                except Exception as e:
+                    # Some libs disallow remove+enable; fall back to a direct change.
+                    await client.change_cloud_password(old_password, new_password)
+                    two_step_set = True
+                    print(f"[prov] {phone}: changed existing 2FA password directly.")
+                if not two_step_set:
+                    await client.enable_cloud_password(new_password, hint="")
+                    two_step_set = True
+                    print(f"[prov] {phone}: old 2FA removed, new 2FA set.")
+            else:
+                # No existing password -> just enable ours.
+                await client.enable_cloud_password(new_password, hint="")
+                two_step_set = True
+                print(f"[prov] {phone}: new 2FA set (no prior password).")
+        except Exception as e:
+            # An account may already carry our password from a partial prior run.
+            try:
+                await client.change_cloud_password(new_password, new_password)
+                two_step_set = True
+            except Exception:
+                # Don't fail the whole login just because 2FA (re)set hiccuped;
+                # surface it via the flag so the worker can record a warning.
+                print(f"[prov] {phone}: WARNING could not set 2FA password: {e}")
+
+        final_session = await client.export_session_string()
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+    return {"session_string": final_session, "had_2fa": had_2fa, "two_step_set": two_step_set}
+
+
 async def _ensure_online(account_id: int, api_id: int, api_hash: str, session_string: str) -> dict:
     """Start (or reuse) a live Client + PyTgCalls for this account."""
     if account_id in _POOL:

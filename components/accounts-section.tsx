@@ -3,6 +3,7 @@
 import useSWR from "swr"
 import { fetcher } from "@/lib/fetcher"
 import { AddAccountDialog } from "@/components/add-account-dialog"
+import { BuyAccountDialog } from "@/components/buy-account-dialog"
 import { ImportAccountsDialog } from "@/components/import-accounts-dialog"
 import { AccountCard } from "@/components/account-card"
 import { Users } from "lucide-react"
@@ -28,6 +29,7 @@ export function AccountsSection() {
         </div>
         <div className="flex items-center gap-2">
           <ImportAccountsDialog onImported={() => mutate()} />
+          <BuyAccountDialog onBought={() => mutate()} />
           <AddAccountDialog onAdded={() => mutate()} />
         </div>
       </div>

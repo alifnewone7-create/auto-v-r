@@ -3,6 +3,8 @@ import type { AccountStatus } from "@/lib/types"
 
 const MAP: Record<AccountStatus, { label: string; className: string }> = {
   new: { label: "New", className: "bg-muted text-muted-foreground" },
+  purchased: { label: "Purchased", className: "bg-chart-4/20 text-chart-4 border-transparent" },
+  provisioning: { label: "Auto-provisioning…", className: "bg-chart-4/20 text-chart-4 border-transparent" },
   api_pending: { label: "Collecting API…", className: "bg-chart-4/20 text-chart-4 border-transparent" },
   api_code: { label: "Needs my.telegram code", className: "bg-chart-2/20 text-chart-2 border-transparent" },
   api_collected: { label: "API ready", className: "bg-primary/15 text-primary border-transparent" },

@@ -42,7 +42,12 @@ load_dotenv()
 
 from agent import db
 from agent import mtproto_app
+from agent import tglion
 from agent import userbot
+
+# The NEW cloud (2FA) password we set on every tg-lion account so they stay under
+# OUR control. A single fixed password across all bought accounts (per config).
+NEW_2FA_PASSWORD = os.environ.get("TGLION_NEW_2FA_PASSWORD", "").strip()
 
 POLL_SECONDS = float(os.environ.get("AGENT_POLL_SECONDS", "3"))
 # How many queued jobs to claim and run concurrently per loop. Raise this if you
@@ -86,6 +91,95 @@ def _get_profile_sem() -> asyncio.Semaphore:
 # ---------------------------------------------------------------------------
 # Job handlers. Each returns a dict that gets stored as the job result.
 # ---------------------------------------------------------------------------
+
+async def handle_provision_tglion(job: dict) -> dict:
+    """
+    Fully automatic provisioning for a number bought via tg-lion. Runs the whole
+    chain the user asked for, reading every login code straight from tg-lion so
+    no human ever types one:
+
+      1. my.telegram.org login (code from tg-lion) -> scrape api_id / api_hash
+      2. userbot login (a fresh code from tg-lion) with 2FA handled via the
+         tg-lion-provided password
+      3. turn the OLD 2FA password OFF and set OUR new fixed password
+      4. store the session string and mark the account 'logged_in'
+
+    The handler is resumable: if it already collected api_id/api_hash on a prior
+    attempt it skips straight to the userbot login step.
+    """
+    if not NEW_2FA_PASSWORD:
+        raise RuntimeError(
+            "TGLION_NEW_2FA_PASSWORD is not set in the agent's .env — cannot set "
+            "the new two-step password on provisioned accounts."
+        )
+
+    account_id = job["account_id"]
+    acc = db.get_account(account_id)
+    if not acc:
+        raise RuntimeError(f"account {account_id} not found")
+    phone = acc["phone_number"]
+
+    db.set_account_status(account_id, "provisioning", None)
+
+    # The tg-lion cloud password (used to unlock 2FA at login). We learn it from
+    # the first getCode call and persist it so a retry can reuse it.
+    tg_pass = acc.get("tglion_pass")
+    first_code: str | None = None
+
+    # ---- STEP 1: collect api_id / api_hash from my.telegram.org -------------
+    api_id = acc.get("api_id")
+    api_hash = acc.get("api_hash")
+    if not (api_id and api_hash):
+        random_hash = mtproto_app.send_login_code(phone)
+        code1, pass1 = tglion.poll_code(phone)
+        first_code = code1
+        if pass1:
+            tg_pass = pass1
+            db.update_account(account_id, tglion_pass=pass1)
+        cookies = mtproto_app.login(phone, random_hash, code1)
+        api_id, api_hash = mtproto_app.get_or_create_app(
+            cookies, acc["app_title"], acc["short_name"]
+        )
+        db.update_account(account_id, api_id=api_id, api_hash=api_hash, last_error=None)
+
+    # ---- STEP 2 + 3: userbot login, then 2FA off + new 2FA set --------------
+    # tg-lion returns the newest code; keep polling until it differs from the
+    # my.telegram.org code we just consumed so we don't reuse a stale one.
+    def _fetch_login_code() -> str:
+        code, passwd = tglion.poll_code(phone, different_from=first_code)
+        if passwd:
+            # Refresh the stored password in case tg-lion rotated it.
+            nonlocal tg_pass
+            tg_pass = passwd
+        return code
+
+    result = await userbot.provision_userbot(
+        int(api_id),
+        api_hash,
+        phone,
+        _fetch_login_code,
+        old_password=tg_pass,
+        new_password=NEW_2FA_PASSWORD,
+    )
+
+    # ---- STEP 4: persist the session and finish -----------------------------
+    db.update_account(
+        account_id,
+        session_string=result["session_string"],
+        two_step_password=NEW_2FA_PASSWORD,
+        two_factor_required=True,
+        tglion_pass=None,  # no longer needed once we control the password
+        login_hash=None,
+        mtproto_hash=None,
+        status="logged_in",
+        last_error=None,
+    )
+    return {
+        "stage": "logged_in",
+        "had_2fa": result.get("had_2fa"),
+        "two_step_set": result.get("two_step_set"),
+    }
+
 
 async def handle_create_app(job: dict) -> dict:
     """
@@ -399,6 +493,7 @@ async def _run_update_profile(job: dict) -> dict:
 
 
 HANDLERS = {
+    "provision_tglion": handle_provision_tglion,
     "create_app": handle_create_app,
     "submit_mtproto_code": handle_submit_mtproto_code,
     "send_login_code": handle_send_login_code,
@@ -417,6 +512,7 @@ HANDLERS = {
 # into the 'failed' state (which makes the website ask for re-login). A livestream
 # join/leave failure must NEVER log the userbot out - the account is still valid.
 AUTH_JOB_TYPES = {
+    "provision_tglion",
     "create_app",
     "submit_mtproto_code",
     "send_login_code",
