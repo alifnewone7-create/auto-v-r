@@ -26,7 +26,6 @@ instead of the cryptic "Expecting value: line 1 column 1 (char 0)".
 from __future__ import annotations
 
 import os
-import re
 import time
 from typing import Any, Optional
 
@@ -139,55 +138,18 @@ def get_number(country_code: str, max_price: Optional[str] = None) -> dict[str, 
     return _call("getNumber", {"country_code": country_code, "maxPrice": max_price})
 
 
-# A hard credential/config problem (bad key, wrong user id, no permission, no
-# balance) will never be fixed by retrying or by trying another number format,
-# so we surface those immediately instead of silently polling until timeout.
-_HARD_ERROR_RE = re.compile(
-    r"api\s*key|apikey|yourid|your\s*id|user\s*id|invalid\s*key|permission|"
-    r"unauthor|forbidden|balance|not\s*found|no\s*number|number.*not",
-    re.IGNORECASE,
-)
-
-# Once we learn which number format tg-lion accepts for a given phone, remember
-# it so later polls don't re-probe every format on every call. Keyed by digits.
-_GETCODE_FORMAT: dict[str, str] = {}
-
-
-def _number_variants(number: str) -> list[str]:
-    """
-    tg-lion is inconsistent about how the `number` must be passed. getNumber
-    returns it as '+99800000000', but the docs example URL uses a literal '+'
-    (which servers decode to a space), and some backends key on bare digits.
-
-    We therefore try the most robust forms in order:
-      1. bare digits            -> '99800000000'   (no +/space/%2B ambiguity)
-      2. E.164 with a leading + -> '+99800000000'  (matches getNumber's output)
-      3. the raw string as given (in case it carried other formatting)
-    """
-    raw = str(number).strip()
-    digits = re.sub(r"\D", "", raw)
-    variants: list[str] = []
-    if digits:
-        variants.append(digits)
-        variants.append("+" + digits)
-    if raw and raw not in variants:
-        variants.append(raw)
-    return variants
-
-
 def get_code(number: str) -> dict[str, Any]:
     """
     Read the most recent login code Telegram sent to `number`, plus the account's
-    current cloud password. Returns the raw tg-lion dict; 'code'/'pass' may be
-    empty/absent until Telegram has actually delivered a code (a normal,
-    retry-able state — this function does NOT raise for it).
+    current cloud password. Just pass the number exactly as getNumber returned
+    it (e.g. '+99800000000'), same as the docs:
 
-    It DOES raise TgLionError for hard problems (bad API key/user id, no balance,
-    unknown number) so the caller stops polling and shows a real reason.
+        action=getCode&number=+99800000000&apiKey=...&YourID=...
+        -> { "status": "ok", "Number": "+99800000000", "code": "47607", "pass": "2345GD8R" }
 
-    We probe several `number` formats (see _number_variants) because tg-lion
-    matches numbers inconsistently, and cache whichever one it accepts so
-    subsequent polls are single-shot.
+    Returns the raw tg-lion dict; 'code'/'pass' may be empty until Telegram has
+    actually delivered a code. That is a normal, retry-able state, so we pass
+    raise_on_status=False and let poll_code keep polling instead of erroring out.
 
     NOTE (from the docs): calling getCode also makes the tg-lion bot DISABLE the
     account's 2FA password by default, so after this the account usually has no
@@ -195,42 +157,7 @@ def get_code(number: str) -> dict[str, Any]:
     """
     if not number:
         raise TgLionError("number is required to read a code.")
-
-    digits = re.sub(r"\D", "", str(number))
-    known = _GETCODE_FORMAT.get(digits)
-    variants = [known] if known else _number_variants(number)
-
-    last_data: dict[str, Any] = {}
-    last_msg: Optional[str] = None
-    for cand in variants:
-        try:
-            data = _call("getCode", {"number": cand}, raise_on_status=False)
-        except TgLionError as e:
-            # Empty body / non-JSON / network hiccup on this variant — remember
-            # the reason and try the next format.
-            last_msg = str(e)
-            continue
-
-        msg = data.get("error") or data.get("message")
-        if msg and _HARD_ERROR_RE.search(str(msg)):
-            raise TgLionError(f"tg-lion getCode error: {msg}")
-
-        code = str(data.get("code") or "").strip()
-        status = str(data.get("status", "")).lower()
-        # A valid request echoes the Number / returns status ok even before a
-        # code lands, so treat that as the accepted format and lock it in.
-        if code or status in ("ok", "success") or data.get("Number"):
-            _GETCODE_FORMAT[digits] = cand
-            return data
-
-        last_data = data
-        last_msg = str(msg) if msg else last_msg
-
-    # No format returned a code or an ok status. If tg-lion gave a message,
-    # surface it (so the agent shows the real reason, not a blank timeout).
-    if last_msg:
-        raise TgLionError(f"tg-lion getCode error: {last_msg}")
-    return last_data
+    return _call("getCode", {"number": str(number).strip()}, raise_on_status=False)
 
 
 def read_code_now(number: str) -> tuple[Optional[str], Optional[str]]:
