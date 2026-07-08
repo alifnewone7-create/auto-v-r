@@ -1,4 +1,6 @@
 import { Pool } from "pg"
+import { readdirSync, readFileSync } from "fs"
+import { join } from "path"
 
 // Single shared pg Pool. Both the website and the Python agent connect to the
 // same Neon database using DATABASE_URL. The website writes/reads jobs; the
@@ -22,16 +24,17 @@ if (process.env.NODE_ENV !== "production") {
 }
 
 // =============================================================================
-// Auto-migration — keep this in sync with scripts/001_init_schema.sql
+// Auto-migration
 // =============================================================================
-// This is the SINGLE source of truth that runs automatically the first time the
-// app touches the database. It is fully idempotent (IF NOT EXISTS everywhere),
-// so the moment a Neon database is integrated/connected, every table is created
-// on the first query — no manual script run required.
+// PRIMARY path: on the first DB query, ensureSchema() reads EVERY file in the
+// scripts/ folder (in filename order) and runs them. All scripts are idempotent
+// (IF NOT EXISTS everywhere), so the moment a Neon database is integrated the
+// entire schema is applied automatically — and any new scripts/NNN_*.sql you
+// drop in later is picked up on the next boot with zero extra wiring.
 //
-// IMPORTANT: whenever you add a new table/column/index in the future, add it
-// here (and mirror it in scripts/001_init_schema.sql) using IF NOT EXISTS so it
-// stays automatic and safe to re-run.
+// FALLBACK path: if the scripts/ folder can't be read at runtime (e.g. it was
+// not bundled into a deployment), we run this embedded copy instead so the app
+// still works. Keep it roughly in sync with the scripts as a safety net.
 const SCHEMA_SQL = /* sql */ `
 -- Telegram accounts (userbots) managed by the panel ---------------------------
 CREATE TABLE IF NOT EXISTS telegram_accounts (
@@ -250,22 +253,60 @@ CREATE INDEX IF NOT EXISTS account_messages_account_created_idx
   ON account_messages (account_id, created_at DESC);
 `
 
+// Reads every scripts/*.sql file in filename order and returns them as an
+// ordered list of { name, sql }. Returns null if the folder can't be read, so
+// the caller can fall back to the embedded SCHEMA_SQL.
+function loadScriptMigrations(): { name: string; sql: string }[] | null {
+  try {
+    const dir = join(process.cwd(), "scripts")
+    const files = readdirSync(dir)
+      .filter((f) => f.toLowerCase().endsWith(".sql"))
+      .sort() // 001_, 002_, ... apply in order
+    if (files.length === 0) return null
+    return files.map((name) => ({
+      name,
+      sql: readFileSync(join(dir, name), "utf8"),
+    }))
+  } catch {
+    return null
+  }
+}
+
+// Applies the whole schema. Prefers the scripts/ folder (so new SQL files are
+// picked up automatically); falls back to the embedded SCHEMA_SQL if the folder
+// isn't available at runtime. Every statement is idempotent, so re-running is
+// always safe.
+async function applySchema(): Promise<void> {
+  const migrations = loadScriptMigrations()
+  if (migrations) {
+    for (const { name, sql } of migrations) {
+      try {
+        await pool.query(sql)
+        console.log(`[v0] Applied migration: ${name}`)
+      } catch (err: any) {
+        console.log(`[v0] Migration ${name} failed:`, err?.message)
+        throw err
+      }
+    }
+    console.log(`[v0] Database schema ensured from ${migrations.length} script(s)`)
+    return
+  }
+  // Fallback: scripts/ folder not readable — use the embedded copy.
+  await pool.query(SCHEMA_SQL)
+  console.log("[v0] Database schema ensured (embedded fallback)")
+}
+
 // Runs the schema exactly once per process. The cached promise guarantees that
 // concurrent requests don't race to create tables — they all await the same
 // migration. If it fails, the promise is reset so the next query retries.
 export function ensureSchema(): Promise<void> {
   if (!global._schemaReady) {
-    global._schemaReady = pool
-      .query(SCHEMA_SQL)
-      .then(() => {
-        console.log("[v0] Database schema ensured (tables created if missing)")
-      })
-      .catch((err) => {
-        // Reset so a later request can retry (e.g. transient connection error).
-        global._schemaReady = undefined
-        console.log("[v0] ensureSchema failed:", err?.message)
-        throw err
-      })
+    global._schemaReady = applySchema().catch((err) => {
+      // Reset so a later request can retry (e.g. transient connection error).
+      global._schemaReady = undefined
+      console.log("[v0] ensureSchema failed:", err?.message)
+      throw err
+    })
   }
   return global._schemaReady
 }
