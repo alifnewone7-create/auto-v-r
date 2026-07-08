@@ -420,45 +420,6 @@ async def _has_active_group_call(client: Client, chat_id: int) -> bool:
         return True
 
 
-async def get_livestream_stats(account_id: int, chat_link: str) -> dict:
-    """
-    Read live-stream stats for a chat using an ALREADY-ONLINE userbot from the
-    pool: whether a group call is running and how many people (everyone, not just
-    our bots) are currently in it.
-
-    Returns {"active": bool, "participants": int, "chat_id": int | None}.
-    Never raises — on any error it just reports the stream as inactive so the
-    periodic refresh loop keeps running.
-    """
-    entry = _POOL.get(account_id)
-    if not entry:
-        return {"active": False, "participants": 0, "chat_id": None}
-    client: Client = entry["client"]
-    try:
-        chat = await client.get_chat(_normalize_link(chat_link))
-        chat_id = chat.id
-        # GetFullChannel populates `call` only while a group call is live.
-        full = await client.invoke(
-            __import__(
-                "pyrogram.raw.functions.channels", fromlist=["GetFullChannel"]
-            ).GetFullChannel(channel=await client.resolve_peer(chat_id))
-        )
-        call = getattr(full.full_chat, "call", None)
-        if call is None:
-            return {"active": False, "participants": 0, "chat_id": chat_id}
-        # Resolve the call to read its live participant count.
-        group_call = await client.invoke(
-            __import__(
-                "pyrogram.raw.functions.phone", fromlist=["GetGroupCall"]
-            ).GetGroupCall(call=call, limit=1)
-        )
-        count = getattr(group_call.call, "participants_count", 0) or 0
-        return {"active": True, "participants": int(count), "chat_id": chat_id}
-    except Exception as e:
-        print(f"[!] livestream stats failed for {chat_link}: {e}")
-        return {"active": False, "participants": 0, "chat_id": None}
-
-
 async def _resolve_and_join_chat(client: Client, chat_link: str) -> int:
     """Join the chat from a public username or a private invite link."""
     link = _normalize_link(chat_link)

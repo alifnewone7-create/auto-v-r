@@ -89,24 +89,16 @@ CREATE INDEX IF NOT EXISTS jobs_account_id_idx     ON jobs (account_id);
 
 -- Livestream / group targets ---------------------------------------------------
 CREATE TABLE IF NOT EXISTS livestream_targets (
-  id                SERIAL PRIMARY KEY,
-  chat_link         TEXT NOT NULL,
-  title             TEXT,
-  status            TEXT NOT NULL DEFAULT 'idle',
-  joined_count      INTEGER NOT NULL DEFAULT 0,
-  total_count       INTEGER NOT NULL DEFAULT 0,
-  last_error        TEXT,
-  chat_id           BIGINT,
-  live_active       BOOLEAN NOT NULL DEFAULT false,
-  live_participants INTEGER NOT NULL DEFAULT 0,
-  live_checked_at   TIMESTAMPTZ,
-  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+  id           SERIAL PRIMARY KEY,
+  chat_link    TEXT NOT NULL,
+  title        TEXT,
+  status       TEXT NOT NULL DEFAULT 'idle',
+  joined_count INTEGER NOT NULL DEFAULT 0,
+  total_count  INTEGER NOT NULL DEFAULT 0,
+  last_error   TEXT,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-ALTER TABLE livestream_targets ADD COLUMN IF NOT EXISTS chat_id           BIGINT;
-ALTER TABLE livestream_targets ADD COLUMN IF NOT EXISTS live_active       BOOLEAN NOT NULL DEFAULT false;
-ALTER TABLE livestream_targets ADD COLUMN IF NOT EXISTS live_participants INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE livestream_targets ADD COLUMN IF NOT EXISTS live_checked_at   TIMESTAMPTZ;
 
 -- Which accounts participate in which livestream target ------------------------
 CREATE TABLE IF NOT EXISTS livestream_participants (

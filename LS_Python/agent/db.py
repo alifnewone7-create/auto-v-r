@@ -292,43 +292,6 @@ def recount_livestream(target_id: int) -> None:
     )
 
 
-def set_livestream_stats(target_id: int, active: bool, participants: int, chat_id: int | None) -> None:
-    """Store the live stream's real-time stats (total people in the call)."""
-    query(
-        """
-        UPDATE livestream_targets SET
-            live_active = %s,
-            live_participants = %s,
-            chat_id = COALESCE(%s, chat_id),
-            live_checked_at = now(),
-            updated_at = now()
-        WHERE id = %s
-        """,
-        (active, participants, chat_id, target_id),
-    )
-
-
-def get_livestream_targets_for_stats() -> list[dict[str, Any]]:
-    """
-    Targets whose live stats should be refreshed: any that still have at least
-    one userbot joined (so we keep the participant count fresh while active).
-    """
-    return query(
-        """
-        SELECT t.id, t.chat_link,
-               (SELECT p.account_id FROM livestream_participants p
-                 WHERE p.target_id = t.id AND p.status = 'joined'
-                 ORDER BY p.id LIMIT 1) AS probe_account_id
-        FROM livestream_targets t
-        WHERE EXISTS (
-            SELECT 1 FROM livestream_participants p
-            WHERE p.target_id = t.id AND p.status = 'joined'
-        )
-        ORDER BY t.id
-        """
-    )
-
-
 # ---------------------------------------------------------------------------
 # Live View helpers (auto-view future channel posts)
 # ---------------------------------------------------------------------------
