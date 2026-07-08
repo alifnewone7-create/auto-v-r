@@ -15,8 +15,8 @@ export async function GET() {
            'label', a.label,
            'status', p.status,
            'last_error', p.last_error
-         ) ORDER BY p.id
-       ) FILTER (WHERE p.id IS NOT NULL), '[]') AS participants
+         ) ORDER BY p.account_id
+       ) FILTER (WHERE p.account_id IS NOT NULL), '[]') AS participants
      FROM livestream_targets t
      LEFT JOIN livestream_participants p ON p.target_id = t.id
      LEFT JOIN telegram_accounts a ON a.id = p.account_id
