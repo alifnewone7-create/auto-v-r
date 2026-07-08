@@ -27,6 +27,7 @@ from pyrogram.errors import (
     PhoneCodeInvalid,
     PhoneCodeExpired,
     ChatAdminRequired,
+    FloodWait,
 )
 from pyrogram.handlers import MessageHandler
 from pyrogram.raw.functions.messages import GetMessagesViews
@@ -62,6 +63,62 @@ class FloodWaitError(UserbotError):
 # In-memory pool of live userbots, keyed by account_id.
 # { account_id: {"client": Client, "calls": PyTgCalls} }
 _POOL: dict[int, dict] = {}
+
+# --- Live-stream join throttling -------------------------------------------
+# Joining a group call is FAR heavier than a normal API call: every join
+# negotiates a full WebRTC/NTgCalls connection (ICE + DTLS + native threads)
+# and Telegram rate-limits group-call joins aggressively per-chat. Firing
+# hundreds of joins at once (which is what happened before) melts the process
+# and makes Telegram silently drop most bots — so "bots sent, none appear".
+#
+# Instead we cap how many joins run CONCURRENTLY with a semaphore and trickle
+# them in with a small jittered gap, so even 1000 accounts join smoothly and
+# look like real viewers arriving. Tune with AGENT_JOIN_CONCURRENCY (how many
+# joins at once) and AGENT_JOIN_STAGGER_SECONDS (base gap between each join
+# acquiring a slot). Both are read once here; created lazily inside the loop.
+import os as _os
+
+JOIN_MAX_CONCURRENCY = max(1, int(_os.environ.get("AGENT_JOIN_CONCURRENCY", "8")))
+JOIN_STAGGER_SECONDS = max(0.0, float(_os.environ.get("AGENT_JOIN_STAGGER_SECONDS", "0.4")))
+# How many times a SINGLE join retries transient (non-flood) errors before it
+# gives up and the job is marked failed. Floods are handled separately (durable
+# reschedule by the worker), so this is only for momentary network / call hiccups.
+JOIN_RETRY_ATTEMPTS = max(1, int(_os.environ.get("AGENT_JOIN_RETRY_ATTEMPTS", "3")))
+
+# Accounts that are SUPPOSED to be in a live stream right now, so we can put
+# them back if Telegram/NTgCalls drops the call (network blip, server move).
+# { account_id: {"chat_id": int, "chat_link": str} }
+_ACTIVE_JOINS: dict[int, dict] = {}
+# Clients that already have the auto-rejoin handler attached (attach once).
+_REJOIN_ATTACHED: set[int] = set()
+
+_join_sem: "asyncio.Semaphore | None" = None
+
+
+def _get_join_sem() -> asyncio.Semaphore:
+    """Bounded concurrency gate for group-call joins (created in the loop)."""
+    global _join_sem
+    if _join_sem is None:
+        _join_sem = asyncio.Semaphore(JOIN_MAX_CONCURRENCY)
+    return _join_sem
+
+
+def _flood_seconds(exc: Exception) -> int | None:
+    """
+    If `exc` is (or wraps) a Telegram FloodWait, return the required wait in
+    seconds; otherwise None. pyrofork exposes the seconds as `.value`; some
+    ntgcalls wrappers surface it as `.x` or in the message text.
+    """
+    if isinstance(exc, FloodWait):
+        return int(getattr(exc, "value", None) or getattr(exc, "x", 0) or 0) or None
+    # ntgcalls sometimes re-raises floods as a generic error carrying the text.
+    msg = str(exc)
+    if "FLOOD_WAIT" in msg or "flood" in msg.lower():
+        import re
+        m = re.search(r"(\d+)", msg)
+        if m:
+            return int(m.group(1))
+    return None
 
 # In-memory pool of IN-PROGRESS login clients, keyed by phone number.
 # The userbot login is split across two jobs (send_login_code -> submit_login_code)
@@ -315,7 +372,50 @@ async def _ensure_online(account_id: int, api_id: int, api_hash: str, session_st
     calls = PyTgCalls(client)
     await calls.start()
     _POOL[account_id] = {"client": client, "calls": calls}
+    _attach_rejoin_handler(account_id, calls)
     return _POOL[account_id]
+
+
+def _attach_rejoin_handler(account_id: int, calls: PyTgCalls) -> None:
+    """
+    Best-effort: when this account's group call ends/drops unexpectedly while it
+    is still supposed to be listening, rejoin it so the userbot stays stably in
+    the live stream. Guarded + feature-detected so it can never crash the agent
+    if the installed py-tgcalls exposes a different update API.
+    """
+    if account_id in _REJOIN_ATTACHED:
+        return
+    on_update = getattr(calls, "on_update", None)
+    if not callable(on_update):
+        return
+
+    try:
+
+        @on_update()
+        async def _rejoin(_client, update) -> None:  # noqa: ANN001
+            try:
+                # Only care about "the call I should be in just ended/dropped".
+                name = update.__class__.__name__.lower()
+                if "end" not in name and "left" not in name and "disconnect" not in name:
+                    return
+                target = _ACTIVE_JOINS.get(account_id)
+                if not target:
+                    return  # we intentionally left — do not rejoin.
+                entry = _POOL.get(account_id)
+                if not entry:
+                    return
+                # Confirm a call is still running before trying to rejoin.
+                if not await _has_active_group_call(entry["client"], target["chat_id"]):
+                    return
+                await asyncio.sleep(random.uniform(1.0, 3.0))
+                await entry["calls"].play(target["chat_id"], _listen_only_stream())
+                print(f"[rejoin] account {account_id} re-joined live stream after a drop.")
+            except Exception as e:
+                print(f"[!] auto-rejoin failed for account {account_id}: {e}")
+
+        _REJOIN_ATTACHED.add(account_id)
+    except Exception as e:
+        print(f"[!] could not attach rejoin handler for account {account_id}: {e}")
 
 
 async def prewarm(accounts: list[dict]) -> int:
@@ -344,49 +444,110 @@ async def prewarm(accounts: list[dict]) -> int:
     return sum(1 for ok in results if ok)
 
 
+def _listen_only_stream() -> MediaStream:
+    """
+    A MediaStream that publishes NOTHING (listen-only). With both audio and
+    video flags set to IGNORE, NTgCalls never opens/probes the placeholder path,
+    so the file does not need to exist — this is the documented py-tgcalls 2.x
+    way to join a call as a pure listener.
+    """
+    return MediaStream(
+        "input.raw",
+        audio_flags=MediaStream.Flags.IGNORE,
+        video_flags=MediaStream.Flags.IGNORE,
+    )
+
+
+def _already_in_call(exc: Exception) -> bool:
+    """True when a join error just means this bot is already in the call."""
+    m = str(exc).lower()
+    return "already" in m and ("call" in m or "join" in m)
+
+
 async def join_livestream(
     account_id: int, api_id: int, api_hash: str, session_string: str, chat_link: str
 ) -> None:
     """
     Make the userbot join the chat (if needed) and then its active live stream /
     video chat in LISTEN-ONLY mode (we send no audio/video).
+
+    SCALE-SAFE: the actual group-call join runs behind a global semaphore so at
+    most AGENT_JOIN_CONCURRENCY joins happen at once, with a small jittered gap
+    between them. This keeps the WebRTC/NTgCalls layer from being flooded when
+    500-1000 bots are told to join together, and makes bots arrive like real
+    viewers. Transient errors are retried; Telegram FloodWaits are surfaced as
+    FloodWaitError so the worker can durably reschedule the job (never dropping
+    the bot permanently for a temporary rate limit).
     """
-    entry = await _ensure_online(account_id, api_id, api_hash, session_string)
-    client: Client = entry["client"]
-    calls: PyTgCalls = entry["calls"]
+    # Serialize the heavy work (client cold-start + call negotiation) so a burst
+    # of join jobs trickles through instead of hammering the process at once.
+    async with _get_join_sem():
+        # Jittered stagger so slots don't all fire on the same tick — natural
+        # arrival pattern + extra breathing room for Telegram's join limits.
+        if JOIN_STAGGER_SECONDS > 0:
+            await asyncio.sleep(random.uniform(0.0, JOIN_STAGGER_SECONDS))
 
-    # 1) Resolve + join the chat so the userbot is a member.
-    chat_id = await _resolve_and_join_chat(client, chat_link)
+        entry = await _ensure_online(account_id, api_id, api_hash, session_string)
+        client: Client = entry["client"]
+        calls: PyTgCalls = entry["calls"]
 
-    # 2) Make sure a live stream / video chat is actually running. If it is NOT,
-    #    pytgcalls would try phone.CreateGroupCall, which needs admin rights and
-    #    fails with CHAT_ADMIN_REQUIRED. We want to JOIN an existing stream only,
-    #    never create one, so we check first and report a clear error.
-    if not await _has_active_group_call(client, chat_id):
-        raise NoActiveLivestream(
-            "No live stream is currently running in this chat. "
-            "Start the live stream/video chat first, then add the link."
-        )
+        # 1) Resolve + join the chat so the userbot is a member.
+        chat_id = await _resolve_and_join_chat(client, chat_link)
 
-    # 3) Join the active group call (listen-only: both streams ignored).
-    try:
-        await calls.play(
-            chat_id,
-            MediaStream(
-                "input.raw",
-                audio_flags=MediaStream.Flags.IGNORE,
-                video_flags=MediaStream.Flags.IGNORE,
-            ),
-        )
-    except ChatAdminRequired:
-        # Race: the live stream ended between our check and the join attempt.
-        raise NoActiveLivestream(
-            "No live stream is currently running in this chat. "
-            "Start the live stream/video chat first, then add the link."
-        )
+        # 2) Make sure a live stream / video chat is actually running. If it is
+        #    NOT, pytgcalls would try phone.CreateGroupCall, which needs admin
+        #    rights and fails with CHAT_ADMIN_REQUIRED. We only ever JOIN an
+        #    existing stream, so we check first and report a clear error.
+        if not await _has_active_group_call(client, chat_id):
+            raise NoActiveLivestream(
+                "No live stream is currently running in this chat. "
+                "Start the live stream/video chat first, then add the link."
+            )
+
+        # 3) Join the active group call (listen-only), retrying transient errors
+        #    and converting Telegram floods into a durable reschedule.
+        last_exc: Exception | None = None
+        for attempt in range(1, JOIN_RETRY_ATTEMPTS + 1):
+            try:
+                await calls.play(chat_id, _listen_only_stream())
+                # Remember we belong here so auto-rejoin can restore us on a drop.
+                _ACTIVE_JOINS[account_id] = {"chat_id": chat_id, "chat_link": chat_link}
+                return  # joined successfully
+            except ChatAdminRequired:
+                # Race: the live stream ended between our check and the join.
+                _ACTIVE_JOINS.pop(account_id, None)
+                raise NoActiveLivestream(
+                    "No live stream is currently running in this chat. "
+                    "Start the live stream/video chat first, then add the link."
+                )
+            except Exception as e:
+                # Already in the call from a previous attempt/run -> success.
+                if _already_in_call(e):
+                    _ACTIVE_JOINS[account_id] = {"chat_id": chat_id, "chat_link": chat_link}
+                    return
+                secs = _flood_seconds(e)
+                if secs is not None:
+                    # Too-long inline wait: hand back to the worker to retry
+                    # later so this bot still joins once the limit clears. Don't
+                    # arm auto-rejoin yet — it isn't in the call.
+                    _ACTIVE_JOINS.pop(account_id, None)
+                    raise FloodWaitError(secs, what="livestream join")
+                last_exc = e
+                if attempt < JOIN_RETRY_ATTEMPTS:
+                    # Brief backoff for momentary network/call hiccups, then retry.
+                    await asyncio.sleep(1.5 * attempt + random.uniform(0.0, 1.0))
+                    continue
+                _ACTIVE_JOINS.pop(account_id, None)
+                raise UserbotError(
+                    f"Failed to join live stream after {JOIN_RETRY_ATTEMPTS} tries: "
+                    f"{e.__class__.__name__}: {e}"
+                ) from last_exc
 
 
 async def leave_livestream(account_id: int, chat_link: str) -> None:
+    # Forget it FIRST so the auto-rejoin handler treats this as an intentional
+    # leave and does not immediately drag the bot back into the call.
+    _ACTIVE_JOINS.pop(account_id, None)
     entry = _POOL.get(account_id)
     if not entry:
         return
@@ -410,6 +571,11 @@ async def leave_livestream_all(account_ids: list[int], chat_link: str) -> int:
     """
     if not account_ids:
         return 0
+
+    # Intentional leave: forget these accounts up front so auto-rejoin ignores
+    # the disconnect events we are about to trigger.
+    for aid in account_ids:
+        _ACTIVE_JOINS.pop(int(aid), None)
 
     link = _normalize_link(chat_link)
 

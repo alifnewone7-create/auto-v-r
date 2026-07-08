@@ -101,18 +101,35 @@ export async function joinLivestream(formData: FormData) {
     [link, accounts.length],
   )
 
-  for (const acc of accounts) {
-    await query(
-      `INSERT INTO livestream_participants (target_id, account_id, status)
-       VALUES ($1, $2, 'pending')
-       ON CONFLICT (target_id, account_id) DO UPDATE SET status = 'pending', last_error = NULL`,
-      [target!.id, acc.id],
-    )
-    await enqueueJob("join_livestream", acc.id, { target_id: target!.id, chat_link: link })
-  }
+  // Bulk-insert participants + join jobs in TWO round-trips (not two per bot).
+  // Looping one INSERT per account meant ~2000 sequential queries for a
+  // 1000-bot task, which is slow and can time out the server action before all
+  // jobs are queued. UNNEST fans the whole batch out in a single statement.
+  const accountIds = accounts.map((a) => a.id)
+  await enqueueJoinBatch(target!.id, link, accountIds)
 
   revalidatePath("/")
   return { ok: true, count: accounts.length, available: allAccounts.length }
+}
+
+// Queue join jobs for a whole batch of accounts at once: one INSERT for all the
+// participant rows and one INSERT for all the join_livestream jobs. Keeps
+// starting/scaling a 500-1000 bot stream fast and within serverless limits.
+async function enqueueJoinBatch(targetId: number, chatLink: string, accountIds: number[]) {
+  if (accountIds.length === 0) return
+  await query(
+    `INSERT INTO livestream_participants (target_id, account_id, status)
+     SELECT $1, uid, 'pending' FROM unnest($2::int[]) AS uid
+     ON CONFLICT (target_id, account_id) DO UPDATE SET status = 'pending', last_error = NULL`,
+    [targetId, accountIds],
+  )
+  await query(
+    `INSERT INTO jobs (type, account_id, payload, status)
+     SELECT 'join_livestream', uid,
+            jsonb_build_object('target_id', $1::int, 'chat_link', $2::text), 'queued'
+     FROM unnest($3::int[]) AS uid`,
+    [targetId, chatLink, accountIds],
+  )
 }
 
 /**
@@ -142,15 +159,7 @@ export async function addLivestreamBots(targetId: number, count: number) {
   const take = Math.min(count, available.length)
   const accounts = available.slice(0, take)
 
-  for (const acc of accounts) {
-    await query(
-      `INSERT INTO livestream_participants (target_id, account_id, status)
-       VALUES ($1, $2, 'pending')
-       ON CONFLICT (target_id, account_id) DO UPDATE SET status = 'pending', last_error = NULL`,
-      [targetId, acc.id],
-    )
-    await enqueueJob("join_livestream", acc.id, { target_id: targetId, chat_link: target.chat_link })
-  }
+  await enqueueJoinBatch(targetId, target.chat_link, accounts.map((a) => a.id))
 
   // Adding bots reactivates a stopped/failed stream.
   await query(

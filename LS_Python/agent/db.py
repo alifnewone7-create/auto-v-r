@@ -177,6 +177,52 @@ def reschedule_job(job_id: int, delay_seconds: float, note: str | None = None) -
     )
 
 
+# Job types that must always be QUICK. If one of these has been stuck in
+# 'processing' past the stale threshold it can only mean the agent that claimed
+# it died/restarted (nothing runs this long normally), so it is safe to put back
+# on the queue. We deliberately EXCLUDE view_post / react_post because those are
+# intentionally long-lived (they trickle actions over minutes) and must not be
+# requeued mid-run.
+_STALE_REQUEUE_TYPES = (
+    "join_livestream",
+    "leave_livestream",
+    "leave_livestream_all",
+    "cast_vote",
+    "retract_vote",
+    "detect_poll",
+)
+
+
+def requeue_stale_jobs(older_than_seconds: float = 600.0) -> int:
+    """
+    Recover orphaned jobs: any quick job stuck in 'processing' longer than
+    `older_than_seconds` is flipped back to 'queued' so it runs again. This is
+    what makes a big live-stream run survive an agent restart — without it, the
+    hundreds of joins claimed at crash time would sit 'processing' forever and
+    those bots would silently never join. Returns how many were recovered.
+
+    Uses a time threshold (not a blanket reset) so it stays safe when several
+    agents share the queue: a job another agent is actively working on won't be
+    yanked away unless it has clearly been abandoned.
+    """
+    secs = max(30.0, float(older_than_seconds))
+    rows = query(
+        """
+        UPDATE jobs
+        SET status = 'queued',
+            run_after = now(),
+            error = 'Recovered after agent restart (was stuck processing)',
+            updated_at = now()
+        WHERE status = 'processing'
+          AND type = ANY(%s)
+          AND claimed_at < now() - (%s || ' seconds')::interval
+        RETURNING id
+        """,
+        (list(_STALE_REQUEUE_TYPES), secs),
+    )
+    return len(rows)
+
+
 # ---------------------------------------------------------------------------
 # Account helpers
 # ---------------------------------------------------------------------------

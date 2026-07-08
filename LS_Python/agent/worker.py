@@ -932,6 +932,19 @@ async def main() -> None:
     except Exception as e:
         print(f"[!] initial heartbeat failed: {e}")
 
+    # Recover any quick jobs (esp. live-stream joins) that were stuck in
+    # 'processing' because a previous run crashed/restarted mid-batch. Without
+    # this, hundreds of joins claimed at crash time would never run again and
+    # those bots would silently never join. Short threshold on startup so a
+    # just-restarted agent recovers fast without clobbering a co-agent's fresh
+    # claims.
+    try:
+        recovered = db.requeue_stale_jobs(120)
+        if recovered:
+            print(f"[i] Recovered {recovered} orphaned job(s) from a previous run.")
+    except Exception as e:
+        print(f"[!] stale-job recovery failed: {e}")
+
     # Keep references to in-flight jobs so they aren't garbage-collected. Some
     # jobs (staggered views/reactions) intentionally stay alive for their whole
     # window, so we must NOT block the loop waiting for them.
@@ -975,6 +988,13 @@ async def main() -> None:
                     print(f"[msg] purged {removed} message(s) older than 30 min")
             except Exception as e:
                 print(f"[!] message purge failed: {e}")
+            # Also sweep up any quick jobs abandoned by a crashed peer agent.
+            try:
+                recovered = db.requeue_stale_jobs(600)
+                if recovered:
+                    print(f"[i] Recovered {recovered} stale job(s) back to the queue.")
+            except Exception as e:
+                print(f"[!] stale-job recovery failed: {e}")
             last_purge = now
 
         # Watch channels for new posts (live handler is primary; this is fallback).
