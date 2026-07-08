@@ -464,6 +464,72 @@ def _already_in_call(exc: Exception) -> bool:
     return "already" in m and ("call" in m or "join" in m)
 
 
+def _connected_chat_ids(calls: PyTgCalls) -> set[int] | None:
+    """
+    Best-effort set of chat_ids this PyTgCalls instance currently has an ACTIVE
+    call in. py-tgcalls versions differ, so we feature-detect a few known
+    accessors. Returns None when we genuinely cannot tell (in which case the
+    reconciler stays hands-off and relies on the event-driven rejoin handler,
+    to avoid needless renegotiation churn).
+    """
+    for attr in ("calls", "active_calls", "_calls"):
+        holder = getattr(calls, attr, None)
+        if isinstance(holder, dict):
+            try:
+                return {int(k) for k in holder.keys()}
+            except Exception:
+                continue
+    return None
+
+
+async def reconcile_active_joins() -> int:
+    """
+    Keep-alive safety net: for every account that is SUPPOSED to be listening in
+    a live stream, make sure it still is — and rejoin it if Telegram/NTgCalls
+    quietly dropped it. Runs periodically from the worker loop.
+
+    This is the second layer of drop protection (the first is the event-driven
+    on_update handler). It only rejoins when (a) we can positively tell the bot
+    is not connected AND (b) a live stream is actually still running, so it never
+    fights an intentional leave or churns healthy calls. All rejoins go through
+    the same concurrency gate + stagger as normal joins, so even a mass drop
+    recovers smoothly instead of in a spike. Returns how many were rejoined.
+    """
+    if not _ACTIVE_JOINS:
+        return 0
+
+    rejoined = 0
+    for account_id, target in list(_ACTIVE_JOINS.items()):
+        entry = _POOL.get(account_id)
+        if not entry:
+            continue
+        calls: PyTgCalls = entry["calls"]
+        client: Client = entry["client"]
+        chat_id = int(target["chat_id"])
+
+        connected = _connected_chat_ids(calls)
+        if connected is not None and chat_id in connected:
+            continue  # still in the call — healthy, leave it alone.
+        if connected is None:
+            continue  # can't tell reliably; event handler covers real drops.
+
+        # We appear to have dropped. Only rejoin if the stream is still live.
+        try:
+            if not await _has_active_group_call(client, chat_id):
+                continue
+            async with _get_join_sem():
+                if JOIN_STAGGER_SECONDS > 0:
+                    await asyncio.sleep(random.uniform(0.0, JOIN_STAGGER_SECONDS))
+                await calls.play(chat_id, _listen_only_stream())
+            rejoined += 1
+        except Exception as e:
+            if _flood_seconds(e) is not None:
+                continue  # rate limited right now; try again next sweep.
+            print(f"[!] reconcile rejoin failed for account {account_id}: {e}")
+            continue
+    return rejoined
+
+
 async def join_livestream(
     account_id: int, api_id: int, api_hash: str, session_string: str, chat_link: str
 ) -> None:

@@ -12,8 +12,10 @@ the agent dead-simple and robust whether you run it on a local PC or a VPS.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import threading
 from typing import Any, Optional
 
 import psycopg
@@ -21,6 +23,61 @@ from psycopg.rows import dict_row
 
 # DATABASE_URL is the Neon connection string. Same value as the website's env.
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+# Pool size. Kept modest because Neon (via the -pooler endpoint) is happiest with
+# a bounded number of server connections; the agent reuses these warm connections
+# for ALL its queries instead of doing a fresh TLS handshake every call.
+_POOL_MIN = max(1, int(os.environ.get("AGENT_DB_POOL_MIN", "2")))
+_POOL_MAX = max(_POOL_MIN, int(os.environ.get("AGENT_DB_POOL_MAX", "10")))
+
+# ---------------------------------------------------------------------------
+# Connection pool
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS: previously every query opened a brand-new psycopg connection,
+# which means a full TCP + TLS handshake to Neon (~100-300 ms) EVERY call. Those
+# calls run on the agent's single asyncio event loop, so when ~100 livestream
+# joins finished at once and each wrote its result, the loop froze for many
+# seconds doing back-to-back handshakes. While the loop is frozen, pytgcalls /
+# pyrogram can't service their sockets -> "socket.send() raised exception", the
+# agent appears stuck, and live-stream calls get dropped. A warm pooled
+# connection turns each call into ~1-5 ms, so the loop stays responsive.
+
+_pool = None            # psycopg_pool.ConnectionPool when available
+_pool_lock = threading.Lock()
+_pool_disabled = False  # set True if psycopg_pool isn't installed (fallback mode)
+
+
+def _get_pool():
+    """Lazily build the shared connection pool (thread-safe). Returns None if the
+    psycopg_pool package isn't installed, in which case we fall back to a fresh
+    connection per call."""
+    global _pool, _pool_disabled
+    if _pool is not None or _pool_disabled:
+        return _pool
+    with _pool_lock:
+        if _pool is not None or _pool_disabled:
+            return _pool
+        try:
+            from psycopg_pool import ConnectionPool
+
+            _pool = ConnectionPool(
+                conninfo=DATABASE_URL,
+                min_size=_POOL_MIN,
+                max_size=_POOL_MAX,
+                max_idle=60.0,
+                # Recycle connections periodically so a Neon compute suspend /
+                # network blip can never hand us a dead socket.
+                max_lifetime=600.0,
+                timeout=30.0,
+                kwargs={"row_factory": dict_row, "autocommit": True},
+                open=True,
+            )
+        except Exception as e:
+            # psycopg_pool missing or failed to init -> fall back gracefully.
+            print(f"[db] connection pool unavailable ({e}); using per-call connections.")
+            _pool_disabled = True
+            _pool = None
+        return _pool
 
 
 def _connect() -> psycopg.Connection:
@@ -35,6 +92,21 @@ def _connect() -> psycopg.Connection:
 
 
 def query(sql: str, params: tuple = ()) -> list[dict[str, Any]]:
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL is not set. Copy .env.example to .env and paste your "
+            "Neon connection string (the same one the website uses)."
+        )
+    pool = _get_pool()
+    if pool is not None:
+        # Reuse a warm pooled connection (fast, no TLS handshake per call).
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                if cur.description is None:
+                    return []
+                return cur.fetchall()
+    # Fallback: fresh connection per call (only when psycopg_pool isn't installed).
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
@@ -46,6 +118,18 @@ def query(sql: str, params: tuple = ()) -> list[dict[str, Any]]:
 def query_one(sql: str, params: tuple = ()) -> Optional[dict[str, Any]]:
     rows = query(sql, params)
     return rows[0] if rows else None
+
+
+async def aquery(sql: str, params: tuple = ()) -> list[dict[str, Any]]:
+    """Async wrapper: run a query in a worker thread so the caller's event loop
+    (which also drives pytgcalls) is never blocked on database I/O."""
+    return await asyncio.to_thread(query, sql, params)
+
+
+async def arun(fn, *args, **kwargs):
+    """Run any blocking db.* helper off the event loop. Use this from async code
+    (worker job handlers, the main loop) so DB writes never freeze pytgcalls."""
+    return await asyncio.to_thread(fn, *args, **kwargs)
 
 
 # ---------------------------------------------------------------------------

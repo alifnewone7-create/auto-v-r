@@ -84,6 +84,9 @@ POLL_SECONDS = float(os.environ.get("AGENT_POLL_SECONDS", "3"))
 # How many queued jobs to claim and run concurrently per loop. Raise this if you
 # have many userbots (e.g. 100) so they all join in one parallel batch.
 BATCH_SIZE = int(os.environ.get("AGENT_BATCH_SIZE", "100"))
+# Threads for off-loop DB work (asyncio.to_thread). Enough to absorb a burst of
+# finishing jobs; they mostly wait on the DB connection pool so this is cheap.
+DB_THREAD_WORKERS = max(8, int(os.environ.get("AGENT_DB_THREAD_WORKERS", "24")))
 # How often to poll watched channels for new posts (live-handler fallback).
 VIEW_POLL_SECONDS = float(os.environ.get("AGENT_VIEW_POLL_SECONDS", "5"))
 # Safety cap: never enqueue more than this many posts at once from one detection
@@ -440,22 +443,22 @@ async def handle_join_livestream(job: dict) -> dict:
     # Bail out if the task was stopped or deleted from the website while this job
     # was queued/processing. Without this a burst of queued joins would keep
     # pulling bots into a stream that the user already turned off.
-    status = db.livestream_target_status(target_id)
+    status = await db.arun(db.livestream_target_status, target_id)
     if status is None or status in ("stopped", "leaving"):
         return {"stage": "skipped", "reason": f"target {status or 'deleted'}", "target_id": target_id}
 
-    acc = db.get_account(account_id)
+    acc = await db.arun(db.get_account, account_id)
 
     try:
         await userbot.join_livestream(
             account_id, int(acc["api_id"]), acc["api_hash"], acc["session_string"], chat_link
         )
-        db.set_participant(target_id, account_id, "joined", None)
+        await db.arun(db.set_participant, target_id, account_id, "joined", None)
     except Exception as e:
-        db.set_participant(target_id, account_id, "failed", str(e)[:500])
-        db.recount_livestream(target_id)
+        await db.arun(db.set_participant, target_id, account_id, "failed", str(e)[:500])
+        await db.arun(db.recount_livestream, target_id)
         raise
-    db.recount_livestream(target_id)
+    await db.arun(db.recount_livestream, target_id)
     return {"stage": "joined", "target_id": target_id}
 
 
@@ -464,8 +467,8 @@ async def handle_leave_livestream(job: dict) -> dict:
     target_id = job["payload"]["target_id"]
     chat_link = job["payload"].get("chat_link", "")
     await userbot.leave_livestream(account_id, chat_link)
-    db.set_participant(target_id, account_id, "left", None)
-    db.recount_livestream(target_id)
+    await db.arun(db.set_participant, target_id, account_id, "left", None)
+    await db.arun(db.recount_livestream, target_id)
     return {"stage": "left", "target_id": target_id}
 
 
@@ -488,8 +491,8 @@ async def handle_leave_livestream_all(job: dict) -> dict:
 
     if target_id is not None:
         for aid in account_ids:
-            db.set_participant(int(target_id), aid, "left", None)
-        db.recount_livestream(int(target_id))
+            await db.arun(db.set_participant, int(target_id), aid, "left", None)
+        await db.arun(db.recount_livestream, int(target_id))
 
     return {"stage": "left_all", "left": left, "requested": len(account_ids)}
 
@@ -711,11 +714,14 @@ AUTH_JOB_TYPES = {
 async def process_one(job: dict) -> None:
     handler = HANDLERS.get(job["type"])
     if not handler:
-        db.fail_job(job["id"], f"Unknown job type: {job['type']}")
+        await db.arun(db.fail_job, job["id"], f"Unknown job type: {job['type']}")
         return
     try:
         result = await handler(job)
-        db.finish_job(job["id"], result)
+        # Run the result write OFF the event loop so a burst of finishing jobs
+        # never freezes pytgcalls' sockets (the old cause of the agent stalling
+        # and "socket.send() raised exception").
+        await db.arun(db.finish_job, job["id"], result)
         print(f"[OK] job #{job['id']} {job['type']} -> {result.get('stage', 'done')}")
     except userbot.FloodWaitError as e:
         # Telegram rate limit that's too long to wait out inline. Don't fail the
@@ -723,20 +729,20 @@ async def process_one(job: dict) -> None:
         # jittered buffer) so it eventually succeeds. This is what lets 500+
         # account runs complete without permanent errors.
         if job["attempts"] >= MAX_FLOOD_RETRIES:
-            db.fail_job(job["id"], f"Gave up after {job['attempts']} rate-limit retries: {e}")
+            await db.arun(db.fail_job, job["id"], f"Gave up after {job['attempts']} rate-limit retries: {e}")
             print(f"[FAIL] job #{job['id']} {job['type']}: exhausted flood retries ({e})")
         else:
             delay = e.seconds + random.uniform(3.0, 10.0)
-            db.reschedule_job(job["id"], delay, f"Rate limited, retrying in ~{int(delay)}s")
+            await db.arun(db.reschedule_job, job["id"], delay, f"Rate limited, retrying in ~{int(delay)}s")
             print(f"[WAIT] job #{job['id']} {job['type']}: rate limited, retry in ~{int(delay)}s "
                   f"(attempt {job['attempts']}/{MAX_FLOOD_RETRIES})")
     except Exception as e:
-        db.fail_job(job["id"], str(e))
+        await db.arun(db.fail_job, job["id"], str(e))
         # Only auth/login jobs may mark the account as failed. A livestream
         # join/leave error keeps the account logged in so the website does not
         # wrongly ask the user to log the userbot in again.
         if job.get("account_id") and job["type"] in AUTH_JOB_TYPES:
-            db.set_account_status(job["account_id"], "failed", str(e)[:500])
+            await db.arun(db.set_account_status, job["account_id"], "failed", str(e)[:500])
         print(f"[FAIL] job #{job['id']} {job['type']}: {e}")
 
 
@@ -931,6 +937,18 @@ async def main() -> None:
     print(f"[i] Iamhear agent '{AGENT_ID}' starting on {HOSTNAME}")
     print(f"[i] Polling every {POLL_SECONDS}s. Press Ctrl+C to stop.\n")
 
+    # All blocking DB work runs off the event loop via asyncio.to_thread (see
+    # db.arun). Give that a dedicated, bounded thread pool so a burst of ~100
+    # finishing jobs has enough threads to write results promptly without
+    # spawning an unbounded number. The threads mostly wait on the DB connection
+    # pool, so this stays light on the CPU.
+    from concurrent.futures import ThreadPoolExecutor
+
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(
+        ThreadPoolExecutor(max_workers=DB_THREAD_WORKERS, thread_name_prefix="db")
+    )
+
     # Register dispatch callbacks up front (no network needed) so any userbot
     # that warms up in the background immediately has working live handlers.
     userbot.set_view_dispatch(live_view_dispatch)
@@ -979,10 +997,10 @@ async def main() -> None:
         now = time.time()
         if now - last_beat > 10:
             try:
-                logged_in = db.query(
+                logged_in = await db.aquery(
                     "SELECT count(*) AS c FROM telegram_accounts WHERE status = 'logged_in'"
                 )
-                db.heartbeat(AGENT_ID, HOSTNAME, int(logged_in[0]["c"]))
+                await db.arun(db.heartbeat, AGENT_ID, HOSTNAME, int(logged_in[0]["c"]))
             except Exception as e:
                 print(f"[!] heartbeat failed: {e}")
             # Accounts logged in AFTER startup (e.g. freshly bought) get added to
@@ -999,18 +1017,25 @@ async def main() -> None:
         # ever shows a short, rolling window of recent notices.
         if now - last_purge > 60:
             try:
-                removed = db.purge_old_account_messages()
+                removed = await db.arun(db.purge_old_account_messages)
                 if removed:
                     print(f"[msg] purged {removed} message(s) older than 30 min")
             except Exception as e:
                 print(f"[!] message purge failed: {e}")
             # Also sweep up any quick jobs abandoned by a crashed peer agent.
             try:
-                recovered = db.requeue_stale_jobs(600)
+                recovered = await db.arun(db.requeue_stale_jobs, 600)
                 if recovered:
                     print(f"[i] Recovered {recovered} stale job(s) back to the queue.")
             except Exception as e:
                 print(f"[!] stale-job recovery failed: {e}")
+            # Keep every bot that SHOULD be live actually in the call (rejoin drops).
+            try:
+                rejoined = await userbot.reconcile_active_joins()
+                if rejoined:
+                    print(f"[rejoin] restored {rejoined} bot(s) that had dropped from the live stream.")
+            except Exception as e:
+                print(f"[!] live-stream reconcile failed: {e}")
             last_purge = now
 
         # Watch channels for new posts (live handler is primary; this is fallback).
@@ -1020,7 +1045,7 @@ async def main() -> None:
             last_view_poll = now
 
         try:
-            jobs = db.claim_next_jobs(BATCH_SIZE)
+            jobs = await db.arun(db.claim_next_jobs, BATCH_SIZE)
         except Exception as e:
             print(f"[!] DB poll error: {e}")
             await asyncio.sleep(POLL_SECONDS)
