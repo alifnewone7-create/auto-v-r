@@ -399,6 +399,52 @@ async def leave_livestream(account_id: int, chat_link: str) -> None:
         pass
 
 
+async def leave_livestream_all(account_ids: list[int], chat_link: str) -> int:
+    """
+    Drop MANY userbots out of a chat's live stream at once.
+
+    The numeric chat id is resolved a single time using any warm client, then a
+    leave_call is fired on every warm client concurrently. Because all the leaves
+    run in parallel (asyncio.gather), even 500-1000 userbots exit within a few
+    seconds instead of trickling out one job at a time. Returns how many left.
+    """
+    if not account_ids:
+        return 0
+
+    link = _normalize_link(chat_link)
+
+    # Resolve the numeric chat id once from any warm client we still hold.
+    chat_id: int | None = None
+    for aid in account_ids:
+        entry = _POOL.get(aid)
+        if not entry:
+            continue
+        try:
+            chat = await entry["client"].get_chat(link)
+            chat_id = chat.id
+            break
+        except Exception:
+            continue
+
+    async def _leave(aid: int) -> bool:
+        entry = _POOL.get(aid)
+        if not entry:
+            return False
+        calls: PyTgCalls = entry["calls"]
+        try:
+            target = chat_id
+            if target is None:
+                chat = await entry["client"].get_chat(link)
+                target = chat.id
+            await calls.leave_call(target)
+            return True
+        except Exception:
+            return False
+
+    results = await asyncio.gather(*(_leave(int(a)) for a in account_ids))
+    return sum(1 for ok in results if ok)
+
+
 async def _has_active_group_call(client: Client, chat_id: int) -> bool:
     """
     Return True if the chat currently has a live stream / video chat running.

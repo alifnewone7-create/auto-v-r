@@ -10,6 +10,7 @@ website uses, polls the `jobs` table, and executes each job:
   submit_login_code   -> finish userbot login (+2FA), store the session string
   join_livestream     -> join a chat's live stream (listen-only)
   leave_livestream    -> leave the live stream
+  leave_livestream_all-> drop a whole batch of userbots out of a stream at once
   view_post           -> view a channel post from every logged-in userbot
   detect_poll         -> read the most recent poll in a channel
   cast_vote           -> make one userbot vote on a poll option
@@ -444,6 +445,31 @@ async def handle_leave_livestream(job: dict) -> dict:
     return {"stage": "left", "target_id": target_id}
 
 
+async def handle_leave_livestream_all(job: dict) -> dict:
+    """
+    Drop a whole batch of userbots out of one live stream in a SINGLE job.
+
+    The website enqueues just one of these (with every account_id) when a task is
+    stopped or deleted, instead of one leave job per bot. All the leaves run
+    concurrently, so hundreds of userbots exit within seconds. The target row may
+    already be gone (delete case) - set_participant is guarded and recount is
+    skipped when the target no longer exists, so this stays safe either way.
+    """
+    payload = job["payload"]
+    target_id = payload.get("target_id")
+    chat_link = payload.get("chat_link", "")
+    account_ids = [int(a) for a in (payload.get("account_ids") or [])]
+
+    left = await userbot.leave_livestream_all(account_ids, chat_link)
+
+    if target_id is not None:
+        for aid in account_ids:
+            db.set_participant(int(target_id), aid, "left", None)
+        db.recount_livestream(int(target_id))
+
+    return {"stage": "left_all", "left": left, "requested": len(account_ids)}
+
+
 async def handle_view_post(job: dict) -> dict:
     """
     View a single channel post from EVERY warm userbot. One of these jobs is
@@ -637,6 +663,7 @@ HANDLERS = {
     "submit_login_code": handle_submit_login_code,
     "join_livestream": handle_join_livestream,
     "leave_livestream": handle_leave_livestream,
+    "leave_livestream_all": handle_leave_livestream_all,
     "view_post": handle_view_post,
     "detect_poll": handle_detect_poll,
     "cast_vote": handle_cast_vote,

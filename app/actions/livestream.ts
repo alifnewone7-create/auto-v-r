@@ -172,15 +172,18 @@ export async function removeLivestreamBots(targetId: number, count: number) {
   )
   if (joined.length === 0) return { error: "No joined userbots to remove." }
 
-  for (const p of joined) {
-    await query(
-      `UPDATE livestream_participants SET status = 'leaving', updated_at = now()
-        WHERE target_id = $1 AND account_id = $2`,
-      [targetId, p.account_id],
-    )
-    // chat_link is required so the agent can resolve the chat and leave its call.
-    await enqueueJob("leave_livestream", p.account_id, { target_id: targetId, chat_link: target.chat_link })
-  }
+  const accountIds = joined.map((p) => p.account_id)
+  await query(
+    `UPDATE livestream_participants SET status = 'leaving', updated_at = now()
+      WHERE target_id = $1 AND account_id = ANY($2)`,
+    [targetId, accountIds],
+  )
+  // One bulk job leaves all selected bots concurrently (fast even for hundreds).
+  await enqueueJob("leave_livestream_all", null, {
+    target_id: targetId,
+    chat_link: target.chat_link,
+    account_ids: accountIds,
+  })
 
   revalidatePath("/")
   return { ok: true, count: joined.length }
@@ -202,17 +205,25 @@ export async function leaveLivestream(targetId: number) {
       WHERE target_id = $1 AND status = 'joined'`,
     [targetId],
   )
-  for (const p of participants) {
-    await enqueueJob("leave_livestream", p.account_id, { target_id: targetId, chat_link: target.chat_link })
-  }
+  // Single bulk job so every bot leaves concurrently in seconds.
+  await enqueueJob("leave_livestream_all", null, {
+    target_id: targetId,
+    chat_link: target.chat_link,
+    account_ids: participants.map((p) => p.account_id),
+  })
   revalidatePath("/")
   return { ok: true }
 }
 
 /**
- * Delete a live stream task. Every userbot still in the stream is told to leave
- * first (leave jobs keep target_id + account_id, which is all the agent needs),
- * then the target and its participant rows are removed.
+ * Delete a live stream task. This is INSTANT on the website: we snapshot the
+ * accounts still in the stream, enqueue ONE bulk `leave_livestream_all` job
+ * carrying every account_id + the chat_link, then immediately delete the target
+ * and its participant rows. Because the leave job carries its own account list
+ * and chat_link, it does not depend on the (now-deleted) target row.
+ *
+ * The agent runs all the leaves concurrently, so even a 500-1000 bot stream is
+ * fully torn down within a minute or two of pressing delete.
  */
 export async function deleteLivestream(targetId: number) {
   await requireAuth()
@@ -222,9 +233,18 @@ export async function deleteLivestream(targetId: number) {
       WHERE target_id = $1 AND status = ANY($2)`,
     [targetId, ACTIVE_PARTICIPANT_STATUSES],
   )
-  for (const p of participants) {
-    await enqueueJob("leave_livestream", p.account_id, { target_id: targetId, chat_link: target?.chat_link ?? "" })
+
+  const accountIds = participants.map((p) => p.account_id)
+  if (accountIds.length > 0) {
+    // Single bulk leave job: instant to enqueue, processed concurrently so all
+    // bots drop out fast. target_id is omitted on purpose since the row is about
+    // to be deleted (the job only needs account_ids + chat_link to leave).
+    await enqueueJob("leave_livestream_all", null, {
+      chat_link: target?.chat_link ?? "",
+      account_ids: accountIds,
+    })
   }
+
   await query(`DELETE FROM livestream_participants WHERE target_id = $1`, [targetId])
   await query(`DELETE FROM livestream_targets WHERE id = $1`, [targetId])
   revalidatePath("/")
