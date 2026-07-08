@@ -38,8 +38,20 @@ import time
 import uuid
 from typing import Any, Optional
 
+from pathlib import Path
+
 from dotenv import load_dotenv
 
+# Load config from the LS_Python folder regardless of the current working
+# directory (so `python -m agent.worker` and `python agent/worker.py` both work
+# on the VPS). We load .env first, then .env.vps with override=True, so a VPS
+# box can drop in a .env.vps that wins over a shared .env — matching what the
+# .env.vps header documents. Both files are optional; real env vars still win
+# when nothing is overridden.
+_LS_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(_LS_ROOT / ".env")
+load_dotenv(_LS_ROOT / ".env.vps", override=True)
+# Also honor a plain `.env` in the current directory as a last resort.
 load_dotenv()
 
 from agent import db
