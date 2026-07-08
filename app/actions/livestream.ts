@@ -161,6 +161,9 @@ export async function removeLivestreamBots(targetId: number, count: number) {
   await requireAuth()
   if (!Number.isFinite(count) || count < 1) return { error: "Enter how many userbots to remove." }
 
+  const target = await queryOne<LivestreamTarget>(`SELECT * FROM livestream_targets WHERE id = $1`, [targetId])
+  if (!target) return { error: "Live stream not found." }
+
   const joined = await query<{ account_id: number }>(
     `SELECT account_id FROM livestream_participants
       WHERE target_id = $1 AND status = 'joined'
@@ -175,7 +178,8 @@ export async function removeLivestreamBots(targetId: number, count: number) {
         WHERE target_id = $1 AND account_id = $2`,
       [targetId, p.account_id],
     )
-    await enqueueJob("leave_livestream", p.account_id, { target_id: targetId })
+    // chat_link is required so the agent can resolve the chat and leave its call.
+    await enqueueJob("leave_livestream", p.account_id, { target_id: targetId, chat_link: target.chat_link })
   }
 
   revalidatePath("/")
@@ -185,6 +189,9 @@ export async function removeLivestreamBots(targetId: number, count: number) {
 /** Make ALL userbots leave a live stream target. */
 export async function leaveLivestream(targetId: number) {
   await requireAuth()
+  const target = await queryOne<LivestreamTarget>(`SELECT * FROM livestream_targets WHERE id = $1`, [targetId])
+  if (!target) return { error: "Live stream not found." }
+
   const participants = await query<{ account_id: number }>(
     `SELECT account_id FROM livestream_participants WHERE target_id = $1 AND status = 'joined'`,
     [targetId],
@@ -196,7 +203,7 @@ export async function leaveLivestream(targetId: number) {
     [targetId],
   )
   for (const p of participants) {
-    await enqueueJob("leave_livestream", p.account_id, { target_id: targetId })
+    await enqueueJob("leave_livestream", p.account_id, { target_id: targetId, chat_link: target.chat_link })
   }
   revalidatePath("/")
   return { ok: true }
@@ -209,13 +216,14 @@ export async function leaveLivestream(targetId: number) {
  */
 export async function deleteLivestream(targetId: number) {
   await requireAuth()
+  const target = await queryOne<LivestreamTarget>(`SELECT * FROM livestream_targets WHERE id = $1`, [targetId])
   const participants = await query<{ account_id: number }>(
     `SELECT account_id FROM livestream_participants
       WHERE target_id = $1 AND status = ANY($2)`,
     [targetId, ACTIVE_PARTICIPANT_STATUSES],
   )
   for (const p of participants) {
-    await enqueueJob("leave_livestream", p.account_id, { target_id: targetId })
+    await enqueueJob("leave_livestream", p.account_id, { target_id: targetId, chat_link: target?.chat_link ?? "" })
   }
   await query(`DELETE FROM livestream_participants WHERE target_id = $1`, [targetId])
   await query(`DELETE FROM livestream_targets WHERE id = $1`, [targetId])
