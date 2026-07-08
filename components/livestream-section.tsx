@@ -9,11 +9,12 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Badge } from "@/components/ui/badge"
 import { Separator } from "@/components/ui/separator"
-import { Radio, LogOut, Trash2, Loader2, CheckCircle2, XCircle, Link2, Plus, Minus, Users, AlertCircle } from "lucide-react"
+import { Radio, LogOut, Trash2, Loader2, CheckCircle2, XCircle, Link2, Plus, Minus, Users, AlertCircle, Square } from "lucide-react"
 import { toast } from "sonner"
 import {
   joinLivestream,
   leaveLivestream,
+  stopLivestream,
   deleteLivestream,
   addLivestreamBots,
   removeLivestreamBots,
@@ -84,6 +85,20 @@ function TargetCard({
         </div>
         <div className="flex items-center gap-1">
           <Badge className={STATUS_STYLES[target.status] ?? STATUS_STYLES.idle}>{target.status}</Badge>
+          {RUNNING_STATUSES.includes(target.status) ? (
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-8 text-chart-4 hover:text-chart-4"
+              title="Stop task now (turns off instantly, all userbots leave)"
+              disabled={pending}
+              onClick={() =>
+                run(() => stopLivestream(target.id), (n) => `Task stopped — ${n} userbot${n === 1 ? "" : "s"} leaving.`)
+              }
+            >
+              <Square className="size-4 fill-current" />
+            </Button>
+          ) : null}
           <Button
             variant="ghost"
             size="icon"

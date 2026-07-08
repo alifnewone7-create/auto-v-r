@@ -216,6 +216,48 @@ export async function leaveLivestream(targetId: number) {
 }
 
 /**
+ * INSTANTLY stop a running live stream task without deleting it.
+ *
+ * The moment this is called the target flips to `stopped` (a non-running status),
+ * so the single-task lock is released immediately and a new task can be started
+ * within a second — no waiting for hundreds of bots to physically leave. All the
+ * userbots still in the stream are dropped by ONE bulk `leave_livestream_all`
+ * job that the agent runs concurrently, so they exit within a minute or two.
+ * The task row is kept so you can add bots to it again later.
+ */
+export async function stopLivestream(targetId: number) {
+  await requireAuth()
+  const target = await queryOne<LivestreamTarget>(`SELECT * FROM livestream_targets WHERE id = $1`, [targetId])
+  if (!target) return { error: "Live stream not found." }
+
+  const participants = await query<{ account_id: number }>(
+    `SELECT account_id FROM livestream_participants
+      WHERE target_id = $1 AND status = ANY($2)`,
+    [targetId, ACTIVE_PARTICIPANT_STATUSES],
+  )
+  const accountIds = participants.map((p) => p.account_id)
+
+  // Flip to stopped right away — releases the single-task lock instantly.
+  await query(`UPDATE livestream_targets SET status = 'stopped', updated_at = now() WHERE id = $1`, [targetId])
+  await query(
+    `UPDATE livestream_participants SET status = 'leaving', updated_at = now()
+      WHERE target_id = $1 AND status = ANY($2)`,
+    [targetId, ACTIVE_PARTICIPANT_STATUSES],
+  )
+
+  if (accountIds.length > 0) {
+    await enqueueJob("leave_livestream_all", null, {
+      target_id: targetId,
+      chat_link: target.chat_link,
+      account_ids: accountIds,
+    })
+  }
+
+  revalidatePath("/")
+  return { ok: true, count: accountIds.length }
+}
+
+/**
  * Delete a live stream task. This is INSTANT on the website: we snapshot the
  * accounts still in the stream, enqueue ONE bulk `leave_livestream_all` job
  * carrying every account_id + the chat_link, then immediately delete the target
