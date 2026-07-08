@@ -1,10 +1,14 @@
 "use client"
 
+import { useState, useTransition } from "react"
 import useSWR from "swr"
 import { fetcher } from "@/lib/fetcher"
 import { Card } from "@/components/ui/card"
-import { Server, Wifi, WifiOff, ListChecks, Loader2 } from "lucide-react"
+import { Button } from "@/components/ui/button"
+import { Server, Wifi, WifiOff, ListChecks, Loader2, Ban } from "lucide-react"
+import { toast } from "sonner"
 import type { Agent } from "@/lib/types"
+import { killProcessingJobs } from "@/app/actions/jobs"
 
 interface AgentsResponse {
   agents: (Agent & { online: boolean })[]
@@ -13,7 +17,24 @@ interface AgentsResponse {
 }
 
 export function AgentStatusBar() {
-  const { data } = useSWR<AgentsResponse>("/api/agents", fetcher, { refreshInterval: 4000 })
+  const { data, mutate } = useSWR<AgentsResponse>("/api/agents", fetcher, { refreshInterval: 4000 })
+  const [pending, startTransition] = useTransition()
+  const [confirming, setConfirming] = useState(false)
+  const processing = data?.processing ?? 0
+
+  const handleKill = () => {
+    startTransition(async () => {
+      const res = await killProcessingJobs()
+      if (res?.ok) {
+        toast.success(`Killed ${res.count} running job${res.count === 1 ? "" : "s"}.`)
+        setConfirming(false)
+        mutate()
+      } else {
+        toast.error("Could not kill jobs.")
+      }
+    })
+  }
+
   const agents = data?.agents ?? []
   const onlineAgents = agents.filter((a) => a.online)
   const anyOnline = onlineAgents.length > 0
@@ -52,10 +73,35 @@ export function AgentStatusBar() {
           <span className="text-muted-foreground">queued</span>
         </div>
         <div className="flex items-center gap-2 text-sm">
-          <Loader2 className={`size-4 text-muted-foreground ${(data?.processing ?? 0) > 0 ? "animate-spin" : ""}`} />
-          <span className="font-medium">{data?.processing ?? 0}</span>
+          <Loader2 className={`size-4 text-muted-foreground ${processing > 0 ? "animate-spin" : ""}`} />
+          <span className="font-medium">{processing}</span>
           <span className="text-muted-foreground">running</span>
         </div>
+
+        {processing > 0 ? (
+          confirming ? (
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="destructive" onClick={handleKill} disabled={pending}>
+                {pending ? <Loader2 className="size-4 animate-spin" /> : <Ban className="size-4" />}
+                Confirm kill
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => setConfirming(false)} disabled={pending}>
+                Cancel
+              </Button>
+            </div>
+          ) : (
+            <Button
+              size="sm"
+              variant="outline"
+              className="text-destructive hover:text-destructive"
+              onClick={() => setConfirming(true)}
+              title="Mark all running jobs as failed (use when the agent is stuck/offline)"
+            >
+              <Ban className="size-4" />
+              Kill running
+            </Button>
+          )
+        ) : null}
       </div>
     </Card>
   )
