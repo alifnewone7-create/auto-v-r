@@ -23,6 +23,19 @@ async function enqueueJob(type: string, accountId: number | null, payload: Recor
   ])
 }
 
+// Cancel every still-queued join_livestream job for a target. Called when a task
+// is stopped/deleted so the worker stops pulling more bots INTO a stream that is
+// being torn down (otherwise queued joins keep running "in the backend").
+async function cancelQueuedJoinJobs(targetId: number) {
+  await query(
+    `DELETE FROM jobs
+      WHERE type = 'join_livestream'
+        AND status = 'queued'
+        AND (payload->>'target_id')::int = $1`,
+    [targetId],
+  )
+}
+
 // Recomputes total_count from the live participant set so the card always shows
 // how many userbots are actually in (or heading into) the stream.
 async function syncTotalCount(targetId: number) {
@@ -195,6 +208,9 @@ export async function leaveLivestream(targetId: number) {
   const target = await queryOne<LivestreamTarget>(`SELECT * FROM livestream_targets WHERE id = $1`, [targetId])
   if (!target) return { error: "Live stream not found." }
 
+  // Stop the worker from joining any more bots into this stream.
+  await cancelQueuedJoinJobs(targetId)
+
   const participants = await query<{ account_id: number }>(
     `SELECT account_id FROM livestream_participants WHERE target_id = $1 AND status = 'joined'`,
     [targetId],
@@ -229,6 +245,9 @@ export async function stopLivestream(targetId: number) {
   await requireAuth()
   const target = await queryOne<LivestreamTarget>(`SELECT * FROM livestream_targets WHERE id = $1`, [targetId])
   if (!target) return { error: "Live stream not found." }
+
+  // Drop any queued joins first so the worker stops feeding bots into the stream.
+  await cancelQueuedJoinJobs(targetId)
 
   const participants = await query<{ account_id: number }>(
     `SELECT account_id FROM livestream_participants
@@ -270,6 +289,11 @@ export async function stopLivestream(targetId: number) {
 export async function deleteLivestream(targetId: number) {
   await requireAuth()
   const target = await queryOne<LivestreamTarget>(`SELECT * FROM livestream_targets WHERE id = $1`, [targetId])
+
+  // Kill queued joins so the worker can't keep pulling bots into a task we are
+  // about to delete.
+  await cancelQueuedJoinJobs(targetId)
+
   const participants = await query<{ account_id: number }>(
     `SELECT account_id FROM livestream_participants
       WHERE target_id = $1 AND status = ANY($2)`,

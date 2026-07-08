@@ -420,6 +420,14 @@ async def handle_join_livestream(job: dict) -> dict:
     account_id = job["account_id"]
     target_id = job["payload"]["target_id"]
     chat_link = job["payload"]["chat_link"]
+
+    # Bail out if the task was stopped or deleted from the website while this job
+    # was queued/processing. Without this a burst of queued joins would keep
+    # pulling bots into a stream that the user already turned off.
+    status = db.livestream_target_status(target_id)
+    if status is None or status in ("stopped", "leaving"):
+        return {"stage": "skipped", "reason": f"target {status or 'deleted'}", "target_id": target_id}
+
     acc = db.get_account(account_id)
 
     try:

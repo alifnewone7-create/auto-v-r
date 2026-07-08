@@ -297,6 +297,17 @@ def recount_livestream(target_id: int) -> None:
     )
 
 
+def livestream_target_status(target_id: int) -> str | None:
+    """
+    Return the current status of a livestream target, or None if the row no
+    longer exists. Used by the join handler to bail out when a task was stopped
+    or deleted from the website while its join job was still queued/processing,
+    so bots are never pulled into a stream that is being torn down.
+    """
+    row = query_one("SELECT status FROM livestream_targets WHERE id = %s", (target_id,))
+    return row["status"] if row else None
+
+
 # ---------------------------------------------------------------------------
 # Live View helpers (auto-view future channel posts)
 # ---------------------------------------------------------------------------
