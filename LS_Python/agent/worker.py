@@ -87,6 +87,10 @@ BATCH_SIZE = int(os.environ.get("AGENT_BATCH_SIZE", "100"))
 # Threads for off-loop DB work (asyncio.to_thread). Enough to absorb a burst of
 # finishing jobs; they mostly wait on the DB connection pool so this is cheap.
 DB_THREAD_WORKERS = max(8, int(os.environ.get("AGENT_DB_THREAD_WORKERS", "24")))
+# How often (seconds) to check that every bot which SHOULD be live still is, and
+# rejoin any that dropped. Lower = faster mass-drop recovery. 15s is a good
+# balance; it's near-free when everyone is healthy.
+RECONCILE_SECONDS = max(5.0, float(os.environ.get("AGENT_RECONCILE_SECONDS", "15")))
 # How often to poll watched channels for new posts (live-handler fallback).
 VIEW_POLL_SECONDS = float(os.environ.get("AGENT_VIEW_POLL_SECONDS", "5"))
 # Safety cap: never enqueue more than this many posts at once from one detection
@@ -992,6 +996,7 @@ async def main() -> None:
     last_beat = 0.0
     last_view_poll = 0.0
     last_purge = 0.0
+    last_reconcile = 0.0
     while True:
         # Heartbeat so the website shows the agent as online.
         now = time.time()
@@ -1029,14 +1034,20 @@ async def main() -> None:
                     print(f"[i] Recovered {recovered} stale job(s) back to the queue.")
             except Exception as e:
                 print(f"[!] stale-job recovery failed: {e}")
-            # Keep every bot that SHOULD be live actually in the call (rejoin drops).
+            last_purge = now
+
+        # Live-stream keep-alive on its OWN fast cadence (independent of the 60s
+        # purge above). This is what makes a mass-drop like "300 joined, 270 left"
+        # self-heal within seconds: any bot that dropped is rejoined through the
+        # throttle. Runs often but is near-free when everyone is healthy.
+        if now - last_reconcile > RECONCILE_SECONDS:
             try:
                 rejoined = await userbot.reconcile_active_joins()
                 if rejoined:
                     print(f"[rejoin] restored {rejoined} bot(s) that had dropped from the live stream.")
             except Exception as e:
                 print(f"[!] live-stream reconcile failed: {e}")
-            last_purge = now
+            last_reconcile = now
 
         # Watch channels for new posts (live handler is primary; this is fallback).
         if now - last_view_poll > VIEW_POLL_SECONDS:
