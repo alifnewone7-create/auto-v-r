@@ -93,6 +93,17 @@ JOIN_RETRY_ATTEMPTS = max(1, int(_os.environ.get("AGENT_JOIN_RETRY_ATTEMPTS", "3
 # so a transient GetFullChannel blip can never make hundreds of bots leave.
 STREAM_GONE_CONFIRMATIONS = max(1, int(_os.environ.get("AGENT_STREAM_GONE_CONFIRMATIONS", "4")))
 
+# Exponential backoff between failed rejoin attempts for a SINGLE bot. This is
+# what stops a mass recovery from turning into a re-play() storm: instead of
+# re-joining every dropped bot on every 15s sweep, a bot that just failed waits
+# BASE, then 2x, 4x… up to MAX before its next try. That keeps the shared event
+# loop responsive so the native WebRTC keepalives fire on time and connections
+# actually survive. A bot is still NEVER abandoned — it just retries more gently.
+REJOIN_BACKOFF_BASE_SECONDS = max(1.0, float(_os.environ.get("AGENT_REJOIN_BACKOFF_BASE", "10")))
+REJOIN_BACKOFF_MAX_SECONDS = max(
+    REJOIN_BACKOFF_BASE_SECONDS, float(_os.environ.get("AGENT_REJOIN_BACKOFF_MAX", "120"))
+)
+
 # Accounts that are SUPPOSED to be in a live stream right now, so we can put
 # them back if Telegram/NTgCalls drops the call (network blip, server move, or a
 # server-side call restart — the usual cause of "300 joined, 270 suddenly left").
@@ -117,9 +128,13 @@ _REJOIN_ATTACHED: set[int] = set()
 # stream looks alive again.
 _STREAM_GONE_STRIKES: dict[int, int] = {}
 
-# Per-account count of consecutive failed rejoin attempts. Used ONLY for backoff
-# logging / diagnostics — a failing bot is retried forever, never abandoned.
+# Per-account count of consecutive failed rejoin attempts. Drives the backoff
+# below. A failing bot is retried forever, never abandoned — just less often.
 _JOIN_FAILS: dict[int, int] = {}
+
+# Per-account earliest monotonic time we may retry a failed rejoin. Set from the
+# exponential backoff after a failure; cleared on success or intentional leave.
+_NEXT_RETRY_AT: dict[int, float] = {}
 
 _join_sem: "asyncio.Semaphore | None" = None
 
@@ -430,8 +445,23 @@ def _attach_rejoin_handler(account_id: int, calls: PyTgCalls) -> None:
                 name = update.__class__.__name__.lower()
                 if account_id not in _ACTIVE_JOINS:
                     return  # we intentionally left — ignore.
-                # A drop / end / leave / kicked event for a call we should be in.
-                if any(k in name for k in ("end", "left", "leav", "disconnect", "kick", "closed")):
+
+                # CRITICAL: a listen-only join publishes no media, so pytgcalls
+                # fires StreamEnded (and pause/resume) almost immediately even
+                # though the bot is STILL in the call as a listener. Treating
+                # that as a "drop" made the reconciler re-play() the bot every
+                # sweep, and with every bot in one event loop that re-play storm
+                # starved the WebRTC keepalives and got everyone kicked. So these
+                # routine media events are explicitly NOT membership changes.
+                if any(k in name for k in ("streamend", "ended", "pause", "resume")):
+                    return
+
+                # Only events that mean the bot TRULY left the call count as a
+                # drop. (LeftGroupCall / KickedFromGroupCall / Disconnected /
+                # ClosedVoiceChat.) The reconciler then rejoins it — unless the
+                # host's whole stream has ended, which its per-chat liveness check
+                # confirms separately.
+                if any(k in name for k in ("left", "leav", "kick", "disconnect", "closed")):
                     _LIVE_STATE[account_id] = "dropped"
                 # A positive "joined/connected" event confirms health.
                 elif any(k in name for k in ("join", "connect")):
@@ -497,6 +527,7 @@ def _forget_join(account_id: int) -> None:
     _ACTIVE_JOINS.pop(account_id, None)
     _LIVE_STATE.pop(account_id, None)
     _JOIN_FAILS.pop(account_id, None)
+    _NEXT_RETRY_AT.pop(account_id, None)
 
 
 async def _teardown_client(account_id: int) -> None:
@@ -576,17 +607,26 @@ async def _rejoin_one(account_id: int, target: dict) -> bool:
             await calls.play(chat_id, _listen_only_stream())
             _LIVE_STATE[account_id] = "connected"
             _JOIN_FAILS.pop(account_id, None)
+            _NEXT_RETRY_AT.pop(account_id, None)
             return True
         except Exception as e:
             if _already_in_call(e):
                 _LIVE_STATE[account_id] = "connected"
                 _JOIN_FAILS.pop(account_id, None)
+                _NEXT_RETRY_AT.pop(account_id, None)
                 return True
             # Could not rejoin right now (rate limit / transient error). Stay
-            # 'dropped' and retry next sweep — we NEVER abandon the bot. Track the
-            # failure streak for diagnostics only.
+            # 'dropped' — we NEVER abandon the bot — but back off before the next
+            # try so a wave of failures can't re-play-storm the event loop.
             fails = _JOIN_FAILS.get(account_id, 0) + 1
             _JOIN_FAILS[account_id] = fails
+            delay = min(
+                REJOIN_BACKOFF_MAX_SECONDS,
+                REJOIN_BACKOFF_BASE_SECONDS * (2 ** (fails - 1)),
+            )
+            # Small jitter so many bots don't all come off backoff on the same tick.
+            delay += random.uniform(0.0, min(5.0, delay * 0.25))
+            _NEXT_RETRY_AT[account_id] = time.monotonic() + delay
             _LIVE_STATE[account_id] = "dropped"
             return False
 
@@ -615,6 +655,8 @@ async def reconcile_active_joins() -> int:
     """
     if not _ACTIVE_JOINS:
         return 0
+
+    now = time.monotonic()
 
     # Group the accounts that SHOULD be live by their chat, so each stream's
     # liveness is checked a single time regardless of how many bots are in it.
@@ -681,13 +723,20 @@ async def reconcile_active_joins() -> int:
                 dropped = True
 
             if dropped:
-                to_rejoin.append((account_id, target))
+                # Respect per-account backoff: a bot that just failed waits its
+                # exponential delay before the next try. This is what keeps a mass
+                # recovery from re-play-storming the shared event loop (the storm
+                # itself starves keepalives and drops connections). First-time
+                # drops have no timer, so they retry on this very sweep.
+                next_at = _NEXT_RETRY_AT.get(account_id)
+                if next_at is None or now >= next_at:
+                    to_rejoin.append((account_id, target))
 
     if not to_rejoin:
         return 0
 
-    # Recover everyone in parallel; the semaphore inside _rejoin_one paces it so a
-    # full mass-drop comes back smoothly without re-overloading the process.
+    # Recover the due bots in parallel; the semaphore inside _rejoin_one paces it
+    # so even a full mass-drop comes back smoothly without re-overloading the loop.
     results = await asyncio.gather(
         *(_rejoin_one(aid, tgt) for aid, tgt in to_rejoin),
         return_exceptions=True,
