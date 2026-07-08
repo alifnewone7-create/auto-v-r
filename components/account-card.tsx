@@ -20,6 +20,7 @@ import { StatusBadge } from "@/components/status-badge"
 import { Trash2, Loader2, KeyRound, ShieldCheck, Phone, AlertCircle, MessageSquare } from "lucide-react"
 import { toast } from "sonner"
 import { submitMtprotoCode, startLogin, submitLoginCode, deleteAccount } from "@/app/actions/accounts"
+import { AccountMessagesDialog } from "@/components/account-messages-dialog"
 import type { AccountStatus, TelegramAccount } from "@/lib/types"
 
 type AccountRow = Omit<TelegramAccount, "session_string"> & { has_session: boolean }
@@ -249,9 +250,16 @@ export function AccountCard({ account, onChange }: { account: AccountRow; onChan
         ) : null}
 
         {account.status === "logged_in" ? (
-          <div className="flex items-center gap-2 text-sm text-chart-3">
-            <ShieldCheck className="size-4" />
-            Session stored — ready to join live streams.
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-sm text-chart-3">
+              <ShieldCheck className="size-4" />
+              Session stored — ready to join live streams.
+            </div>
+            <AccountMessagesDialog
+              accountId={account.id}
+              phone={account.phone_number}
+              label={account.label}
+            />
           </div>
         ) : null}
 

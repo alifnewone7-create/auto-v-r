@@ -465,6 +465,9 @@ def _normalize_link(chat_link: str) -> str:
 _VIEW_DISPATCH = None
 # Set by the worker. Called as: await _REACTION_DISPATCH(chat_id, message_id)
 _REACTION_DISPATCH = None
+# Set by the worker. Called as:
+#   await _MESSAGE_DISPATCH(account_id, body, telegram_message_id, sender, message_date)
+_MESSAGE_DISPATCH = None
 
 
 def set_view_dispatch(callback) -> None:
@@ -477,6 +480,12 @@ def set_reaction_dispatch(callback) -> None:
     """Register the worker callback that turns a detected post into reaction jobs."""
     global _REACTION_DISPATCH
     _REACTION_DISPATCH = callback
+
+
+def set_message_dispatch(callback) -> None:
+    """Register the worker callback that stores an incoming Telegram message."""
+    global _MESSAGE_DISPATCH
+    _MESSAGE_DISPATCH = callback
 
 
 def _first_client() -> Optional[Client]:
@@ -633,6 +642,62 @@ def attach_view_handlers() -> int:
         handler = MessageHandler(_on_channel_post, post_filter)
         client.add_handler(handler)
         entry["view_handler"] = handler
+        count += 1
+    return count
+
+
+# ===========================================================================
+# Incoming messages: surface Telegram's service messages (login codes, notices)
+# ===========================================================================
+
+# Telegram's official service account. All system messages — login codes,
+# security alerts, "new login" notices — arrive from this peer. We deliberately
+# ONLY capture messages from this account: nothing the user chats with is stored,
+# just Telegram's own notices, which is exactly what the panel needs to show.
+TELEGRAM_SERVICE_ID = 777000
+
+
+def _account_id_for_client(client: Client) -> Optional[int]:
+    """Reverse-lookup which pooled account a client belongs to."""
+    for acc_id, entry in _POOL.items():
+        if entry.get("client") is client:
+            return acc_id
+    return None
+
+
+async def _on_service_message(client: Client, message) -> None:
+    """Live handler: a private message arrived from Telegram's service account."""
+    if _MESSAGE_DISPATCH is None:
+        return
+    body = getattr(message, "text", None) or getattr(message, "caption", None)
+    if not body:
+        return
+    account_id = _account_id_for_client(client)
+    if account_id is None:
+        return
+    # message.date is a datetime; psycopg stores it directly as timestamptz.
+    message_date = getattr(message, "date", None)
+    try:
+        await _MESSAGE_DISPATCH(account_id, str(body), int(message.id), "Telegram", message_date)
+    except Exception as e:
+        print(f"[!] message store failed (account {account_id}): {e}")
+
+
+def attach_message_handlers() -> int:
+    """
+    Attach the service-message handler to every warm client so each userbot's
+    incoming Telegram notices are captured live. Returns how many were attached.
+    """
+    count = 0
+    # Only private (one-to-one) messages from Telegram's service account 777000.
+    service_filter = filters.private & filters.user(TELEGRAM_SERVICE_ID)
+    for entry in _POOL.values():
+        client: Client = entry["client"]
+        if entry.get("message_handler"):
+            continue  # already attached
+        handler = MessageHandler(_on_service_message, service_filter)
+        client.add_handler(handler)
+        entry["message_handler"] = handler
         count += 1
     return count
 

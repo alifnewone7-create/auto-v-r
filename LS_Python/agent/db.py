@@ -203,6 +203,44 @@ def create_tglion_account(phone: str, country_code: str, label: str | None = Non
     return row["id"] if row else None
 
 
+# ---------------------------------------------------------------------------
+# Incoming Telegram messages (ephemeral, 30-minute window)
+# ---------------------------------------------------------------------------
+
+def store_account_message(
+    account_id: int,
+    body: str,
+    telegram_message_id: int | None,
+    sender: str = "Telegram",
+    message_date: Any = None,
+) -> None:
+    """
+    Save one incoming Telegram message for an account. ON CONFLICT DO NOTHING on
+    (account_id, telegram_message_id) makes it safe if the same update is
+    delivered more than once — a given message is stored only the first time.
+    """
+    query(
+        """
+        INSERT INTO account_messages (account_id, sender, telegram_message_id, body, message_date)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (account_id, telegram_message_id) DO NOTHING
+        """,
+        (account_id, sender, telegram_message_id, body, message_date),
+    )
+
+
+def purge_old_account_messages() -> int:
+    """
+    Delete every stored message older than 30 minutes. Returns how many rows were
+    removed. Called periodically by the worker so the table only ever holds a
+    short, rolling window of recent notices.
+    """
+    rows = query(
+        "DELETE FROM account_messages WHERE created_at < now() - interval '30 minutes' RETURNING id"
+    )
+    return len(rows)
+
+
 def update_account(account_id: int, **fields: Any) -> None:
     if not fields:
         return

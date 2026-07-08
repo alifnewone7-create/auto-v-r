@@ -229,6 +229,25 @@ CREATE TABLE IF NOT EXISTS profile_updates (
 
 CREATE INDEX IF NOT EXISTS profile_updates_account_idx ON profile_updates (account_id);
 CREATE INDEX IF NOT EXISTS profile_updates_created_idx ON profile_updates (created_at DESC);
+
+-- Incoming Telegram messages surfaced per userbot account ----------------------
+-- Only messages from Telegram's official service account (id 777000, "Telegram")
+-- are stored — these carry login codes and other system notices. They are
+-- ephemeral: the agent deletes anything older than 30 minutes, so this table
+-- only ever holds a short, rolling window of recent notices.
+CREATE TABLE IF NOT EXISTS account_messages (
+  id                  BIGSERIAL PRIMARY KEY,
+  account_id          INTEGER NOT NULL REFERENCES telegram_accounts(id) ON DELETE CASCADE,
+  sender              TEXT NOT NULL DEFAULT 'Telegram',
+  telegram_message_id BIGINT,
+  body                TEXT NOT NULL,
+  message_date        TIMESTAMPTZ,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (account_id, telegram_message_id)
+);
+
+CREATE INDEX IF NOT EXISTS account_messages_account_created_idx
+  ON account_messages (account_id, created_at DESC);
 `
 
 // Runs the schema exactly once per process. The cached promise guarantees that

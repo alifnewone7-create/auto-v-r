@@ -204,6 +204,19 @@ export interface ProfileUpdate {
   updated_at: string
 }
 
+// An incoming Telegram message surfaced for an account. Only messages from
+// Telegram's official service account (777000, "Telegram") are captured — these
+// carry login codes and system notices. They live for 30 minutes then the agent
+// purges them, so the UI only ever shows a short rolling window.
+export interface AccountMessage {
+  id: number
+  sender: string
+  body: string
+  telegram_message_id: number | null
+  message_date: string | null
+  created_at: string
+}
+
 // A telegram account row enriched with the latest profile-edit result, used by
 // the bulk profile editor UI.
 export interface ProfileAccountRow {

@@ -809,6 +809,17 @@ async def live_reaction_dispatch(chat_id: int, message_id: int) -> None:
     await dispatch_reactions_for_target(target, chat_id, message_id)
 
 
+async def live_message_dispatch(
+    account_id: int, body: str, telegram_message_id: int, sender: str, message_date
+) -> None:
+    """Live-handler callback: a userbot received a system message from Telegram."""
+    try:
+        db.store_account_message(account_id, body, telegram_message_id, sender, message_date)
+        print(f"[msg] account {account_id}: stored Telegram message #{telegram_message_id}")
+    except Exception as e:
+        print(f"[!] failed to store message for account {account_id}: {e}")
+
+
 async def poll_reaction_targets() -> None:
     """
     Fallback detector for reaction channels: resolve chat_id/title on first sight,
@@ -855,6 +866,13 @@ async def main() -> None:
     if attached:
         print(f"[i] Live View + Reaction handlers attached to {attached} userbot(s).")
 
+    # Capture each userbot's incoming Telegram service messages (login codes, etc.)
+    # so the panel can show them per account (auto-purged after 30 minutes).
+    userbot.set_message_dispatch(live_message_dispatch)
+    msg_attached = userbot.attach_message_handlers()
+    if msg_attached:
+        print(f"[i] Message capture attached to {msg_attached} userbot(s).")
+
     # Keep references to in-flight jobs so they aren't garbage-collected. Some
     # jobs (staggered views/reactions) intentionally stay alive for their whole
     # window, so we must NOT block the loop waiting for them.
@@ -862,6 +880,7 @@ async def main() -> None:
 
     last_beat = 0.0
     last_view_poll = 0.0
+    last_purge = 0.0
     while True:
         # Heartbeat so the website shows the agent as online.
         now = time.time()
@@ -873,7 +892,26 @@ async def main() -> None:
                 db.heartbeat(AGENT_ID, HOSTNAME, int(logged_in[0]["c"]))
             except Exception as e:
                 print(f"[!] heartbeat failed: {e}")
+            # Accounts logged in AFTER startup (e.g. freshly bought) get added to
+            # the pool later, so re-attach handlers here. attach_* skip clients
+            # that already have one, so this is cheap and idempotent.
+            try:
+                userbot.attach_view_handlers()
+                userbot.attach_message_handlers()
+            except Exception as e:
+                print(f"[!] handler re-attach failed: {e}")
             last_beat = now
+
+        # Auto-purge Telegram messages older than 30 minutes so the panel only
+        # ever shows a short, rolling window of recent notices.
+        if now - last_purge > 60:
+            try:
+                removed = db.purge_old_account_messages()
+                if removed:
+                    print(f"[msg] purged {removed} message(s) older than 30 min")
+            except Exception as e:
+                print(f"[!] message purge failed: {e}")
+            last_purge = now
 
         # Watch channels for new posts (live handler is primary; this is fallback).
         if now - last_view_poll > VIEW_POLL_SECONDS:
