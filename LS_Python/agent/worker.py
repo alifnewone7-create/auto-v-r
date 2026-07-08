@@ -40,13 +40,7 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 
-# On a VPS you keep production settings in `.env.vps` (higher priority). If it is
-# not present we fall back to the normal `.env`, so local dev keeps working.
-_HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_VPS_ENV = os.path.join(_HERE, ".env.vps")
-if os.path.exists(_VPS_ENV):
-    load_dotenv(_VPS_ENV)
-load_dotenv()  # fills in anything not already set from .env
+load_dotenv()
 
 from agent import db
 from agent import mtproto_app
