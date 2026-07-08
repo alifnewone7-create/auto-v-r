@@ -43,14 +43,18 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # Load config from the LS_Python folder regardless of the current working
-# directory (so `python -m agent.worker` and `python agent/worker.py` both work
-# on the VPS). We load .env first, then .env.vps with override=True, so a VPS
-# box can drop in a .env.vps that wins over a shared .env — matching what the
-# .env.vps header documents. Both files are optional; real env vars still win
-# when nothing is overridden.
+# directory (so `python -m agent.worker` and `python agent/worker.py` both work).
+# `.env` is the main config and works for BOTH local PC and VPS.
+#
+# `.env.vps` is an OPTIONAL real override for a VPS box that wants different
+# values than a shared `.env` (only load it when it actually exists — never the
+# `.env.vps.example` template, which holds placeholders like
+# ep-xxxxxxxxxxxx.neon.tech that would clobber a real DATABASE_URL).
 _LS_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(_LS_ROOT / ".env")
-load_dotenv(_LS_ROOT / ".env.vps", override=True)
+_vps_env = _LS_ROOT / ".env.vps"
+if _vps_env.exists():
+    load_dotenv(_vps_env, override=True)
 # Also honor a plain `.env` in the current directory as a last resort.
 load_dotenv()
 
