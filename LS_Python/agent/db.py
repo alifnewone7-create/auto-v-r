@@ -258,14 +258,19 @@ def set_account_status(account_id: int, status: str, error: str | None = None) -
 # ---------------------------------------------------------------------------
 
 def set_participant(target_id: int, account_id: int, status: str, error: str | None = None) -> None:
+    # Guard against a deleted target: if the live stream task was removed while a
+    # leave job was still queued, the bot has already physically left the call and
+    # the participant bookkeeping is no longer needed. The WHERE EXISTS keeps the
+    # INSERT from violating the target_id foreign key.
     query(
         """
         INSERT INTO livestream_participants (target_id, account_id, status, last_error)
-        VALUES (%s, %s, %s, %s)
+        SELECT %s, %s, %s, %s
+        WHERE EXISTS (SELECT 1 FROM livestream_targets WHERE id = %s)
         ON CONFLICT (target_id, account_id)
         DO UPDATE SET status = EXCLUDED.status, last_error = EXCLUDED.last_error, updated_at = now()
         """,
-        (target_id, account_id, status, error),
+        (target_id, account_id, status, error, target_id),
     )
 
 
