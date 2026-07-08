@@ -887,31 +887,60 @@ async def poll_reaction_targets() -> None:
             print(f"[!] reaction poll failed for target {t['id']}: {e}")
 
 
-async def main() -> None:
-    print(f"[i] Iamhear agent '{AGENT_ID}' starting on {HOSTNAME}")
-    print(f"[i] Polling every {POLL_SECONDS}s. Press Ctrl+C to stop.\n")
+async def startup_warmup() -> None:
+    """
+    Connect all logged-in userbots and attach live handlers IN THE BACKGROUND.
 
-    # Warm all logged-in userbots up front so join jobs only run calls.play().
+    This used to run (awaited) before the main loop started, so the agent stayed
+    "offline" on the website until every userbot finished connecting - and slow
+    connections/network timeouts made that take a long time. Running it as a
+    background task lets the heartbeat loop start immediately (agent shows active
+    right away) while userbots warm up behind the scenes.
+    """
     await prewarm_accounts()
 
     # Live-detect new posts on channels our userbots are members of.
-    userbot.set_view_dispatch(live_view_dispatch)
-    userbot.set_reaction_dispatch(live_reaction_dispatch)
     attached = userbot.attach_view_handlers()
     if attached:
         print(f"[i] Live View + Reaction handlers attached to {attached} userbot(s).")
 
     # Capture each userbot's incoming Telegram service messages (login codes, etc.)
     # so the panel can show them per account (auto-purged after 30 minutes).
-    userbot.set_message_dispatch(live_message_dispatch)
     msg_attached = userbot.attach_message_handlers()
     if msg_attached:
         print(f"[i] Message capture attached to {msg_attached} userbot(s).")
+
+
+async def main() -> None:
+    print(f"[i] Iamhear agent '{AGENT_ID}' starting on {HOSTNAME}")
+    print(f"[i] Polling every {POLL_SECONDS}s. Press Ctrl+C to stop.\n")
+
+    # Register dispatch callbacks up front (no network needed) so any userbot
+    # that warms up in the background immediately has working live handlers.
+    userbot.set_view_dispatch(live_view_dispatch)
+    userbot.set_reaction_dispatch(live_reaction_dispatch)
+    userbot.set_message_dispatch(live_message_dispatch)
+
+    # Heartbeat once RIGHT NOW so the website shows the agent as online before we
+    # spend any time connecting userbots.
+    try:
+        logged_in = db.query(
+            "SELECT count(*) AS c FROM telegram_accounts WHERE status = 'logged_in'"
+        )
+        db.heartbeat(AGENT_ID, HOSTNAME, int(logged_in[0]["c"]))
+        print("[i] Agent registered and online. Warming userbots in background...")
+    except Exception as e:
+        print(f"[!] initial heartbeat failed: {e}")
 
     # Keep references to in-flight jobs so they aren't garbage-collected. Some
     # jobs (staggered views/reactions) intentionally stay alive for their whole
     # window, so we must NOT block the loop waiting for them.
     background: set[asyncio.Task] = set()
+
+    # Warm userbots + attach handlers in the background (non-blocking).
+    warmup_task = asyncio.create_task(startup_warmup())
+    background.add(warmup_task)
+    warmup_task.add_done_callback(background.discard)
 
     last_beat = 0.0
     last_view_poll = 0.0
