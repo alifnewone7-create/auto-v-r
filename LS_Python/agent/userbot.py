@@ -85,6 +85,14 @@ JOIN_STAGGER_SECONDS = max(0.0, float(_os.environ.get("AGENT_JOIN_STAGGER_SECOND
 # reschedule by the worker), so this is only for momentary network / call hiccups.
 JOIN_RETRY_ATTEMPTS = max(1, int(_os.environ.get("AGENT_JOIN_RETRY_ATTEMPTS", "3")))
 
+# CRITICAL keep-alive rule: a bot must NEVER be abandoned because of a momentary
+# hiccup. The reconciler only stops tracking (releases) the bots for a chat after
+# it has confirmed the host's live stream is REALLY gone this many times IN A ROW.
+# Until then every dropped bot is rejoined forever. With AGENT_RECONCILE_SECONDS
+# at 15s, the default of 4 means we only let go ~60s after the stream truly ends —
+# so a transient GetFullChannel blip can never make hundreds of bots leave.
+STREAM_GONE_CONFIRMATIONS = max(1, int(_os.environ.get("AGENT_STREAM_GONE_CONFIRMATIONS", "4")))
+
 # Accounts that are SUPPOSED to be in a live stream right now, so we can put
 # them back if Telegram/NTgCalls drops the call (network blip, server move, or a
 # server-side call restart — the usual cause of "300 joined, 270 suddenly left").
@@ -102,6 +110,16 @@ _LIVE_STATE: dict[int, str] = {}
 
 # Clients that already have the auto-rejoin handler attached (attach once).
 _REJOIN_ATTACHED: set[int] = set()
+
+# Per-chat count of consecutive "the live stream looks gone" readings. We only
+# release a chat's bots once this reaches STREAM_GONE_CONFIRMATIONS, so a single
+# transient false reading can never make everyone leave. Reset the instant the
+# stream looks alive again.
+_STREAM_GONE_STRIKES: dict[int, int] = {}
+
+# Per-account count of consecutive failed rejoin attempts. Used ONLY for backoff
+# logging / diagnostics — a failing bot is retried forever, never abandoned.
+_JOIN_FAILS: dict[int, int] = {}
 
 _join_sem: "asyncio.Semaphore | None" = None
 
@@ -475,9 +493,29 @@ def _already_in_call(exc: Exception) -> bool:
 
 def _forget_join(account_id: int) -> None:
     """Stop tracking an account for live-stream keep-alive (intentional leave or
-    permanent failure). Clears both the target and our state view."""
+    a stream that has genuinely ended). Clears the target and all state views."""
     _ACTIVE_JOINS.pop(account_id, None)
     _LIVE_STATE.pop(account_id, None)
+    _JOIN_FAILS.pop(account_id, None)
+
+
+async def _teardown_client(account_id: int) -> None:
+    """
+    Fully drop a userbot's Client + PyTgCalls so the next rejoin rebuilds it from
+    scratch. Used when a client has died (network/process churn): re-playing on a
+    dead client would silently fail forever, so we rebuild instead. This keeps a
+    bot recoverable indefinitely rather than stuck 'dropped'. Never raises.
+    """
+    entry = _POOL.pop(account_id, None)
+    _REJOIN_ATTACHED.discard(account_id)
+    if not entry:
+        return
+    client = entry.get("client")
+    try:
+        if client is not None:
+            await client.stop()
+    except Exception:
+        pass
 
 
 def _connected_chat_ids(calls: PyTgCalls) -> set[int] | None:
@@ -501,8 +539,17 @@ async def _rejoin_one(account_id: int, target: dict) -> bool:
     """
     Bring a single dropped account back into its live stream, THROUGH the shared
     join throttle (concurrency gate + stagger) so a mass recovery never spikes.
-    Revives a disconnected client if needed. Returns True if it is now in the
-    call. Never raises — recovery must be silent and self-healing.
+
+    Key rule: this NEVER gives up on a bot. If the client died it is rebuilt from
+    scratch; if the rejoin fails right now (rate limit, momentary error) the bot
+    simply stays 'dropped' and is retried on the next sweep. The only thing that
+    ever stops a bot being tracked is the stream genuinely ending (decided once,
+    per-chat, in reconcile_active_joins) or the user leaving. Never raises.
+
+    Whether the host's stream is still running is decided ONCE per chat by the
+    caller — we intentionally do NOT check it here, because doing so per-account
+    fired a GetFullChannel from every client every sweep and that flood was itself
+    a cause of the mass-drop we are healing.
     """
     chat_id = int(target["chat_id"])
     async with _get_join_sem():
@@ -510,8 +557,13 @@ async def _rejoin_one(account_id: int, target: dict) -> bool:
             await asyncio.sleep(random.uniform(0.0, JOIN_STAGGER_SECONDS))
         try:
             # Revive the client/calls pair if it was lost (process churn, pyrogram
-            # disconnect). _ensure_online reuses the warm one when it's healthy.
+            # disconnect). A pooled-but-dead client can't rejoin, so rebuild it.
             entry = _POOL.get(account_id)
+            if entry is not None:
+                client = entry.get("client")
+                if client is not None and not getattr(client, "is_connected", True):
+                    await _teardown_client(account_id)
+                    entry = None
             if not entry:
                 entry = await _ensure_online(
                     account_id,
@@ -519,74 +571,123 @@ async def _rejoin_one(account_id: int, target: dict) -> bool:
                     target["api_hash"],
                     target["session_string"],
                 )
-            client: Client = entry["client"]
             calls: PyTgCalls = entry["calls"]
-
-            # Only rejoin if the host's stream is actually still running. If the
-            # check fails transiently, leave state as "dropped" so we retry next
-            # sweep instead of giving up (never permanently lose a viewer).
-            try:
-                live = await _has_active_group_call(client, chat_id)
-            except Exception:
-                return False
-            if not live:
-                # Stream is genuinely over — stop tracking so we don't spin.
-                _forget_join(account_id)
-                return False
 
             await calls.play(chat_id, _listen_only_stream())
             _LIVE_STATE[account_id] = "connected"
+            _JOIN_FAILS.pop(account_id, None)
             return True
         except Exception as e:
             if _already_in_call(e):
                 _LIVE_STATE[account_id] = "connected"
+                _JOIN_FAILS.pop(account_id, None)
                 return True
-            # Rate limited right now — stay "dropped", retry on the next sweep.
-            # Any other error is swallowed so one bad account never stalls the rest.
+            # Could not rejoin right now (rate limit / transient error). Stay
+            # 'dropped' and retry next sweep — we NEVER abandon the bot. Track the
+            # failure streak for diagnostics only.
+            fails = _JOIN_FAILS.get(account_id, 0) + 1
+            _JOIN_FAILS[account_id] = fails
+            _LIVE_STATE[account_id] = "dropped"
             return False
 
 
 async def reconcile_active_joins() -> int:
     """
-    Keep-alive safety net that makes "300 joined, 270 suddenly left" self-heal.
+    Relentless keep-alive that makes "300 joined, 270 suddenly left" self-heal and
+    keeps every bot in the stream for as long as the agent runs and the host's
+    stream stays live — bots only ever leave when YOU stop the task.
 
-    For every account that SHOULD be listening, decide if it has dropped using
-    (a) our event-tracked _LIVE_STATE and (b) pytgcalls' active-call set when the
-    installed version exposes one. Every account that looks dropped is rejoined
-    CONCURRENTLY but through the shared throttle, so even a full mass-drop of
-    hundreds recovers quickly and smoothly without re-overloading the process.
-    Runs on a fast cadence from the worker loop. Returns how many were rejoined.
+    Two design rules make this robust (and fix the old auto-drop bug):
+
+      1. Liveness is checked ONCE PER CHAT (not per account). The old code called
+         GetFullChannel from every dropped client every sweep; with hundreds of
+         bots that flood was itself a cause of the mass-drop, and a single
+         transient "call is None" reading made it `_forget_join` the bot forever
+         (so dropped bots vanished from the backend and the panel and never came
+         back). Now one warm client answers for the whole chat.
+
+      2. We only RELEASE a chat's bots after the stream is confirmed gone
+         STREAM_GONE_CONFIRMATIONS times in a row. A momentary blip can never make
+         everyone leave; while the stream is live (or we're unsure) every dropped
+         bot is rejoined through the throttle, forever.
+
+    Returns how many bots were rejoined this sweep.
     """
     if not _ACTIVE_JOINS:
         return 0
 
-    # Figure out who needs rejoining.
-    to_rejoin: list[tuple[int, dict]] = []
+    # Group the accounts that SHOULD be live by their chat, so each stream's
+    # liveness is checked a single time regardless of how many bots are in it.
+    by_chat: dict[int, list[tuple[int, dict]]] = {}
     for account_id, target in list(_ACTIVE_JOINS.items()):
-        chat_id = int(target["chat_id"])
-        entry = _POOL.get(account_id)
+        by_chat.setdefault(int(target["chat_id"]), []).append((account_id, target))
 
-        dropped = False
-        if entry is not None:
-            connected = _connected_chat_ids(entry["calls"])
-            if connected is not None:
-                # Version exposes real state — trust it (and sync our view).
-                dropped = chat_id not in connected
-                _LIVE_STATE[account_id] = "dropped" if dropped else "connected"
-            else:
-                # Fall back to our own event-tracked state.
-                dropped = _LIVE_STATE.get(account_id) == "dropped"
+    to_rejoin: list[tuple[int, dict]] = []
+
+    for chat_id, members in by_chat.items():
+        # --- Is the host's live stream still running? Ask ONCE, via any warm
+        #     client we still hold for this chat. _has_active_group_call already
+        #     returns True on a transient error, so `live` is only False when the
+        #     call is genuinely absent.
+        live = True
+        for account_id, _t in members:
+            entry = _POOL.get(account_id)
+            if entry is not None and getattr(entry.get("client"), "is_connected", False):
+                try:
+                    live = await _has_active_group_call(entry["client"], chat_id)
+                except Exception:
+                    live = True  # never treat an error as "stream gone"
+                break
+
+        if not live:
+            # Might be over — but require several consecutive confirmations so a
+            # single blip can NEVER evict everyone. Keep rejoining until then.
+            strikes = _STREAM_GONE_STRIKES.get(chat_id, 0) + 1
+            _STREAM_GONE_STRIKES[chat_id] = strikes
+            if strikes >= STREAM_GONE_CONFIRMATIONS:
+                for account_id, _t in members:
+                    _forget_join(account_id)
+                _STREAM_GONE_STRIKES.pop(chat_id, None)
+                print(
+                    f"[rejoin] live stream in chat {chat_id} confirmed ended after "
+                    f"{strikes} checks; released {len(members)} bot(s)."
+                )
+                continue
+            # Not yet confirmed gone — fall through and keep everyone alive.
         else:
-            # Lost the client entirely — definitely needs reviving.
-            dropped = True
+            _STREAM_GONE_STRIKES.pop(chat_id, None)
 
-        if dropped:
-            to_rejoin.append((account_id, target))
+        # --- Decide which members have dropped and queue them for rejoin.
+        for account_id, target in members:
+            entry = _POOL.get(account_id)
+            dropped = False
+            if entry is not None:
+                client = entry.get("client")
+                if client is not None and not getattr(client, "is_connected", True):
+                    # Client itself died — definitely needs a full rebuild+rejoin.
+                    dropped = True
+                    _LIVE_STATE[account_id] = "dropped"
+                else:
+                    connected = _connected_chat_ids(entry["calls"])
+                    if connected is not None:
+                        # Version exposes real state — trust it (and sync our view).
+                        dropped = chat_id not in connected
+                        _LIVE_STATE[account_id] = "dropped" if dropped else "connected"
+                    else:
+                        # Fall back to our own event-tracked state.
+                        dropped = _LIVE_STATE.get(account_id) == "dropped"
+            else:
+                # Lost the client entirely — definitely needs reviving.
+                dropped = True
+
+            if dropped:
+                to_rejoin.append((account_id, target))
 
     if not to_rejoin:
         return 0
 
-    # Recover everyone in parallel; the semaphore inside _rejoin_one paces it.
+    # Recover everyone in parallel; the semaphore inside _rejoin_one paces it so a
+    # full mass-drop comes back smoothly without re-overloading the process.
     results = await asyncio.gather(
         *(_rejoin_one(aid, tgt) for aid, tgt in to_rejoin),
         return_exceptions=True,
