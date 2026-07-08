@@ -1,6 +1,6 @@
 "use client"
 
-import { useTransition } from "react"
+import { useState, useTransition } from "react"
 import useSWR from "swr"
 import { fetcher } from "@/lib/fetcher"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -9,9 +9,15 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Badge } from "@/components/ui/badge"
 import { Separator } from "@/components/ui/separator"
-import { Radio, LogOut, Trash2, Loader2, CheckCircle2, XCircle, Link2 } from "lucide-react"
+import { Radio, LogOut, Trash2, Loader2, CheckCircle2, XCircle, Link2, Plus, Minus, Users, AlertCircle } from "lucide-react"
 import { toast } from "sonner"
-import { joinLivestream, leaveLivestream, deleteLivestream } from "@/app/actions/livestream"
+import {
+  joinLivestream,
+  leaveLivestream,
+  deleteLivestream,
+  addLivestreamBots,
+  removeLivestreamBots,
+} from "@/app/actions/livestream"
 import type { LivestreamTarget } from "@/lib/types"
 
 interface Participant {
@@ -32,12 +38,181 @@ const STATUS_STYLES: Record<string, string> = {
   idle: "bg-muted text-muted-foreground",
 }
 
+const RUNNING_STATUSES = ["joining", "active", "leaving"]
+const ACTIVE_PARTICIPANT_STATUSES = ["pending", "joining", "joined", "leaving"]
+
+function TargetCard({
+  target,
+  loggedInCount,
+  onChanged,
+}: {
+  target: TargetRow
+  loggedInCount: number
+  onChanged: () => void
+}) {
+  const [addAmount, setAddAmount] = useState(1)
+  const [removeAmount, setRemoveAmount] = useState(1)
+  const [pending, startTransition] = useTransition()
+
+  const participants = target.participants
+  const joinedCount = participants.filter((p) => p.status === "joined").length
+  const inStreamCount = participants.filter((p) => ACTIVE_PARTICIPANT_STATUSES.includes(p.status)).length
+  const availableToAdd = Math.max(0, loggedInCount - inStreamCount)
+
+  function run(fn: () => Promise<{ error?: string; count?: number } | void>, success: (n: number) => string) {
+    startTransition(async () => {
+      const res = await fn()
+      if (res && "error" in res && res.error) {
+        toast.error(res.error)
+        return
+      }
+      toast.success(success(res && "count" in res ? (res.count ?? 0) : 0))
+      onChanged()
+    })
+  }
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-start justify-between gap-2 space-y-0">
+        <div className="min-w-0">
+          <CardTitle className="truncate text-sm font-medium">{target.title || target.chat_link}</CardTitle>
+          <p className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+            <Users className="size-3.5" />
+            <span className="font-medium tabular-nums text-foreground">{joinedCount}</span>
+            {` live in stream · ${inStreamCount} sent`}
+          </p>
+        </div>
+        <div className="flex items-center gap-1">
+          <Badge className={STATUS_STYLES[target.status] ?? STATUS_STYLES.idle}>{target.status}</Badge>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-8 text-muted-foreground"
+            title="Make all userbots leave"
+            disabled={pending || joinedCount < 1}
+            onClick={() => run(() => leaveLivestream(target.id), () => "Leaving with all userbots.")}
+          >
+            <LogOut className="size-4" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-8 text-muted-foreground hover:text-destructive"
+            title="Delete task (all userbots leave)"
+            disabled={pending}
+            onClick={() => run(() => deleteLivestream(target.id), () => "Task deleted — all userbots leaving.")}
+          >
+            <Trash2 className="size-4" />
+          </Button>
+        </div>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        {target.last_error ? (
+          <div className="flex items-start gap-1.5 rounded-md bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+            <AlertCircle className="mt-0.5 size-3.5 shrink-0" />
+            <span className="break-words">{target.last_error}</span>
+          </div>
+        ) : null}
+
+        {/* Add / remove userbots by quantity */}
+        <div className="flex flex-col gap-2 rounded-lg border border-border p-3 sm:flex-row sm:items-center">
+          <div className="flex items-center gap-2">
+            <Input
+              type="number"
+              min={1}
+              value={addAmount}
+              onChange={(e) => setAddAmount(Math.max(1, Number(e.target.value) || 1))}
+              className="h-8 w-20"
+              aria-label="How many userbots to add"
+              disabled={pending}
+            />
+            <Button
+              size="sm"
+              className="h-8 gap-1"
+              disabled={pending || availableToAdd < 1}
+              title={availableToAdd < 1 ? "No free userbots left to add" : undefined}
+              onClick={() =>
+                run(
+                  () => addLivestreamBots(target.id, addAmount),
+                  (n) => `Sending ${n} more userbot${n === 1 ? "" : "s"} in.`,
+                )
+              }
+            >
+              {pending ? <Loader2 className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />}
+              Add bots
+            </Button>
+          </div>
+          <div className="flex items-center gap-2 sm:ml-auto">
+            <Input
+              type="number"
+              min={1}
+              value={removeAmount}
+              onChange={(e) => setRemoveAmount(Math.max(1, Number(e.target.value) || 1))}
+              className="h-8 w-20"
+              aria-label="How many userbots to remove"
+              disabled={pending}
+            />
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-8 gap-1 bg-transparent"
+              disabled={pending || joinedCount < 1}
+              title={joinedCount < 1 ? "No joined userbots to remove" : undefined}
+              onClick={() =>
+                run(
+                  () => removeLivestreamBots(target.id, removeAmount),
+                  (n) => `Removing ${n} userbot${n === 1 ? "" : "s"} from the stream.`,
+                )
+              }
+            >
+              <Minus className="size-3.5" />
+              Remove bots
+            </Button>
+          </div>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          {`${availableToAdd} free userbot${availableToAdd === 1 ? "" : "s"} left to add · ${loggedInCount} logged in total`}
+        </p>
+
+        <Separator />
+        <div className="flex flex-wrap gap-2">
+          {participants.length === 0 ? (
+            <p className="text-xs text-muted-foreground">No userbots in this stream.</p>
+          ) : (
+            participants.map((p) => (
+              <div
+                key={p.account_id}
+                className="flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs"
+                title={p.last_error || undefined}
+              >
+                {p.status === "joined" ? (
+                  <CheckCircle2 className="size-3.5 text-chart-3" />
+                ) : p.status === "failed" ? (
+                  <XCircle className="size-3.5 text-destructive" />
+                ) : (
+                  <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
+                )}
+                <span className="text-muted-foreground">{p.label || p.phone}</span>
+              </div>
+            ))
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
 export function LivestreamSection() {
-  const { data, mutate } = useSWR<{ targets: TargetRow[] }>("/api/livestream", fetcher, {
+  const { data, mutate } = useSWR<{ targets: TargetRow[]; logged_in_count: number }>("/api/livestream", fetcher, {
     refreshInterval: 3000,
   })
   const [pending, startTransition] = useTransition()
   const targets = data?.targets ?? []
+  const loggedInCount = data?.logged_in_count ?? 0
+
+  // Only one live stream task may run at a time.
+  const runningTask = targets.find((t) => RUNNING_STATUSES.includes(t.status))
+  const locked = Boolean(runningTask)
 
   function handleJoin(formData: FormData) {
     startTransition(async () => {
@@ -46,9 +221,7 @@ export function LivestreamSection() {
         toast.error(res.error)
         return
       }
-      toast.success(
-        `Dispatched join to ${res?.count} of ${res?.available} userbot${res?.available === 1 ? "" : "s"}.`,
-      )
+      toast.success(`Dispatched join to ${res?.count} of ${res?.available} userbot${res?.available === 1 ? "" : "s"}.`)
       mutate()
     })
   }
@@ -63,42 +236,53 @@ export function LivestreamSection() {
           </CardTitle>
         </CardHeader>
         <CardContent>
-          <form action={handleJoin} className="flex flex-col gap-3">
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="chat_link">Channel / group link</Label>
-              <div className="relative">
-                <Link2 className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  id="chat_link"
-                  name="chat_link"
-                  placeholder="@channel, t.me/link or t.me/+invite"
-                  className="pl-9"
-                  required
-                />
+          {locked ? (
+            <div className="flex items-start gap-2 rounded-lg border border-border bg-muted/40 p-3 text-sm">
+              <AlertCircle className="mt-0.5 size-4 shrink-0 text-chart-4" />
+              <div>
+                <p className="font-medium">A live stream task is already running</p>
+                <p className="mt-0.5 text-xs text-muted-foreground">
+                  {`Only one task can run at a time. Delete "${runningTask?.title || runningTask?.chat_link}" below to start a new one — or add/remove userbots on it directly.`}
+                </p>
               </div>
             </div>
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
-              <div className="flex flex-col gap-2 sm:w-48">
-                <Label htmlFor="count">How many userbots</Label>
-                <Input
-                  id="count"
-                  name="count"
-                  type="number"
-                  min={1}
-                  inputMode="numeric"
-                  placeholder="All logged-in bots"
-                />
+          ) : (
+            <form action={handleJoin} className="flex flex-col gap-3">
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="chat_link">Channel / group link</Label>
+                <div className="relative">
+                  <Link2 className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    id="chat_link"
+                    name="chat_link"
+                    placeholder="@channel, t.me/link or t.me/+invite"
+                    className="pl-9"
+                    required
+                  />
+                </div>
               </div>
-              <Button type="submit" disabled={pending} className="gap-2 sm:ml-auto">
-                {pending ? <Loader2 className="size-4 animate-spin" /> : <Radio className="size-4" />}
-                Join live stream
-              </Button>
-            </div>
-            <p className="text-xs text-muted-foreground">
-              Public or private link. Enter how many userbots to send in (leave blank to use all). They join the chat,
-              then its active live stream in listen-only mode.
-            </p>
-          </form>
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+                <div className="flex flex-col gap-2 sm:w-48">
+                  <Label htmlFor="count">How many userbots</Label>
+                  <Input
+                    id="count"
+                    name="count"
+                    type="number"
+                    min={1}
+                    inputMode="numeric"
+                    placeholder="All logged-in bots"
+                  />
+                </div>
+                <Button type="submit" disabled={pending} className="gap-2 sm:ml-auto">
+                  {pending ? <Loader2 className="size-4 animate-spin" /> : <Radio className="size-4" />}
+                  Join live stream
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                {`Public or private link. Enter how many userbots to send in (leave blank to use all ${loggedInCount}). They join the chat, then its active live stream in listen-only mode. You can add or remove more later.`}
+              </p>
+            </form>
+          )}
         </CardContent>
       </Card>
 
@@ -115,69 +299,7 @@ export function LivestreamSection() {
       ) : (
         <div className="flex flex-col gap-4">
           {targets.map((t) => (
-            <Card key={t.id}>
-              <CardHeader className="flex flex-row items-start justify-between gap-2 space-y-0">
-                <div className="min-w-0">
-                  <CardTitle className="truncate text-sm font-medium">{t.chat_link}</CardTitle>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    {t.joined_count}/{t.total_count} joined
-                  </p>
-                </div>
-                <div className="flex items-center gap-1">
-                  <Badge className={STATUS_STYLES[t.status] ?? STATUS_STYLES.idle}>{t.status}</Badge>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="size-8 text-muted-foreground"
-                    title="Leave with all userbots"
-                    onClick={() =>
-                      startTransition(async () => {
-                        await leaveLivestream(t.id)
-                        toast.success("Leave dispatched.")
-                        mutate()
-                      })
-                    }
-                  >
-                    <LogOut className="size-4" />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="size-8 text-muted-foreground hover:text-destructive"
-                    title="Remove"
-                    onClick={() =>
-                      startTransition(async () => {
-                        await deleteLivestream(t.id)
-                        mutate()
-                      })
-                    }
-                  >
-                    <Trash2 className="size-4" />
-                  </Button>
-                </div>
-              </CardHeader>
-              <CardContent>
-                <Separator className="mb-3" />
-                <div className="flex flex-wrap gap-2">
-                  {t.participants.map((p) => (
-                    <div
-                      key={p.account_id}
-                      className="flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs"
-                      title={p.last_error || undefined}
-                    >
-                      {p.status === "joined" ? (
-                        <CheckCircle2 className="size-3.5 text-chart-3" />
-                      ) : p.status === "failed" ? (
-                        <XCircle className="size-3.5 text-destructive" />
-                      ) : (
-                        <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
-                      )}
-                      <span className="text-muted-foreground">{p.label || p.phone}</span>
-                    </div>
-                  ))}
-                </div>
-              </CardContent>
-            </Card>
+            <TargetCard key={t.id} target={t} loggedInCount={loggedInCount} onChanged={mutate} />
           ))}
         </div>
       )}

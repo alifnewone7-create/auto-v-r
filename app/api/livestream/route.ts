@@ -23,5 +23,8 @@ export async function GET() {
      GROUP BY t.id
      ORDER BY t.created_at DESC`,
   )
-  return NextResponse.json({ targets })
+  const [{ count }] = await query<{ count: number }>(
+    `SELECT count(*)::int AS count FROM telegram_accounts WHERE status = 'logged_in'`,
+  )
+  return NextResponse.json({ targets, logged_in_count: count })
 }
