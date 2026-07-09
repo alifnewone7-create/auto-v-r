@@ -99,8 +99,37 @@ VIEW_MAX_BACKFILL = int(os.environ.get("AGENT_VIEW_MAX_BACKFILL", "30"))
 # Views are trickled in over this window (front-loaded, uneven gaps) instead of
 # firing all at once, so a post's view count climbs like real viewers arriving.
 VIEW_SPREAD_SECONDS = float(os.environ.get("AGENT_VIEW_SPREAD_SECONDS", "45"))
-AGENT_ID = os.environ.get("AGENT_ID") or f"agent-{uuid.uuid4().hex[:8]}"
-HOSTNAME = socket.gethostname()
+# ---------------------------------------------------------------------------
+# Sharding — this process handles only ITS slice of the userbots
+# ---------------------------------------------------------------------------
+# The supervisor (agent/supervisor.py) launches SHARD_COUNT copies of this
+# worker, giving each a distinct LS_SHARD_INDEX. Each copy warms, keeps alive and
+# runs jobs ONLY for accounts where (id % SHARD_COUNT == SHARD_INDEX). Spreading
+# the persistent WebRTC live-stream connections across processes (each with its
+# own event loop / CPU core) is what stops the mass "join then drop". Run the
+# worker directly (no supervisor) and both default to 1/0 → classic single
+# process, unchanged behavior.
+SHARD_COUNT = max(1, int(os.environ.get("LS_WORKER_SHARDS", "1")))
+SHARD_INDEX = min(max(0, int(os.environ.get("LS_SHARD_INDEX", "0"))), SHARD_COUNT - 1)
+IS_SHARDED = SHARD_COUNT > 1
+# Only ONE shard should do global bookkeeping (message purge, stale-job recovery,
+# fan-out expansion, fallback channel polling) to avoid N× duplicate work.
+IS_PRIMARY_SHARD = SHARD_INDEX == 0
+# Soft ceiling: if a shard ends up warming more than this many bots, log a warning
+# suggesting more shards / another VPS. It never rejects bots — just advises.
+SOFT_MAX_PER_SHARD = max(1, int(os.environ.get("LS_SOFT_MAX_PER_SHARD", "70")))
+
+_BASE_AGENT_ID = os.environ.get("AGENT_ID") or f"agent-{uuid.uuid4().hex[:8]}"
+# Give each shard its own agent id + labelled hostname so the panel shows the
+# health of every shard separately (and their bot counts sum to the real total).
+AGENT_ID = _BASE_AGENT_ID if not IS_SHARDED else f"{_BASE_AGENT_ID}-s{SHARD_INDEX}"
+_RAW_HOSTNAME = socket.gethostname()
+HOSTNAME = _RAW_HOSTNAME if not IS_SHARDED else f"{_RAW_HOSTNAME} (shard {SHARD_INDEX + 1}/{SHARD_COUNT})"
+
+# SQL fragment + params that restrict a query to accounts THIS shard owns. In
+# single-process mode it is an always-true no-op so existing queries are unchanged.
+_SHARD_ACCOUNT_SQL = "" if not IS_SHARDED else " AND (id %% %s) = %s"
+_SHARD_ACCOUNT_PARAMS: tuple = () if not IS_SHARDED else (SHARD_COUNT, SHARD_INDEX)
 
 # Profile edits (name/username/photo) hit STRICT Telegram rate limits, so unlike
 # other jobs we must not fire a whole batch at once. We run at most
@@ -751,7 +780,7 @@ async def process_one(job: dict) -> None:
 
 
 async def prewarm_accounts() -> None:
-    """Connect all logged-in userbots at startup so the first joins are fast."""
+    """Connect this shard's logged-in userbots at startup so the first joins are fast."""
     try:
         accounts = db.query(
             """
@@ -762,12 +791,20 @@ async def prewarm_accounts() -> None:
               AND api_hash IS NOT NULL
               AND session_string IS NOT NULL
             """
+            + _SHARD_ACCOUNT_SQL,
+            _SHARD_ACCOUNT_PARAMS or None,
         )
     except Exception as e:
         print(f"[!] prewarm query failed: {e}")
         return
     if not accounts:
         return
+    if IS_SHARDED and len(accounts) > SOFT_MAX_PER_SHARD:
+        print(
+            f"[warn] shard {SHARD_INDEX} owns {len(accounts)} bots (> soft max "
+            f"{SOFT_MAX_PER_SHARD}). Consider more shards (LS_WORKER_SHARDS) or "
+            f"another VPS/agent to keep live-stream connections stable."
+        )
     print(f"[i] Pre-warming {len(accounts)} logged-in userbot(s)...")
     warmed = await userbot.prewarm(accounts)
     print(f"[i] {warmed}/{len(accounts)} userbot(s) connected and ready.\n")
@@ -939,6 +976,11 @@ async def startup_warmup() -> None:
 
 async def main() -> None:
     print(f"[i] Iamhear agent '{AGENT_ID}' starting on {HOSTNAME}")
+    if IS_SHARDED:
+        print(
+            f"[i] Shard {SHARD_INDEX + 1}/{SHARD_COUNT}: handling accounts where "
+            f"id %% {SHARD_COUNT} == {SHARD_INDEX} (soft max {SOFT_MAX_PER_SHARD})."
+        )
     print(f"[i] Polling every {POLL_SECONDS}s. Press Ctrl+C to stop.\n")
 
     # All blocking DB work runs off the event loop via asyncio.to_thread (see
@@ -964,6 +1006,8 @@ async def main() -> None:
     try:
         logged_in = db.query(
             "SELECT count(*) AS c FROM telegram_accounts WHERE status = 'logged_in'"
+            + _SHARD_ACCOUNT_SQL,
+            _SHARD_ACCOUNT_PARAMS or None,
         )
         db.heartbeat(AGENT_ID, HOSTNAME, int(logged_in[0]["c"]))
         print("[i] Agent registered and online. Warming userbots in background...")
@@ -975,13 +1019,15 @@ async def main() -> None:
     # this, hundreds of joins claimed at crash time would never run again and
     # those bots would silently never join. Short threshold on startup so a
     # just-restarted agent recovers fast without clobbering a co-agent's fresh
-    # claims.
-    try:
-        recovered = db.requeue_stale_jobs(120)
-        if recovered:
-            print(f"[i] Recovered {recovered} orphaned job(s) from a previous run.")
-    except Exception as e:
-        print(f"[!] stale-job recovery failed: {e}")
+    # claims. Only the primary shard does this global sweep so N shards don't all
+    # race to requeue the same rows.
+    if IS_PRIMARY_SHARD:
+        try:
+            recovered = db.requeue_stale_jobs(120)
+            if recovered:
+                print(f"[i] Recovered {recovered} orphaned job(s) from a previous run.")
+        except Exception as e:
+            print(f"[!] stale-job recovery failed: {e}")
 
     # Keep references to in-flight jobs so they aren't garbage-collected. Some
     # jobs (staggered views/reactions) intentionally stay alive for their whole
@@ -1004,6 +1050,8 @@ async def main() -> None:
             try:
                 logged_in = await db.aquery(
                     "SELECT count(*) AS c FROM telegram_accounts WHERE status = 'logged_in'"
+                    + _SHARD_ACCOUNT_SQL,
+                    _SHARD_ACCOUNT_PARAMS or None,
                 )
                 await db.arun(db.heartbeat, AGENT_ID, HOSTNAME, int(logged_in[0]["c"]))
             except Exception as e:
@@ -1019,8 +1067,9 @@ async def main() -> None:
             last_beat = now
 
         # Auto-purge Telegram messages older than 30 minutes so the panel only
-        # ever shows a short, rolling window of recent notices.
-        if now - last_purge > 60:
+        # ever shows a short, rolling window of recent notices. This is global
+        # bookkeeping, so only the primary shard runs it (avoids N× duplicate work).
+        if IS_PRIMARY_SHARD and now - last_purge > 60:
             try:
                 removed = await db.arun(db.purge_old_account_messages)
                 if removed:
@@ -1036,6 +1085,17 @@ async def main() -> None:
                 print(f"[!] stale-job recovery failed: {e}")
             last_purge = now
 
+        # Fan-out expansion: the primary shard turns each un-sharded view/react/
+        # leave-all job into one copy per shard so the action reaches every bot
+        # even though bots are split across processes. No-op in single-process mode.
+        if IS_SHARDED and IS_PRIMARY_SHARD:
+            try:
+                expanded = await db.arun(db.expand_fanout_jobs, SHARD_COUNT)
+                if expanded:
+                    print(f"[shard] expanded {expanded} fan-out job(s) across {SHARD_COUNT} shards.")
+            except Exception as e:
+                print(f"[!] fan-out expansion failed: {e}")
+
         # Live-stream keep-alive on its OWN fast cadence (independent of the 60s
         # purge above). This is what makes a mass-drop like "300 joined, 270 left"
         # self-heal within seconds: any bot that dropped is rejoined through the
@@ -1049,14 +1109,18 @@ async def main() -> None:
                 print(f"[!] live-stream reconcile failed: {e}")
             last_reconcile = now
 
-        # Watch channels for new posts (live handler is primary; this is fallback).
-        if now - last_view_poll > VIEW_POLL_SECONDS:
+        # Watch channels for new posts (the live handler on each shard's bots is
+        # the primary detector; this poll is a fallback). Only the primary shard
+        # runs the fallback poll so we don't hit Telegram's history API N times;
+        # whichever shard detects first enqueues a single job and shard 0 expands
+        # it to all shards. Live handlers still run on every shard.
+        if IS_PRIMARY_SHARD and now - last_view_poll > VIEW_POLL_SECONDS:
             await poll_view_targets()
             await poll_reaction_targets()
             last_view_poll = now
 
         try:
-            jobs = await db.arun(db.claim_next_jobs, BATCH_SIZE)
+            jobs = await db.arun(db.claim_next_jobs, BATCH_SIZE, SHARD_INDEX, SHARD_COUNT)
         except Exception as e:
             print(f"[!] DB poll error: {e}")
             await asyncio.sleep(POLL_SECONDS)

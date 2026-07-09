@@ -24,6 +24,23 @@ from psycopg.rows import dict_row
 # DATABASE_URL is the Neon connection string. Same value as the website's env.
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
+# ---------------------------------------------------------------------------
+# Sharding — spread the userbots across several worker PROCESSES
+# ---------------------------------------------------------------------------
+# Each account has a stable integer id. A shard "owns" an account when
+#     account_id % shard_count == shard_index
+# so every account (and therefore its persistent WebRTC live-stream connection)
+# lives in exactly ONE process. This is what stops "join then drop": hundreds of
+# WebRTC keepalives no longer fight over a single event loop.
+#
+# FAN-OUT jobs (view_post / react_post / leave_livestream_all) must act on EVERY
+# bot, not just one shard's. They are enqueued (by the website AND the worker)
+# as a single plain row with NO shard_index. Shard 0 then "expands" each into one
+# copy PER shard (tagging payload.shard_index), and each shard runs its copy
+# against its own local bots. The originating code needs to know nothing about
+# shards, so the website stays completely shard-agnostic.
+FANOUT_JOB_TYPES = ("view_post", "react_post", "leave_livestream_all")
+
 # Pool size. Kept modest because Neon (via the -pooler endpoint) is happiest with
 # a bounded number of server connections; the agent reuses these warm connections
 # for ALL its queries instead of doing a fresh TLS handshake every call.
@@ -166,16 +183,31 @@ def claim_next_job() -> Optional[dict[str, Any]]:
             return cur.fetchone()
 
 
-def claim_next_jobs(limit: int = 50) -> list[dict[str, Any]]:
+def claim_next_jobs(
+    limit: int = 50,
+    shard_index: int = 0,
+    shard_count: int = 1,
+) -> list[dict[str, Any]]:
     """
-    Atomically grab up to `limit` of the oldest queued jobs and mark them
-    'processing' in a single round-trip. This lets the worker run many jobs
-    (e.g. 100 livestream joins) concurrently instead of one-at-a-time.
+    Atomically grab up to `limit` of the oldest queued jobs THIS shard is
+    responsible for, and mark them 'processing' in a single round-trip. This lets
+    the worker run many jobs (e.g. 100 livestream joins) concurrently instead of
+    one-at-a-time. FOR UPDATE SKIP LOCKED keeps this safe across every process.
 
-    FOR UPDATE SKIP LOCKED keeps this safe across multiple agents.
+    Shard routing (only when shard_count > 1):
+      * per-account jobs  -> the shard that owns the account (account_id % N == i)
+      * fan-out jobs       -> the copy tagged for this shard (shard 0 expands them
+                              first; see expand_fanout_jobs)
+      * misc no-account jobs (e.g. buy_tglion_batch) -> shard 0
+
+    With the default shard_count == 1 the WHERE collapses to "everything", so a
+    single-process deployment behaves exactly as before.
     """
     if limit < 1:
         limit = 1
+    if shard_count < 1:
+        shard_count = 1
+
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -189,15 +221,104 @@ def claim_next_jobs(limit: int = 50) -> list[dict[str, Any]]:
                     SELECT id FROM jobs
                     WHERE status = 'queued'
                       AND run_after <= now()
+                      AND (
+                        -- single-process mode: take everything
+                        %(sc)s <= 1
+                        -- fan-out copy that was tagged for me
+                        OR (
+                          type = ANY(%(fanout)s)
+                          AND payload ? 'shard_index'
+                          AND (payload->>'shard_index')::int = %(si)s
+                        )
+                        -- per-account job for an account this shard owns
+                        OR (
+                          account_id IS NOT NULL
+                          AND (account_id %% %(sc)s) = %(si)s
+                        )
+                        -- misc no-account, non-fanout job -> shard 0 handles it
+                        OR (
+                          account_id IS NULL
+                          AND type <> ALL(%(fanout)s)
+                          AND %(si)s = 0
+                        )
+                      )
                     ORDER BY created_at
                     FOR UPDATE SKIP LOCKED
-                    LIMIT %s
+                    LIMIT %(lim)s
                 )
                 RETURNING *
                 """,
-                (limit,),
+                {
+                    "sc": shard_count,
+                    "si": shard_index,
+                    "fanout": list(FANOUT_JOB_TYPES),
+                    "lim": limit,
+                },
             )
             return cur.fetchall()
+
+
+def expand_fanout_jobs(shard_count: int) -> int:
+    """
+    Turn every un-sharded fan-out job into one copy PER shard.
+
+    Fan-out actions (view_post / react_post / leave_livestream_all) are enqueued
+    as a single plain row so the website and the worker's detectors never need to
+    know how many shards exist. This function — run ONLY by shard 0 — finds those
+    rows and replaces each with `shard_count` copies, tagging payload.shard_index
+    0..N-1. Each shard then claims its own copy and runs it against its own local
+    bots, so the action still reaches all userbots even though they are spread
+    across processes. No-op (returns 0) in single-process mode. Returns how many
+    template rows were expanded.
+    """
+    if shard_count <= 1:
+        return 0
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            # Lock a batch of un-tagged fan-out templates so two shard-0 restarts
+            # can't double-expand the same row.
+            cur.execute(
+                """
+                SELECT id, type, account_id, payload, run_after, created_at
+                FROM jobs
+                WHERE status = 'queued'
+                  AND type = ANY(%s)
+                  AND NOT (payload ? 'shard_index')
+                ORDER BY created_at
+                FOR UPDATE SKIP LOCKED
+                LIMIT 500
+                """,
+                (list(FANOUT_JOB_TYPES),),
+            )
+            templates = cur.fetchall()
+            if not templates:
+                return 0
+
+            for t in templates:
+                base_payload = t["payload"] or {}
+                # One queued copy per shard, preserving the original timing/order.
+                for k in range(shard_count):
+                    copy_payload = {**base_payload, "shard_index": k}
+                    cur.execute(
+                        """
+                        INSERT INTO jobs
+                            (type, account_id, payload, status, run_after, created_at, updated_at)
+                        VALUES (%s, %s, %s::jsonb, 'queued', %s, %s, now())
+                        """,
+                        (
+                            t["type"],
+                            t["account_id"],
+                            json.dumps(copy_payload),
+                            t["run_after"],
+                            t["created_at"],
+                        ),
+                    )
+
+            cur.execute(
+                "DELETE FROM jobs WHERE id = ANY(%s)",
+                ([t["id"] for t in templates],),
+            )
+            return len(templates)
 
 
 def enqueue_job(job_type: str, account_id: int | None, payload: dict[str, Any] | None = None) -> None:
