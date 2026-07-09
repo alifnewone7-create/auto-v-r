@@ -1342,18 +1342,38 @@ async def react_post_scheduled(
     message_id: int,
     emojis: list[str],
     window_seconds: float,
+    react_min: int = 0,
+    react_max: int = 0,
 ) -> int:
     """
-    React to a single post from EVERY warm userbot, but stagger each userbot's
+    React to a single post from the warm userbots, staggering each userbot's
     reaction at a random offset inside [0, window_seconds] so the reactions don't
     all land at once. All reactions are guaranteed to complete within the window.
 
+    "Below to high" amount: when react_max > 0, only a RANDOM number of userbots
+    in [react_min, react_max] reacts to this post (a fresh random subset each
+    time, capped at the pool size). When react_max is 0, every warm userbot
+    reacts.
+
     Returns how many userbots successfully reacted (emojis the channel rejects
-    are skipped, so the count can be lower than the number of userbots).
+    are skipped, so the count can be lower than the number chosen).
     """
     clients = [entry["client"] for entry in _POOL.values()]
     if not clients or not emojis:
         return 0
+
+    # Pick a random "below to high" amount of userbots for this specific post.
+    lo = max(0, int(react_min or 0))
+    hi = max(0, int(react_max or 0))
+    if hi > 0:
+        if lo > hi:
+            lo, hi = hi, lo
+        hi = min(hi, len(clients))
+        lo = min(lo, hi)
+        target_count = random.randint(lo, hi)
+        if target_count <= 0:
+            return 0
+        clients = random.sample(clients, target_count)
 
     # Front-loaded, uneven arrival times inside the window: a burst of early
     # reactions right after the post, then a thinning tail - just like real users.

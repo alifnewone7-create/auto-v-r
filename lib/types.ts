@@ -174,6 +174,11 @@ export interface ReactionTarget {
   emojis: string[]
   mode: ReactionMode
   custom_minutes: number
+  // Per-post reaction count range ("below to high"). When react_max > 0 a random
+  // number of userbots in [react_min, react_max] reacts to each post. When both
+  // are 0, every logged-in userbot reacts.
+  react_min: number
+  react_max: number
   status: ReactionTargetStatus
   last_seen_message_id: number
   posts_reacted: number

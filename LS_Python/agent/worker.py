@@ -637,6 +637,8 @@ async def handle_react_post(job: dict) -> dict:
     target_id = p.get("target_id")
     emojis = p.get("emojis") or []
     mode = p.get("mode", "medium")
+    react_min = int(p.get("react_min", 0) or 0)
+    react_max = int(p.get("react_max", 0) or 0)
 
     if mode == "custom":
         # Exact window the user asked for (minimum 1 minute).
@@ -644,7 +646,7 @@ async def handle_react_post(job: dict) -> dict:
     else:
         window = REACTION_WINDOWS.get(mode, REACTION_WINDOWS["medium"])
 
-    count = await userbot.react_post_scheduled(chat_id, message_id, emojis, window)
+    count = await userbot.react_post_scheduled(chat_id, message_id, emojis, window, react_min, react_max)
     if target_id:
         db.bump_reaction_sent(int(target_id), count)
     return {"stage": "reacted", "reactions": count, "message_id": message_id}
@@ -892,9 +894,11 @@ async def dispatch_reactions_for_target(target: dict, chat_id: int, latest_id: i
         emojis = _json.loads(emojis)
     mode = target.get("mode", "medium")
     custom_minutes = int(target.get("custom_minutes", 5) or 5)
+    react_min = int(target.get("react_min", 0) or 0)
+    react_max = int(target.get("react_max", 0) or 0)
 
     for mid in post_ids:
-        db.enqueue_reaction_job(chat_id, mid, target["id"], emojis, mode, custom_minutes)
+        db.enqueue_reaction_job(chat_id, mid, target["id"], emojis, mode, custom_minutes, react_min, react_max)
     db.bump_reaction_posts(target["id"], len(post_ids))
     print(f"[react] target {target['id']}: queued {len(post_ids)} new post(s) up to #{latest_id}")
 

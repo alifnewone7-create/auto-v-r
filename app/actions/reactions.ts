@@ -16,6 +16,16 @@ const VALID_MODES: ReactionMode[] = ["slow", "medium", "fast", "custom"]
 function parseFields(formData: FormData) {
   const link = String(formData.get("channel_link") ?? "").trim()
 
+  // Optional chat_id. Lets the agent detect the channel instantly/reliably
+  // instead of resolving it from the link. Channel ids are negative (e.g.
+  // -1001234567890), so keep the sign. Blank -> null (auto-resolve).
+  const chatIdRaw = String(formData.get("chat_id") ?? "").trim()
+  let chatId: number | null = null
+  if (chatIdRaw) {
+    const n = Number.parseInt(chatIdRaw, 10)
+    if (!Number.isNaN(n)) chatId = n
+  }
+
   // emojis arrive as a JSON array string from the client.
   let emojis: string[] = []
   try {
@@ -36,7 +46,11 @@ function parseFields(formData: FormData) {
   const minutes = Number.parseInt(String(formData.get("custom_minutes") ?? "0"), 10) || 0
   const customMinutes = Math.max(1, hours * 60 + minutes)
 
-  return { link, emojis, mode, customMinutes }
+  // "Below to high" per-post reaction count. 0/0 means "all userbots react".
+  const reactMin = Math.max(0, Number.parseInt(String(formData.get("react_min") ?? "0"), 10) || 0)
+  const reactMax = Math.max(0, Number.parseInt(String(formData.get("react_max") ?? "0"), 10) || 0)
+
+  return { link, chatId, emojis, mode, customMinutes, reactMin, reactMax }
 }
 
 function validate(fields: ReturnType<typeof parseFields>): string | null {
@@ -45,6 +59,9 @@ function validate(fields: ReturnType<typeof parseFields>): string | null {
   if (!VALID_MODES.includes(fields.mode)) return "Invalid speed mode."
   if (fields.mode === "custom" && fields.customMinutes < 1) {
     return "Custom time must be at least 1 minute."
+  }
+  if (fields.reactMax > 0 && fields.reactMin > fields.reactMax) {
+    return "Reaction range: the low amount cannot be greater than the high amount."
   }
   return null
 }
@@ -71,9 +88,18 @@ export async function addReactionTarget(formData: FormData) {
   if (existing) return { error: "That channel is already in the reaction list." }
 
   await query(
-    `INSERT INTO reaction_targets (channel_link, emojis, mode, custom_minutes, status, last_seen_message_id)
-     VALUES ($1, $2::jsonb, $3, $4, 'active', 0)`,
-    [fields.link, JSON.stringify(fields.emojis), fields.mode, fields.customMinutes],
+    `INSERT INTO reaction_targets
+       (channel_link, chat_id, emojis, mode, custom_minutes, react_min, react_max, status, last_seen_message_id)
+     VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, 'active', 0)`,
+    [
+      fields.link,
+      fields.chatId,
+      JSON.stringify(fields.emojis),
+      fields.mode,
+      fields.customMinutes,
+      fields.reactMin,
+      fields.reactMax,
+    ],
   )
 
   revalidatePath("/")
@@ -90,12 +116,24 @@ export async function updateReactionTarget(targetId: number, formData: FormData)
   if (fields.mode === "custom" && fields.customMinutes < 1) {
     return { error: "Custom time must be at least 1 minute." }
   }
+  if (fields.reactMax > 0 && fields.reactMin > fields.reactMax) {
+    return { error: "Reaction range: the low amount cannot be greater than the high amount." }
+  }
 
   await query(
     `UPDATE reaction_targets
-     SET emojis = $1::jsonb, mode = $2, custom_minutes = $3, updated_at = now()
-     WHERE id = $4`,
-    [JSON.stringify(fields.emojis), fields.mode, fields.customMinutes, targetId],
+     SET chat_id = $1, emojis = $2::jsonb, mode = $3, custom_minutes = $4,
+         react_min = $5, react_max = $6, updated_at = now()
+     WHERE id = $7`,
+    [
+      fields.chatId,
+      JSON.stringify(fields.emojis),
+      fields.mode,
+      fields.customMinutes,
+      fields.reactMin,
+      fields.reactMax,
+      targetId,
+    ],
   )
 
   revalidatePath("/")

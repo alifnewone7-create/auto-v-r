@@ -787,8 +787,15 @@ def enqueue_reaction_job(
     emojis: list[str],
     mode: str,
     custom_minutes: int,
+    react_min: int = 0,
+    react_max: int = 0,
 ) -> None:
-    """Queue a single react_post job (fans out to all userbots inside the agent)."""
+    """Queue a single react_post job (fans out to userbots inside the agent).
+
+    react_min/react_max define a "below to high" range: when react_max > 0 the
+    agent reacts from a random number of userbots in [react_min, react_max]
+    instead of the whole pool. 0/0 means every userbot reacts.
+    """
     query(
         "INSERT INTO jobs (type, account_id, payload, status) "
         "VALUES ('react_post', NULL, %s::jsonb, 'queued')",
@@ -801,6 +808,8 @@ def enqueue_reaction_job(
                     "emojis": emojis,
                     "mode": mode,
                     "custom_minutes": custom_minutes,
+                    "react_min": react_min,
+                    "react_max": react_max,
                 }
             ),
         ),

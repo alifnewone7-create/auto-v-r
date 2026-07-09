@@ -17,7 +17,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import { Smile, Play, Pause, Trash2, Loader2, Link2, AlertCircle, Plus, X, Pencil, Gauge } from "lucide-react"
+import { Smile, Play, Pause, Trash2, Loader2, Link2, AlertCircle, Plus, X, Pencil, Gauge, Hash } from "lucide-react"
 import { toast } from "sonner"
 import {
   addReactionTarget,
@@ -82,6 +82,11 @@ function ConfigFields({
   setHours,
   minutes,
   setMinutes,
+  reactMin,
+  setReactMin,
+  reactMax,
+  setReactMax,
+  userbots,
 }: {
   emojis: string[]
   setEmojis: (e: string[]) => void
@@ -91,6 +96,11 @@ function ConfigFields({
   setHours: (n: number) => void
   minutes: number
   setMinutes: (n: number) => void
+  reactMin: number
+  setReactMin: (n: number) => void
+  reactMax: number
+  setReactMax: (n: number) => void
+  userbots: number
 }) {
   const [custom, setCustom] = useState("")
 
@@ -228,6 +238,49 @@ function ConfigFields({
           </div>
         ) : null}
       </div>
+
+      <Separator />
+
+      <div className="flex flex-col gap-2">
+        <Label className="flex items-center gap-1.5">
+          <Hash className="size-4 text-primary" />
+          Reactions per post
+        </Label>
+        <p className="text-xs text-muted-foreground">
+          Pick a low-to-high range and each post gets a random amount inside it (e.g. 30–50 means a random number like
+          33 or 42 reacts each time). Leave both at 0 to react from all your userbots.
+        </p>
+        <div className="flex items-end gap-3">
+          <div className="flex flex-col gap-1">
+            <span className="text-xs text-muted-foreground">Low</span>
+            <Input
+              type="number"
+              min={0}
+              value={reactMin}
+              onChange={(e) => setReactMin(Math.max(0, Number.parseInt(e.target.value || "0", 10)))}
+              className="h-9 w-24"
+            />
+          </div>
+          <span className="pb-2 text-muted-foreground">to</span>
+          <div className="flex flex-col gap-1">
+            <span className="text-xs text-muted-foreground">High</span>
+            <Input
+              type="number"
+              min={0}
+              value={reactMax}
+              onChange={(e) => setReactMax(Math.max(0, Number.parseInt(e.target.value || "0", 10)))}
+              className="h-9 w-24"
+            />
+          </div>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          {reactMax > 0
+            ? `Each post gets between ${Math.min(reactMin, reactMax)} and ${reactMax} reactions (capped at your ${userbots} logged-in userbot${
+                userbots === 1 ? "" : "s"
+              }).`
+            : `All ${userbots} logged-in userbot${userbots === 1 ? "" : "s"} will react to each post.`}
+        </p>
+      </div>
     </div>
   )
 }
@@ -235,28 +288,37 @@ function ConfigFields({
 // ---------------------------------------------------------------------------
 // Edit dialog
 // ---------------------------------------------------------------------------
-function EditDialog({ target, onSaved }: { target: ReactionTarget; onSaved: () => void }) {
+function EditDialog({ target, onSaved, userbots }: { target: ReactionTarget; onSaved: () => void; userbots: number }) {
   const [open, setOpen] = useState(false)
+  const [chatId, setChatId] = useState(target.chat_id != null ? String(target.chat_id) : "")
   const [emojis, setEmojis] = useState<string[]>(target.emojis)
   const [mode, setMode] = useState<ReactionMode>(target.mode)
   const [hours, setHours] = useState(Math.floor(target.custom_minutes / 60))
   const [minutes, setMinutes] = useState(target.custom_minutes % 60)
+  const [reactMin, setReactMin] = useState(target.react_min ?? 0)
+  const [reactMax, setReactMax] = useState(target.react_max ?? 0)
   const [pending, startTransition] = useTransition()
 
   function reset() {
+    setChatId(target.chat_id != null ? String(target.chat_id) : "")
     setEmojis(target.emojis)
     setMode(target.mode)
     setHours(Math.floor(target.custom_minutes / 60))
     setMinutes(target.custom_minutes % 60)
+    setReactMin(target.react_min ?? 0)
+    setReactMax(target.react_max ?? 0)
   }
 
   function save() {
     startTransition(async () => {
       const fd = new FormData()
+      fd.set("chat_id", chatId)
       fd.set("emojis", JSON.stringify(emojis))
       fd.set("mode", mode)
       fd.set("custom_hours", String(hours))
       fd.set("custom_minutes", String(minutes))
+      fd.set("react_min", String(reactMin))
+      fd.set("react_max", String(reactMax))
       const res = await updateReactionTarget(target.id, fd)
       if (res?.error) {
         toast.error(res.error)
@@ -290,6 +352,22 @@ function EditDialog({ target, onSaved }: { target: ReactionTarget; onSaved: () =
           <DialogTitle>Edit reactions</DialogTitle>
           <DialogDescription className="truncate">{target.title || target.channel_link}</DialogDescription>
         </DialogHeader>
+        <div className="flex flex-col gap-2">
+          <Label htmlFor={`edit_chat_id_${target.id}`} className="flex items-center gap-1.5">
+            <Hash className="size-4 text-primary" />
+            Chat ID <span className="font-normal text-muted-foreground">(optional)</span>
+          </Label>
+          <Input
+            id={`edit_chat_id_${target.id}`}
+            value={chatId}
+            onChange={(e) => setChatId(e.target.value)}
+            placeholder="e.g. -1001234567890"
+            className="h-9"
+          />
+          <p className="text-xs text-muted-foreground">
+            Set the numeric chat ID for instant, reliable detection. Leave blank to auto-detect from the link.
+          </p>
+        </div>
         <ConfigFields
           emojis={emojis}
           setEmojis={setEmojis}
@@ -299,6 +377,11 @@ function EditDialog({ target, onSaved }: { target: ReactionTarget; onSaved: () =
           setHours={setHours}
           minutes={minutes}
           setMinutes={setMinutes}
+          reactMin={reactMin}
+          setReactMin={setReactMin}
+          reactMax={reactMax}
+          setReactMax={setReactMax}
+          userbots={userbots}
         />
         <DialogFooter>
           <Button variant="outline" onClick={() => setOpen(false)} disabled={pending}>
@@ -327,10 +410,13 @@ export function ReactionsSection() {
 
   // Add-form state
   const [link, setLink] = useState("")
+  const [chatId, setChatId] = useState("")
   const [emojis, setEmojis] = useState<string[]>(["👍", "🔥", "❤️"])
   const [mode, setMode] = useState<ReactionMode>("medium")
   const [hours, setHours] = useState(0)
   const [minutes, setMinutes] = useState(5)
+  const [reactMin, setReactMin] = useState(0)
+  const [reactMax, setReactMax] = useState(0)
 
   const targets = data?.targets ?? []
   const userbots = data?.userbots ?? 0
@@ -341,10 +427,13 @@ export function ReactionsSection() {
     startTransition(async () => {
       const fd = new FormData()
       fd.set("channel_link", link)
+      fd.set("chat_id", chatId)
       fd.set("emojis", JSON.stringify(emojis))
       fd.set("mode", mode)
       fd.set("custom_hours", String(hours))
       fd.set("custom_minutes", String(minutes))
+      fd.set("react_min", String(reactMin))
+      fd.set("react_max", String(reactMax))
       const res = await addReactionTarget(fd)
       if (res?.error) {
         toast.error(res.error)
@@ -352,10 +441,13 @@ export function ReactionsSection() {
       }
       toast.success("Channel added. Future posts will be auto-reacted to.")
       setLink("")
+      setChatId("")
       setEmojis(["👍", "🔥", "❤️"])
       setMode("medium")
       setHours(0)
       setMinutes(5)
+      setReactMin(0)
+      setReactMax(0)
       mutate()
     })
   }
@@ -385,6 +477,24 @@ export function ReactionsSection() {
             </div>
           </div>
 
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="reaction_chat_id" className="flex items-center gap-1.5">
+              <Hash className="size-4 text-primary" />
+              Chat ID <span className="font-normal text-muted-foreground">(optional)</span>
+            </Label>
+            <Input
+              id="reaction_chat_id"
+              value={chatId}
+              onChange={(e) => setChatId(e.target.value)}
+              placeholder="e.g. -1001234567890"
+              disabled={atLimit}
+            />
+            <p className="text-xs text-muted-foreground">
+              Add the channel&apos;s numeric chat ID so the agent detects it instantly and reliably. Leave blank to
+              auto-detect from the link.
+            </p>
+          </div>
+
           <ConfigFields
             emojis={emojis}
             setEmojis={setEmojis}
@@ -394,6 +504,11 @@ export function ReactionsSection() {
             setHours={setHours}
             minutes={minutes}
             setMinutes={setMinutes}
+            reactMin={reactMin}
+            setReactMin={setReactMin}
+            reactMax={reactMax}
+            setReactMax={setReactMax}
+            userbots={userbots}
           />
 
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
@@ -434,7 +549,7 @@ export function ReactionsSection() {
                 </div>
                 <div className="flex items-center gap-1">
                   <Badge className={STATUS_STYLES[t.status] ?? STATUS_STYLES.paused}>{t.status}</Badge>
-                  <EditDialog target={t} onSaved={() => mutate()} />
+                  <EditDialog target={t} onSaved={() => mutate()} userbots={userbots} />
                   <Button
                     variant="ghost"
                     size="icon"
@@ -481,6 +596,12 @@ export function ReactionsSection() {
                   <div className="flex flex-col">
                     <span className="text-muted-foreground">Speed</span>
                     <span className="font-medium">{modeLabel(t)}</span>
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="text-muted-foreground">Per post</span>
+                    <span className="font-medium tabular-nums">
+                      {t.react_max > 0 ? `${Math.min(t.react_min, t.react_max)}–${t.react_max}` : "All bots"}
+                    </span>
                   </div>
                   <div className="flex flex-col">
                     <span className="text-muted-foreground">Posts reacted</span>
