@@ -215,7 +215,8 @@ function ConfigFields({
                 <Input
                   type="number"
                   min={0}
-                  value={hours}
+                  placeholder="0"
+                  value={hours || ""}
                   onChange={(e) => setHours(Math.max(0, Number.parseInt(e.target.value || "0", 10)))}
                   className="h-9 w-20"
                 />
@@ -226,7 +227,8 @@ function ConfigFields({
                   type="number"
                   min={0}
                   max={59}
-                  value={minutes}
+                  placeholder="0"
+                  value={minutes || ""}
                   onChange={(e) => setMinutes(Math.max(0, Number.parseInt(e.target.value || "0", 10)))}
                   className="h-9 w-20"
                 />
@@ -256,7 +258,8 @@ function ConfigFields({
             <Input
               type="number"
               min={0}
-              value={reactMin}
+              placeholder="0"
+              value={reactMin || ""}
               onChange={(e) => setReactMin(Math.max(0, Number.parseInt(e.target.value || "0", 10)))}
               className="h-9 w-24"
             />
@@ -267,7 +270,8 @@ function ConfigFields({
             <Input
               type="number"
               min={0}
-              value={reactMax}
+              placeholder="0"
+              value={reactMax || ""}
               onChange={(e) => setReactMax(Math.max(0, Number.parseInt(e.target.value || "0", 10)))}
               className="h-9 w-24"
             />
