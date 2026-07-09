@@ -646,7 +646,14 @@ async def handle_react_post(job: dict) -> dict:
     else:
         window = REACTION_WINDOWS.get(mode, REACTION_WINDOWS["medium"])
 
-    count = await userbot.react_post_scheduled(chat_id, message_id, emojis, window, react_min, react_max)
+    # This job is a per-shard fan-out copy (see expand_fanout_jobs). Pass the
+    # shard identity so the [react_min, react_max] range is treated as ONE global
+    # target split across shards, instead of being re-rolled on every shard (which
+    # would multiply the reactions by the shard count = "all userbots react").
+    shard_index = int(p.get("shard_index", SHARD_INDEX) or 0)
+    count = await userbot.react_post_scheduled(
+        chat_id, message_id, emojis, window, react_min, react_max, shard_index, SHARD_COUNT
+    )
     if target_id:
         db.bump_reaction_sent(int(target_id), count)
     return {"stage": "reacted", "reactions": count, "message_id": message_id}

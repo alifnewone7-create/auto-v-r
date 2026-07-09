@@ -1344,6 +1344,8 @@ async def react_post_scheduled(
     window_seconds: float,
     react_min: int = 0,
     react_max: int = 0,
+    shard_index: int = 0,
+    shard_count: int = 1,
 ) -> int:
     """
     React to a single post from the warm userbots, staggering each userbot's
@@ -1355,6 +1357,14 @@ async def react_post_scheduled(
     time, capped at the pool size). When react_max is 0, every warm userbot
     reacts.
 
+    Sharding: this handler runs once PER shard (each shard owns a slice of the
+    userbots). The [react_min, react_max] range is a GLOBAL target for the whole
+    post, so we must NOT re-roll it independently on every shard - otherwise a
+    channel split across N shards would get up to N x the requested reactions
+    (i.e. effectively every userbot reacts). Instead we roll the total ONCE using
+    a per-post deterministic seed (so every shard agrees on the same number) and
+    then hand this shard only its fair slice of that total.
+
     Returns how many userbots successfully reacted (emojis the channel rejects
     are skipped, so the count can be lower than the number chosen).
     """
@@ -1362,18 +1372,33 @@ async def react_post_scheduled(
     if not clients or not emojis:
         return 0
 
-    # Pick a random "below to high" amount of userbots for this specific post.
+    # Pick a "below to high" amount of userbots for this specific post.
     lo = max(0, int(react_min or 0))
     hi = max(0, int(react_max or 0))
     if hi > 0:
         if lo > hi:
             lo, hi = hi, lo
-        hi = min(hi, len(clients))
-        lo = min(lo, hi)
-        target_count = random.randint(lo, hi)
-        if target_count <= 0:
+        shards = max(1, int(shard_count or 1))
+        idx = min(max(0, int(shard_index or 0)), shards - 1)
+
+        # Roll the GLOBAL total once, identically on every shard, seeded by the
+        # post so all shards compute the same number without talking to each other.
+        rng = random.Random(f"{chat_id}:{message_id}:{lo}:{hi}")
+        total_count = rng.randint(lo, hi)
+        if total_count <= 0:
             return 0
-        clients = random.sample(clients, target_count)
+
+        # Split the global total evenly across shards; the first `remainder`
+        # shards take one extra so the per-shard shares sum EXACTLY to total_count.
+        base, remainder = divmod(total_count, shards)
+        my_count = base + (1 if idx < remainder else 0)
+
+        # Cap at this shard's local pool (shares are only ever short, never over,
+        # which keeps the global total <= the requested "high").
+        my_count = min(my_count, len(clients))
+        if my_count <= 0:
+            return 0
+        clients = random.sample(clients, my_count)
 
     # Front-loaded, uneven arrival times inside the window: a burst of early
     # reactions right after the post, then a thinning tail - just like real users.
