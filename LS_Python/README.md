@@ -50,20 +50,56 @@ Get it from the v0 project: **Settings (top right) → Vars → DATABASE_URL**.
 
 ## 4. Run
 
+For a handful of userbots, a single process is fine:
+
 ```bash
 python -m agent.worker
+```
+
+### Running many userbots (500+) — use sharding
+
+One process can't keep hundreds of live-stream connections alive: they share a
+single event loop, and a momentary stall makes Telegram drop everyone at once
+("they join, then all leave after 2-3 min"). The fix is to run several worker
+**processes**, each on its own CPU core, each owning a **slice** of the bots.
+
+The **supervisor** does this for you — it spawns and auto-restarts the shards:
+
+```bash
+python -m agent.supervisor
+```
+
+Set the shard count in `.env` (defaults shown):
+
+```env
+LS_WORKER_SHARDS=7          # on an 8-core VPS, 7 leaves a core for the OS
+LS_SOFT_MAX_PER_SHARD=70    # warn-only hint if a shard gets too many bots
 ```
 
 You should see:
 
 ```
-[i] Iamhear agent 'agent-main' starting on YOUR-PC
-[i] Polling every 3s. Press Ctrl+C to stop.
+[supervisor] launching 7 worker shard(s)...
+[supervisor] started shard 1/7 (pid 12345)
+[i] Iamhear agent 'agent-main-s0' starting on YOUR-VPS (shard 1/7)
+[i] Shard 1/7: handling accounts where id % 7 == 0 (soft max 70)
+...
 ```
 
-Leave it running. The website's top bar will now show **the agent is online**.
+**How it splits work:** account `id % LS_WORKER_SHARDS` decides which process owns
+each bot, so every bot lives in exactly one shard. Per-account jobs route to that
+same shard automatically. Fan-out actions (channel views, reactions, leave-all)
+are enqueued once by the website and shard 0 copies each to every shard, so they
+still reach all bots. **The website needs no changes and knows nothing about
+shards** — the panel simply shows each shard as its own online agent.
 
-On a VPS, keep it alive with `screen`, `tmux`, `nohup`, or a `systemd` service.
+**Sizing:** ~55-70 bots per shard is comfortable. If a shard warns that it's over
+the soft max, add more shards or a second VPS. Rule of thumb: **shards ≈ CPU
+cores** — more processes than cores just adds context-switching and slows joins.
+
+Leave it running. The website's top bar will now show **the agent(s) online**.
+On a VPS, keep the supervisor alive with `screen`, `tmux`, `nohup`, or a
+`systemd` service — just point it at `agent.supervisor` instead of `agent.worker`.
 
 ## 5. How a userbot gets added (the flow you see on the website)
 
