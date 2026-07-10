@@ -152,6 +152,11 @@ export interface ViewTarget {
   chat_id: number | null
   title: string | null
   status: ViewTargetStatus
+  // Per-post view count range ("low to high"). When view_max > 0 a random number
+  // of userbots in [view_min, view_max] views each post so the count climbs
+  // gradually. When both are 0, every logged-in userbot views the post.
+  view_min: number
+  view_max: number
   last_seen_message_id: number
   posts_viewed: number
   views_sent: number

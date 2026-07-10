@@ -703,12 +703,34 @@ def set_view_target_error(target_id: int, error: str | None) -> None:
     )
 
 
-def enqueue_view_job(chat_id: int, message_id: int, target_id: int) -> None:
-    """Queue a single view_post job (fans out to all userbots inside the agent)."""
+def enqueue_view_job(
+    chat_id: int,
+    message_id: int,
+    target_id: int,
+    view_min: int = 0,
+    view_max: int = 0,
+) -> None:
+    """Queue a single view_post job (fans out to userbots inside the agent).
+
+    view_min/view_max define a "low to high" range: when view_max > 0 the agent
+    views from a random number of userbots in [view_min, view_max] instead of the
+    whole pool, so a post's view count climbs gradually. 0/0 means every userbot
+    views (the original behavior).
+    """
     query(
         "INSERT INTO jobs (type, account_id, payload, status) "
         "VALUES ('view_post', NULL, %s::jsonb, 'queued')",
-        (json.dumps({"chat_id": chat_id, "message_id": message_id, "target_id": target_id}),),
+        (
+            json.dumps(
+                {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "target_id": target_id,
+                    "view_min": view_min,
+                    "view_max": view_max,
+                }
+            ),
+        ),
     )
 
 

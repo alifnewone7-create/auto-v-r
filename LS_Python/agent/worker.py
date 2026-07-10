@@ -574,15 +574,29 @@ async def handle_join_channel(job: dict) -> dict:
 
 async def handle_view_post(job: dict) -> dict:
     """
-    View a single channel post from EVERY warm userbot. One of these jobs is
-    queued per new post; it fans out across the whole pool concurrently.
+    View a single channel post from the warm userbots, trickled in over a window
+    so the count climbs like real viewers. One of these jobs is queued per new
+    post.
+
+    "Low to high" amount: when view_max > 0 only a RANDOM number of userbots in
+    [view_min, view_max] views the post (a gradually climbing count) instead of
+    the whole pool. 0/0 means every warm userbot views it.
     """
     payload = job["payload"]
     chat_id = int(payload["chat_id"])
     message_id = int(payload["message_id"])
     target_id = payload.get("target_id")
+    view_min = int(payload.get("view_min", 0) or 0)
+    view_max = int(payload.get("view_max", 0) or 0)
 
-    count = await userbot.view_post_all(chat_id, message_id, VIEW_SPREAD_SECONDS)
+    # This job is a per-shard fan-out copy (see expand_fanout_jobs). Pass the
+    # shard identity so the [view_min, view_max] range is treated as ONE global
+    # target split across shards, instead of being re-rolled on every shard (which
+    # would multiply the views by the shard count = "all userbots view").
+    shard_index = int(payload.get("shard_index", SHARD_INDEX) or 0)
+    count = await userbot.view_post_scheduled(
+        chat_id, message_id, VIEW_SPREAD_SECONDS, view_min, view_max, shard_index, SHARD_COUNT
+    )
     if target_id:
         db.bump_view_sent(int(target_id), count)
     return {"stage": "viewed", "views": count, "message_id": message_id}
@@ -862,11 +876,21 @@ async def prewarm_accounts() -> None:
     print(f"[i] {warmed}/{len(accounts)} userbot(s) connected and ready.\n")
 
 
-async def dispatch_views_for_target(target_id: int, chat_id: int, latest_id: int) -> None:
+async def dispatch_views_for_target(
+    target_id: int,
+    chat_id: int,
+    latest_id: int,
+    view_min: int = 0,
+    view_max: int = 0,
+) -> None:
     """
     Atomically claim the new post range and queue one view_post job per post.
     Safe to call from both the polling loop and the live handler - claim_view_advance
     guarantees each post is only dispatched once.
+
+    view_min/view_max are the channel's "low to high" per-post view range; they are
+    carried onto every view_post job so the agent views from only a random subset
+    of userbots (a gradually climbing count) instead of the whole pool.
     """
     old = db.claim_view_advance(target_id, latest_id)
     if old is None:
@@ -876,7 +900,7 @@ async def dispatch_views_for_target(target_id: int, chat_id: int, latest_id: int
     if not post_ids:
         return
     for mid in post_ids:
-        db.enqueue_view_job(chat_id, mid, target_id)
+        db.enqueue_view_job(chat_id, mid, target_id, view_min, view_max)
     db.bump_view_posts(target_id, len(post_ids))
     print(f"[view] target {target_id}: queued {len(post_ids)} new post(s) up to #{latest_id}")
 
@@ -887,7 +911,13 @@ async def live_view_dispatch(chat_id: int, message_id: int) -> None:
     # Skip until the baseline is set by the polling loop (honors future-only).
     if not target or target["status"] != "active" or target["last_seen_message_id"] == 0:
         return
-    await dispatch_views_for_target(target["id"], chat_id, message_id)
+    await dispatch_views_for_target(
+        target["id"],
+        chat_id,
+        message_id,
+        int(target.get("view_min", 0) or 0),
+        int(target.get("view_max", 0) or 0),
+    )
 
 
 async def poll_view_targets() -> None:
@@ -915,7 +945,13 @@ async def poll_view_targets() -> None:
                 db.init_view_baseline(t["id"], latest)
                 continue
 
-            await dispatch_views_for_target(t["id"], chat_id, latest)
+            await dispatch_views_for_target(
+                t["id"],
+                chat_id,
+                latest,
+                int(t.get("view_min", 0) or 0),
+                int(t.get("view_max", 0) or 0),
+            )
         except userbot.UserbotError:
             # No warm userbots yet - try again next cycle, don't spam errors.
             return

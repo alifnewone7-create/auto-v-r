@@ -1213,6 +1213,86 @@ async def view_post_all(chat_id: int, message_id: int, spread_seconds: float = 0
     return sum(1 for ok in results if ok)
 
 
+async def view_post_scheduled(
+    chat_id: int,
+    message_id: int,
+    spread_seconds: float = 0.0,
+    view_min: int = 0,
+    view_max: int = 0,
+    shard_index: int = 0,
+    shard_count: int = 1,
+) -> int:
+    """
+    View a single post from the warm userbots, trickling the views in over
+    `spread_seconds` (front-loaded, uneven gaps) so a post's view count climbs
+    like real viewers arriving one after another instead of a single instant
+    spike.
+
+    "Low to high" amount: when view_max > 0, only a RANDOM number of userbots in
+    [view_min, view_max] views the post (a fresh random subset each time, capped
+    at the pool size). When view_max is 0, every warm userbot views.
+
+    Sharding: this handler runs once PER shard (each shard owns a slice of the
+    userbots). The [view_min, view_max] range is a GLOBAL target for the whole
+    post, so we must NOT re-roll it independently on every shard - otherwise a
+    channel split across N shards would get up to N x the requested views (i.e.
+    effectively every userbot views). Instead we roll the total ONCE using a
+    per-post deterministic seed (so every shard agrees on the same number) and
+    then hand this shard only its fair slice of that total.
+
+    Returns how many userbots successfully registered a view.
+    """
+    clients = [entry["client"] for entry in _POOL.values()]
+    if not clients:
+        return 0
+
+    # Pick a "low to high" amount of userbots for this specific post.
+    lo = max(0, int(view_min or 0))
+    hi = max(0, int(view_max or 0))
+    if hi > 0:
+        if lo > hi:
+            lo, hi = hi, lo
+        shards = max(1, int(shard_count or 1))
+        idx = min(max(0, int(shard_index or 0)), shards - 1)
+
+        # Roll the GLOBAL total once, identically on every shard, seeded by the
+        # post so all shards compute the same number without talking to each other.
+        rng = random.Random(f"view:{chat_id}:{message_id}:{lo}:{hi}")
+        total_count = rng.randint(lo, hi)
+        if total_count <= 0:
+            return 0
+
+        # Split the global total evenly across shards; the first `remainder`
+        # shards take one extra so the per-shard shares sum EXACTLY to total_count.
+        base, remainder = divmod(total_count, shards)
+        my_count = base + (1 if idx < remainder else 0)
+
+        # Cap at this shard's local pool (shares are only ever short, never over,
+        # which keeps the global total <= the requested "high").
+        my_count = min(my_count, len(clients))
+        if my_count <= 0:
+            return 0
+        clients = random.sample(clients, my_count)
+
+    offsets = _natural_arrival_offsets(len(clients), spread_seconds)
+
+    async def _one(client: Client, delay: float) -> bool:
+        if delay > 0:
+            await asyncio.sleep(delay)
+        try:
+            peer = await client.resolve_peer(chat_id)
+            await client.invoke(
+                GetMessagesViews(peer=peer, id=[int(message_id)], increment=True)
+            )
+            return True
+        except Exception as e:
+            print(f"[!] view failed (msg {message_id}): {e.__class__.__name__}: {e}")
+            return False
+
+    results = await asyncio.gather(*(_one(c, d) for c, d in zip(clients, offsets)))
+    return sum(1 for ok in results if ok)
+
+
 # Cross-client dedup: the SAME post is delivered to every warm userbot that is a
 # member of the channel, so with many accounts one post would fire this handler
 # hundreds of times. We remember (chat_id, message_id) briefly and only let the
