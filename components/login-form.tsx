@@ -16,15 +16,37 @@ export function LoginForm() {
       <CardContent className="pt-6">
         <form action={formAction} className="flex flex-col gap-4">
           <div className="flex flex-col gap-2">
-            <Label htmlFor="password">Admin password</Label>
+            <Label htmlFor="username">Username</Label>
+            <Input
+              id="username"
+              name="username"
+              type="text"
+              autoComplete="username"
+              placeholder="Enter username"
+              required
+              autoFocus
+            />
+          </div>
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="password">Password</Label>
             <Input
               id="password"
               name="password"
               type="password"
               autoComplete="current-password"
-              placeholder="Enter admin password"
+              placeholder="Enter password"
               required
-              autoFocus
+            />
+          </div>
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="secret">Secret</Label>
+            <Input
+              id="secret"
+              name="secret"
+              type="password"
+              autoComplete="one-time-code"
+              placeholder="Enter secret"
+              required
             />
           </div>
           {state?.error ? (

@@ -55,7 +55,7 @@ export function AgentStatusBar() {
           </p>
           <p className="text-xs text-muted-foreground">
             {anyOnline
-              ? onlineAgents.map((a) => a.hostname || a.id).join(", ")
+              ? `${onlineAgents.length} worker${onlineAgents.length > 1 ? "s" : ""} running in the background`
               : "Start the Python agent on your PC or VPS"}
           </p>
         </div>
