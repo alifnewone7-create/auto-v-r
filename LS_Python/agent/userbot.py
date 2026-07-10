@@ -1879,6 +1879,39 @@ def _username_candidates(base: str) -> list[str]:
     return candidates
 
 
+async def _username_available(client: "Client", uname: str) -> bool:
+    """
+    Ask Telegram whether `uname` is free using the LIGHT `account.checkUsername`
+    call — NOT `set_username`.
+
+    Why this matters: `set_username` maps to `account.updateUsername`, which
+    Telegram rate-limits VERY aggressively (a handful of calls can earn a
+    multi-thousand-second FloodWait). Every failed "already taken" attempt still
+    counts against that limit. `account.checkUsername` is a cheap read that is
+    barely limited, so we probe with it and only spend ONE real updateUsername on
+    a handle we already know is free. This is the difference between name/photo
+    edits (generous limits) succeeding while username edits flood.
+
+    Returns True if available, False if taken/invalid. FloodWaits are propagated
+    to the caller (via _flood_retry) so the job can be rescheduled durably.
+    """
+    from pyrogram.raw.functions.account import CheckUsername
+    from pyrogram.errors import UsernameInvalid, UsernameOccupied, BadRequest
+
+    try:
+        return bool(
+            await _flood_retry(
+                lambda: client.invoke(CheckUsername(username=uname)),
+                what="checking username",
+            )
+        )
+    except (UsernameInvalid, UsernameOccupied):
+        return False
+    except BadRequest:
+        # USERNAME_PURCHASE_AVAILABLE and similar "can't use this" 400s -> not free.
+        return False
+
+
 async def _flood_retry(make_coro, *, what: str, attempts: int = 3, inline_max: int = 30):
     """
     Run a Telegram call, handling FloodWait rate limits gracefully.
@@ -1961,54 +1994,70 @@ async def update_profile(
         changed.append("name")
 
     # --- username ---
+    # IMPORTANT: probe availability with the LIGHT account.checkUsername call and
+    # only ever run ONE real set_username (account.updateUsername) on a handle we
+    # already know is free. The old loop called set_username on every candidate
+    # until one stuck; each "occupied" collision was a heavy updateUsername write
+    # that counts toward Telegram's strict username flood limit, which is exactly
+    # why username edits flooded for ~3300s while name/photo (generous limits)
+    # went through fine.
     if auto_username:
         seed = username_base or " ".join(x for x in [first_name, last_name] if x)
         candidates = _username_candidates(seed)
-        last_err: Optional[str] = None
+        chosen: Optional[str] = None
         for cand in candidates:
-            try:
-                await _flood_retry(lambda c=cand: client.set_username(c), what="setting username")
-                final_username = cand
-                changed.append("username")
+            if await _username_available(client, cand):
+                chosen = cand
                 break
-            except UsernameNotModified:
-                final_username = cand
-                changed.append("username")
-                break
-            except (UsernameOccupied, UsernameInvalid):
-                # Already taken / not a valid handle -> just try the next one.
-                last_err = cand
-                continue
-            except BadRequest as e:
-                # Covers USERNAME_PURCHASE_AVAILABLE (reserved for sale on
-                # fragment.com) and any other "can't use this handle" 400s.
-                # None of these are fatal for us: move on to the next candidate.
-                last_err = f"{cand} ({e})"
-                continue
-        if final_username is None:
+        if chosen is None:
             raise UserbotError(
                 f"Could not find a free username from '{seed}' after several tries."
             )
-    elif username and username.strip():
-        uname = username.strip().lstrip("@")
         try:
-            await _flood_retry(lambda: client.set_username(uname), what=f"setting @{uname}")
-            final_username = uname
+            await _flood_retry(lambda: client.set_username(chosen), what="setting username")
+            final_username = chosen
             changed.append("username")
         except UsernameNotModified:
-            final_username = uname
-            changed.append("username")  # already set to this value; treat as success
-        except UsernameOccupied:
-            raise UserbotError(f"Username @{uname} is already taken.")
-        except UsernameInvalid:
-            raise UserbotError(f"Username @{uname} is invalid.")
-        except BadRequest as e:
-            # e.g. USERNAME_PURCHASE_AVAILABLE (reserved for sale on fragment.com).
-            if "PURCHASE_AVAILABLE" in str(e):
-                raise UserbotError(
-                    f"Username @{uname} is reserved for purchase on fragment.com. Pick another."
-                )
-            raise UserbotError(f"Could not set @{uname}: {e}")
+            final_username = chosen
+            changed.append("username")
+        except (UsernameOccupied, UsernameInvalid, BadRequest):
+            # Raced with someone else in the tiny window since the check — the
+            # whole job will simply be retried by the worker.
+            raise UserbotError(
+                f"Username @{chosen} was taken just before we could claim it. Retrying."
+            )
+    elif username and username.strip():
+        uname = username.strip().lstrip("@")
+        # Probe first (cheap) so an already-taken handle doesn't burn a heavy,
+        # rate-limited updateUsername write.
+        if not await _username_available(client, uname):
+            # Not free — but it may already belong to THIS account. Confirm before
+            # erroring so re-applying the same username is treated as success.
+            me = await client.get_me()
+            if (me.username or "").lower() == uname.lower():
+                final_username = uname
+                changed.append("username")
+            else:
+                raise UserbotError(f"Username @{uname} is already taken or unavailable.")
+        else:
+            try:
+                await _flood_retry(lambda: client.set_username(uname), what=f"setting @{uname}")
+                final_username = uname
+                changed.append("username")
+            except UsernameNotModified:
+                final_username = uname
+                changed.append("username")  # already set to this value; treat as success
+            except UsernameOccupied:
+                raise UserbotError(f"Username @{uname} is already taken.")
+            except UsernameInvalid:
+                raise UserbotError(f"Username @{uname} is invalid.")
+            except BadRequest as e:
+                # e.g. USERNAME_PURCHASE_AVAILABLE (reserved for sale on fragment.com).
+                if "PURCHASE_AVAILABLE" in str(e):
+                    raise UserbotError(
+                        f"Username @{uname} is reserved for purchase on fragment.com. Pick another."
+                    )
+                raise UserbotError(f"Could not set @{uname}: {e}")
 
     # --- profile photo ---
     if photo_bytes:
