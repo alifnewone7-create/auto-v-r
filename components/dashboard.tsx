@@ -1,7 +1,7 @@
 "use client"
 
 import { useState } from "react"
-import { Radio, Users, LogOut, Eye, Vote, Smile, UserCog, UserPlus } from "lucide-react"
+import { Radio, Users, LogOut, Eye, Vote, Smile, UserCog, UserPlus, Trash2 } from "lucide-react"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Button } from "@/components/ui/button"
 import { logoutAction } from "@/app/actions/auth"
@@ -14,6 +14,7 @@ import { VoteSection } from "@/components/vote-section"
 import { ReactionsSection } from "@/components/reactions-section"
 import { ChannelJoinSection } from "@/components/channel-join-section"
 import { ProfileSection } from "@/components/profile-section"
+import { PrpDeleteSection } from "@/components/prp-delete-section"
 
 export function Dashboard() {
   const [activeTab, setActiveTab] = useState("accounts")
@@ -78,6 +79,10 @@ export function Dashboard() {
               <UserCog className="size-4" />
               <span className="hidden lg:inline">Profile</span>
             </TabsTrigger>
+            <TabsTrigger value="prp-delete" className="gap-2">
+              <Trash2 className="size-4" />
+              <span className="hidden lg:inline">Prp Delete</span>
+            </TabsTrigger>
           </TabsList>
 
           <TabsContent value="accounts" className="mt-6">
@@ -100,6 +105,9 @@ export function Dashboard() {
           </TabsContent>
           <TabsContent value="profile" className="mt-6">
             <ProfileSection />
+          </TabsContent>
+          <TabsContent value="prp-delete" className="mt-6">
+            <PrpDeleteSection />
           </TabsContent>
         </Tabs>
       </main>
