@@ -3,6 +3,7 @@
 import { query, queryOne } from "@/lib/db"
 import { isAuthenticated } from "@/lib/auth"
 import { revalidatePath } from "next/cache"
+import { isTelegramLink } from "@/lib/validation"
 import type { ViewTarget } from "@/lib/types"
 
 async function requireAuth() {
@@ -18,6 +19,7 @@ export async function addViewTarget(formData: FormData) {
   await requireAuth()
   const link = String(formData.get("channel_link") ?? "").trim()
   if (!link) return { error: "Channel link is required." }
+  if (!isTelegramLink(link)) return { error: "Enter a valid Telegram link." }
 
   const existing = await queryOne<ViewTarget>(`SELECT * FROM view_targets WHERE channel_link = $1`, [link])
   if (existing) return { error: "That channel is already being watched." }

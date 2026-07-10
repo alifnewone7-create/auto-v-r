@@ -3,6 +3,7 @@
 import { query, queryOne } from "@/lib/db"
 import { isAuthenticated } from "@/lib/auth"
 import { revalidatePath } from "next/cache"
+import { isTelegramLink } from "@/lib/validation"
 import type { TelegramAccount, VoteTarget } from "@/lib/types"
 
 async function requireAuth() {
@@ -27,6 +28,7 @@ export async function detectPoll(formData: FormData) {
   await requireAuth()
   const link = String(formData.get("poll_link") ?? "").trim()
   if (!link) return { error: "Poll / channel link is required." }
+  if (!isTelegramLink(link)) return { error: "Enter a valid Telegram link." }
 
   const accounts = await query<TelegramAccount>(`SELECT id FROM telegram_accounts WHERE status = 'logged_in' LIMIT 1`)
   if (accounts.length === 0) {

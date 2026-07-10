@@ -3,6 +3,7 @@
 import { query, queryOne } from "@/lib/db"
 import { isAuthenticated } from "@/lib/auth"
 import { revalidatePath } from "next/cache"
+import { isTelegramLink } from "@/lib/validation"
 import type { ReactionMode, ReactionTarget } from "@/lib/types"
 
 async function requireAuth() {
@@ -55,6 +56,7 @@ function parseFields(formData: FormData) {
 
 function validate(fields: ReturnType<typeof parseFields>): string | null {
   if (!fields.link) return "Channel link is required."
+  if (!isTelegramLink(fields.link)) return "Enter a valid Telegram link."
   if (fields.emojis.length === 0) return "Pick at least one reaction emoji."
   if (!VALID_MODES.includes(fields.mode)) return "Invalid speed mode."
   if (fields.mode === "custom" && fields.customMinutes < 1) {

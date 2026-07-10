@@ -3,6 +3,7 @@
 import { query, queryOne } from "@/lib/db"
 import { isAuthenticated } from "@/lib/auth"
 import { revalidatePath } from "next/cache"
+import { isTelegramLink } from "@/lib/validation"
 import type { LivestreamTarget, TelegramAccount } from "@/lib/types"
 
 // A livestream target is "running" while it is joining, active, or in the
@@ -76,6 +77,7 @@ export async function joinLivestream(formData: FormData) {
 
   const link = String(formData.get("chat_link") ?? "").trim()
   if (!link) return { error: "Channel / group link is required." }
+  if (!isTelegramLink(link)) return { error: "Enter a valid Telegram link." }
 
   // How many userbots to send in. Blank / 0 / "all" -> use every logged-in bot.
   const rawCount = String(formData.get("count") ?? "").trim()
