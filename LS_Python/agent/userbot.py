@@ -902,6 +902,75 @@ async def leave_livestream_all(account_ids: list[int], chat_link: str) -> int:
     return sum(1 for ok in results if ok)
 
 
+async def raise_hand_livestream(account_ids: list[int], chat_link: str, raise_hand: bool = True) -> int:
+    """
+    Make MANY already-joined userbots RAISE (or LOWER) their hand in a chat's
+    live stream / video chat — i.e. "ask to speak".
+
+    This only touches bots that are already warm and in the call (present in
+    `_POOL`); it never cold-starts or re-joins anyone, so it is cheap and safe to
+    fire for hundreds of bots. We resolve the chat's InputGroupCall ONCE using any
+    warm client, then invoke `phone.EditGroupCallParticipant(raise_hand=...)` for
+    every bot concurrently. Each call is individually guarded, so a flood or a bot
+    that already left just counts as "not raised" and never crashes the agent.
+
+    Returns how many bots successfully raised/lowered their hand.
+    """
+    if not account_ids:
+        return 0
+
+    # Lazy imports so a schema/version mismatch can't break module import at
+    # startup — worst case this one feature errors, the agent stays up.
+    from pyrogram.raw.functions.phone import EditGroupCallParticipant
+    from pyrogram.raw.functions.channels import GetFullChannel
+    from pyrogram.raw.types import InputPeerSelf
+
+    link = _normalize_link(chat_link)
+
+    # Resolve the live stream's InputGroupCall a single time from any warm client.
+    # The group call object (id + access_hash) is the same for every participant,
+    # so one lookup is enough for the whole batch.
+    input_call = None
+    for aid in account_ids:
+        entry = _POOL.get(int(aid))
+        if not entry:
+            continue
+        try:
+            client: Client = entry["client"]
+            chat = await client.get_chat(link)
+            full = await client.invoke(GetFullChannel(channel=await client.resolve_peer(chat.id)))
+            input_call = getattr(full.full_chat, "call", None)
+            if input_call is not None:
+                break
+        except Exception:
+            continue
+
+    if input_call is None:
+        # No active group call (stream ended) or none of these bots are warm.
+        return 0
+
+    async def _raise(aid: int) -> bool:
+        entry = _POOL.get(aid)
+        if not entry:
+            return False
+        client: Client = entry["client"]
+        try:
+            await client.invoke(
+                EditGroupCallParticipant(
+                    call=input_call,
+                    participant=InputPeerSelf(),
+                    raise_hand=bool(raise_hand),
+                )
+            )
+            return True
+        except Exception:
+            # Flood, already-left, or transient RPC error — skip this one bot.
+            return False
+
+    results = await asyncio.gather(*(_raise(int(a)) for a in account_ids))
+    return sum(1 for ok in results if ok)
+
+
 async def _has_active_group_call(client: Client, chat_id: int) -> bool:
     """
     Return True if the chat currently has a live stream / video chat running.

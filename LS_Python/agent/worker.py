@@ -531,6 +531,26 @@ async def handle_leave_livestream_all(job: dict) -> dict:
     return {"stage": "left_all", "left": left, "requested": len(account_ids)}
 
 
+async def handle_raise_hand_all(job: dict) -> dict:
+    """
+    Make a batch of already-joined userbots raise (or lower) their hand in a live
+    stream — "ask to speak". One bulk job carries every account_id, so hundreds of
+    bots raise concurrently. Safe: only warm/in-call bots are touched, per-bot
+    errors are swallowed, and a failure never logs anyone out (not an auth job).
+    """
+    payload = job["payload"]
+    chat_link = payload.get("chat_link", "")
+    account_ids = [int(a) for a in (payload.get("account_ids") or [])]
+    raise_hand = bool(payload.get("raise_hand", True))
+
+    n = await userbot.raise_hand_livestream(account_ids, chat_link, raise_hand)
+    return {
+        "stage": "hand_raised" if raise_hand else "hand_lowered",
+        "count": n,
+        "requested": len(account_ids),
+    }
+
+
 async def handle_join_channel(job: dict) -> dict:
     """
     Join ONE userbot into a channel/group (plain membership, no live stream) so
@@ -835,6 +855,7 @@ HANDLERS = {
     "join_livestream": handle_join_livestream,
     "leave_livestream": handle_leave_livestream,
     "leave_livestream_all": handle_leave_livestream_all,
+    "raise_hand_all": handle_raise_hand_all,
     "join_channel": handle_join_channel,
     "view_post": handle_view_post,
     "detect_poll": handle_detect_poll,

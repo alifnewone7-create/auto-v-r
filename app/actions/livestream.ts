@@ -213,6 +213,42 @@ export async function removeLivestreamBots(targetId: number, count: number) {
   return { ok: true, count: joined.length }
 }
 
+/**
+ * Make a specific NUMBER of currently-joined userbots RAISE (or lower) their
+ * hand in the live stream — i.e. "ask to speak". Picks that many joined bots at
+ * random and enqueues ONE bulk `raise_hand_all` job so they all raise together.
+ *
+ * This does not change participant status (they stay `joined`) — it just signals
+ * the hand-raise to Telegram. Only bots already in the call are affected.
+ */
+export async function raiseHandLivestream(targetId: number, count: number, raise = true) {
+  await requireAuth()
+  if (!Number.isFinite(count) || count < 1) return { error: "Enter how many userbots should raise their hand." }
+
+  const target = await queryOne<LivestreamTarget>(`SELECT * FROM livestream_targets WHERE id = $1`, [targetId])
+  if (!target) return { error: "Live stream not found." }
+
+  const joined = await query<{ account_id: number }>(
+    `SELECT account_id FROM livestream_participants
+      WHERE target_id = $1 AND status = 'joined'
+      ORDER BY random() LIMIT $2`,
+    [targetId, count],
+  )
+  if (joined.length === 0) return { error: "No joined userbots to raise a hand." }
+
+  const accountIds = joined.map((p) => p.account_id)
+  // Single bulk job so every selected bot raises its hand concurrently.
+  await enqueueJob("raise_hand_all", null, {
+    target_id: targetId,
+    chat_link: target.chat_link,
+    account_ids: accountIds,
+    raise_hand: raise,
+  })
+
+  revalidatePath("/")
+  return { ok: true, count: joined.length }
+}
+
 /** Make ALL userbots leave a live stream target. */
 export async function leaveLivestream(targetId: number) {
   await requireAuth()
