@@ -25,7 +25,17 @@ export interface ProfileEditInput {
   // A pool of data URLs ("data:image/jpeg;base64,....") for the new profile
   // photos. When more than one is supplied, each selected account is assigned a
   // RANDOM photo from the pool. Empty/omitted leaves the photo unchanged.
+  //
+  // NOTE: Prefer `photoAssetIds` (pre-uploaded one-by-one via uploadProfilePhoto)
+  // for multi-image edits. Sending many data URLs here in a single call can
+  // exceed the Server Action body limit and crash the request. This field is
+  // kept only for the single-image / backward-compatible path.
   photoDataUrls?: string[]
+  // Asset IDs of photos already uploaded via `uploadProfilePhoto` (one request
+  // each). This is the crash-safe path for multiple images: the heavy base64
+  // payloads are streamed up one at a time, and only the small integer IDs are
+  // sent here. When both are provided, these are appended to `photoDataUrls`.
+  photoAssetIds?: number[]
   // Distribution mode for the name / photo pools:
   //  - false (default, "cycle"): every selected account is changed; the pool is
   //    shuffled and cycled, so a 2-name pool applied to 300 accounts repeats
@@ -70,6 +80,43 @@ function shuffle<T>(arr: T[]): T[] {
 
 const MAX_PHOTO_BYTES = 5 * 1024 * 1024 // 5MB cap on the uploaded image
 
+// Validate a base64 image data URL and persist it as its own profile_assets row.
+// Returns the new asset id, or an { error } message on bad input. Shared by the
+// single-call path (updateProfiles) and the one-at-a-time uploader below.
+async function storePhotoDataUrl(dataUrl: string): Promise<{ id: number } | { error: string }> {
+  const match = /^data:([^;]+);base64,(.+)$/.exec(dataUrl)
+  if (!match) return { error: "Invalid image. Please choose JPEG or PNG files." }
+  const mime = match[1]
+  const b64 = match[2]
+  if (!/^image\/(jpeg|jpg|png|webp)$/i.test(mime)) {
+    return { error: "Photos must be JPEG, PNG, or WebP images." }
+  }
+  const approxBytes = Math.floor((b64.length * 3) / 4)
+  if (approxBytes > MAX_PHOTO_BYTES) {
+    return { error: "One of the photos is too large. Please use images under 5MB." }
+  }
+  const asset = await queryOne<{ id: number }>(
+    `INSERT INTO profile_assets (data, mime) VALUES ($1, $2) RETURNING id`,
+    [b64, mime],
+  )
+  return { id: asset!.id }
+}
+
+/**
+ * Upload ONE profile photo and return its asset id. The client calls this once
+ * per selected image (sequentially) before calling `updateProfiles`, so each
+ * heavy base64 payload travels in its own small request. This is what keeps a
+ * multi-image edit from exceeding the Server Action body limit and throwing the
+ * "this page couldn't load" error.
+ */
+export async function uploadProfilePhoto(dataUrl: string) {
+  await requireAuth()
+  if (typeof dataUrl !== "string" || dataUrl.length === 0) {
+    return { error: "No image provided." }
+  }
+  return storePhotoDataUrl(dataUrl)
+}
+
 /**
  * Bulk profile edit. For every selected account we queue an `update_profile`
  * job. The Python agent picks each up, changes the account's name / username /
@@ -106,30 +153,29 @@ export async function updateProfiles(input: ProfileEditInput) {
     }
   }
 
-  if (!useNamePool && !firstName && !lastName && !baseUsername && photoDataUrls.length === 0) {
+  // Photos already uploaded one-by-one via `uploadProfilePhoto` arrive here as
+  // small integer ids - this is the crash-safe path for multiple images.
+  const preUploadedIds = (input.photoAssetIds ?? []).filter((n) => Number.isInteger(n))
+
+  if (
+    !useNamePool &&
+    !firstName &&
+    !lastName &&
+    !baseUsername &&
+    photoDataUrls.length === 0 &&
+    preUploadedIds.length === 0
+  ) {
     return { error: "Enter a name, a name list, a username, or choose a photo to change." }
   }
 
-  // Store every uploaded photo as its own asset. When several are supplied we
-  // assign one at random per account below (like the name pool).
-  const photoAssetIds: number[] = []
+  // Start from the pre-uploaded asset ids, then store any inline data URLs
+  // (single-image / backward-compatible path) as their own assets. When several
+  // photos are supplied we assign one at random per account below (like names).
+  const photoAssetIds: number[] = [...preUploadedIds]
   for (const dataUrl of photoDataUrls) {
-    const match = /^data:([^;]+);base64,(.+)$/.exec(dataUrl)
-    if (!match) return { error: "Invalid image. Please choose JPEG or PNG files." }
-    const mime = match[1]
-    const b64 = match[2]
-    if (!/^image\/(jpeg|jpg|png|webp)$/i.test(mime)) {
-      return { error: "Photos must be JPEG, PNG, or WebP images." }
-    }
-    const approxBytes = Math.floor((b64.length * 3) / 4)
-    if (approxBytes > MAX_PHOTO_BYTES) {
-      return { error: "One of the photos is too large. Please use images under 5MB." }
-    }
-    const asset = await queryOne<{ id: number }>(
-      `INSERT INTO profile_assets (data, mime) VALUES ($1, $2) RETURNING id`,
-      [b64, mime],
-    )
-    photoAssetIds.push(asset!.id)
+    const stored = await storePhotoDataUrl(dataUrl)
+    if ("error" in stored) return { error: stored.error }
+    photoAssetIds.push(stored.id)
   }
   const usesPhotoPool = photoAssetIds.length > 0
 

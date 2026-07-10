@@ -15,7 +15,7 @@ import { Checkbox } from "@/components/ui/checkbox"
 import { Separator } from "@/components/ui/separator"
 import { UserCog, Loader2, ImageIcon, X, CheckCircle2, AlertCircle, Clock, Users, ListPlus } from "lucide-react"
 import { toast } from "sonner"
-import { updateProfiles } from "@/app/actions/profile"
+import { updateProfiles, uploadProfilePhoto } from "@/app/actions/profile"
 import type { ProfileAccountRow } from "@/lib/types"
 
 const STATUS_META: Record<
@@ -75,6 +75,8 @@ export function ProfileSection() {
   const [photoDataUrls, setPhotoDataUrls] = useState<string[]>([]) // pool of images, randomly assigned per account
   const [noRepeat, setNoRepeat] = useState(false) // use each name/photo once, skip extra accounts
   const [pending, startTransition] = useTransition()
+  // Tracks the one-by-one photo upload so the button can show "Uploading 2/5…".
+  const [uploadProgress, setUploadProgress] = useState<{ done: number; total: number } | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
 
   const parsedNames = useMemo(
@@ -151,6 +153,26 @@ export function ProfileSection() {
       return
     }
     startTransition(async () => {
+      // Upload photos ONE AT A TIME so each heavy base64 payload travels in its
+      // own small request. Sending them all together in updateProfiles used to
+      // blow past the Server Action body limit and crash with "this page
+      // couldn't load". Here we collect the small asset ids and pass only those.
+      const photoAssetIds: number[] = []
+      if (photoDataUrls.length > 0) {
+        setUploadProgress({ done: 0, total: photoDataUrls.length })
+        for (let i = 0; i < photoDataUrls.length; i++) {
+          const up = await uploadProfilePhoto(photoDataUrls[i])
+          if ("error" in up) {
+            setUploadProgress(null)
+            toast.error(up.error)
+            return
+          }
+          photoAssetIds.push(up.id)
+          setUploadProgress({ done: i + 1, total: photoDataUrls.length })
+        }
+        setUploadProgress(null)
+      }
+
       const res = await updateProfiles({
         accountIds: Array.from(selected),
         // In name-list mode we send the pool; otherwise the manual first/last.
@@ -160,7 +182,8 @@ export function ProfileSection() {
         // In auto mode the agent derives the username from the assigned name.
         username: autoUsername ? "" : username,
         autoUsername,
-        photoDataUrls,
+        // Photos are pre-uploaded above; send only their ids (tiny payload).
+        photoAssetIds,
         noRepeat,
       })
       if (res?.error) {
@@ -382,7 +405,9 @@ export function ProfileSection() {
             </p>
             <Button onClick={handleApply} disabled={pending || selected.size === 0} className="gap-2">
               {pending ? <Loader2 className="size-4 animate-spin" /> : <UserCog className="size-4" />}
-              Apply to selected
+              {uploadProgress
+                ? `Uploading ${uploadProgress.done}/${uploadProgress.total}…`
+                : "Apply to selected"}
             </Button>
           </div>
         </CardContent>
