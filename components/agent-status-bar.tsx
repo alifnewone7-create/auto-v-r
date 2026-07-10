@@ -61,7 +61,7 @@ export function AgentStatusBar() {
         </div>
       </div>
 
-      <div className="flex items-center gap-5">
+      <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
         <div className="flex items-center gap-2 text-sm">
           <Server className="size-4 text-muted-foreground" />
           <span className="font-medium">{agents.reduce((n, a) => n + (a.active_accounts || 0), 0)}</span>

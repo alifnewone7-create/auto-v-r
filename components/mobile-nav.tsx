@@ -30,22 +30,33 @@ export function MobileNav({ activeTab, onTabChange }: MobileNavProps) {
   const [isOpen, setIsOpen] = useState(false)
 
   return (
-    <div>
-      {/* Hamburger Menu Button - Mobile Only */}
+    <div className="md:hidden">
+      {/* Hamburger Menu Button - top left corner, mobile only */}
       <Button
         variant="ghost"
         size="icon"
-        className="md:hidden"
+        className="-ml-1.5"
         onClick={() => setIsOpen(!isOpen)}
         aria-label="Toggle menu"
+        aria-expanded={isOpen}
       >
         {isOpen ? <X className="size-5" /> : <Menu className="size-5" />}
       </Button>
 
+      {/* Backdrop - tap outside to close */}
+      {isOpen && (
+        <button
+          type="button"
+          aria-label="Close menu"
+          className="fixed inset-0 top-16 z-40 bg-foreground/30 backdrop-blur-sm"
+          onClick={() => setIsOpen(false)}
+        />
+      )}
+
       {/* Mobile Menu */}
       {isOpen && (
-        <div className="absolute left-0 right-0 top-16 z-50 border-b border-border bg-background md:hidden">
-          <nav className="flex flex-col gap-1 p-4">
+        <div className="fixed left-0 right-0 top-16 z-50 max-h-[calc(100vh-4rem)] overflow-y-auto border-b border-border bg-background shadow-lg">
+          <nav className="mx-auto flex max-w-6xl flex-col gap-1 p-4">
             {TABS.map((tab) => (
               <button
                 key={tab.value}
@@ -53,7 +64,7 @@ export function MobileNav({ activeTab, onTabChange }: MobileNavProps) {
                   onTabChange(tab.value)
                   setIsOpen(false)
                 }}
-                className={`flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-colors ${
+                className={`flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors ${
                   activeTab === tab.value
                     ? "bg-primary text-primary-foreground"
                     : "text-foreground hover:bg-muted"
@@ -63,13 +74,8 @@ export function MobileNav({ activeTab, onTabChange }: MobileNavProps) {
                 {tab.label}
               </button>
             ))}
-            <form action={logoutAction} className="mt-4">
-              <Button
-                variant="outline"
-                size="sm"
-                type="submit"
-                className="w-full gap-2"
-              >
+            <form action={logoutAction} className="mt-3 border-t border-border pt-3">
+              <Button variant="outline" size="sm" type="submit" className="w-full gap-2">
                 <LogOut className="size-4" />
                 Sign out
               </Button>

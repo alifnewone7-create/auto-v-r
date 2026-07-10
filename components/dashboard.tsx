@@ -21,8 +21,11 @@ export function Dashboard() {
   return (
     <div className="min-h-screen bg-background text-foreground">
       <header className="border-b border-border">
-        <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-4 py-4 sm:px-6">
-          <div className="flex items-center gap-3">
+        <div className="mx-auto flex max-w-6xl items-center justify-between gap-3 px-4 py-4 sm:px-6">
+          <div className="flex items-center gap-2 sm:gap-3">
+            {/* Mobile hamburger menu - top left corner */}
+            <MobileNav activeTab={activeTab} onTabChange={setActiveTab} />
+
             <div className="flex size-9 items-center justify-center rounded-lg bg-primary text-primary-foreground">
               <Radio className="size-5" />
             </div>
@@ -31,7 +34,7 @@ export function Dashboard() {
               <p className="text-xs text-muted-foreground">Userbot Control Panel</p>
             </div>
           </div>
-          
+
           {/* Desktop logout button */}
           <form action={logoutAction} className="hidden md:block">
             <Button variant="ghost" size="sm" type="submit" className="gap-2 text-muted-foreground">
@@ -39,9 +42,6 @@ export function Dashboard() {
               <span>Sign out</span>
             </Button>
           </form>
-
-          {/* Mobile hamburger menu */}
-          <MobileNav activeTab={activeTab} onTabChange={setActiveTab} />
         </div>
       </header>
 
