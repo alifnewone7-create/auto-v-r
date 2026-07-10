@@ -13,6 +13,7 @@ import { Vote, Trash2, Loader2, Link2, AlertCircle, RefreshCw, Plus, Minus, Chec
 import { toast } from "sonner"
 import { castVotes, removeVotes, detectPoll, redetectPoll, deleteVoteTarget } from "@/app/actions/vote"
 import type { VoteOptionTally, VoteTargetRow } from "@/lib/types"
+import { isTelegramLink, stripSpaces } from "@/lib/validation"
 
 const STATUS_STYLES: Record<string, string> = {
   detecting: "bg-chart-4/20 text-chart-4 border-transparent",
@@ -31,12 +32,16 @@ function OptionRow({
   disabled: boolean
   onChanged: () => void
 }) {
-  const [amount, setAmount] = useState(1)
+  // Empty by default (no pre-filled "1"). The user must type an amount, then
+  // vote/remove. Voting can never exceed the free userbots (`available`);
+  // removing can never exceed the votes that exist on this option.
+  const [amount, setAmount] = useState("")
   const [pending, startTransition] = useTransition()
   const available = target.available_accounts
+  const typed = Number.parseInt(amount || "0", 10) || 0
 
   function doVote() {
-    const n = Math.max(1, Math.min(amount, available))
+    const n = Math.max(1, Math.min(typed || 1, available))
     startTransition(async () => {
       const res = await castVotes(target.id, tally.index, n)
       if (res?.error) {
@@ -51,7 +56,7 @@ function OptionRow({
   }
 
   function doRemove() {
-    const n = Math.max(1, Math.min(amount, tally.total))
+    const n = Math.max(1, Math.min(typed || 1, tally.total))
     startTransition(async () => {
       const res = await removeVotes(target.id, tally.index, n)
       if (res?.error) {
@@ -90,8 +95,21 @@ function OptionRow({
         <Input
           type="number"
           min={1}
+          max={Math.max(available, tally.total)}
+          inputMode="numeric"
+          placeholder="Amount"
           value={amount}
-          onChange={(e) => setAmount(Math.max(1, Number(e.target.value) || 1))}
+          onChange={(e) => {
+            const digits = e.target.value.replace(/[^0-9]/g, "")
+            if (digits === "") {
+              setAmount("")
+              return
+            }
+            // Cap typing at the larger of "free to vote" and "votes to remove"
+            // so the single field works for both buttons; each action re-clamps.
+            const cap = Math.max(available, tally.total, 1)
+            setAmount(String(Math.min(Number.parseInt(digits, 10), cap)))
+          }}
           className="h-8 w-20"
           aria-label={`Number of votes for ${tally.text}`}
           disabled={disabled || pending}
@@ -131,6 +149,11 @@ export function VoteSection() {
   const userbots = data?.userbots ?? 0
 
   function handleDetect(formData: FormData) {
+    const link = String(formData.get("poll_link") || "")
+    if (!isTelegramLink(link)) {
+      toast.error("Enter a valid Telegram link (@channel, t.me/channel/123 or t.me/+invite).")
+      return
+    }
     startTransition(async () => {
       const res = await detectPoll(formData)
       if (res?.error) {
@@ -165,6 +188,9 @@ export function VoteSection() {
                     placeholder="t.me/channel/123, @channel or t.me/+invite"
                     className="pl-9"
                     required
+                    onInput={(e) => {
+                      e.currentTarget.value = stripSpaces(e.currentTarget.value)
+                    }}
                   />
                 </div>
                 <Button type="submit" disabled={pending} className="gap-2">

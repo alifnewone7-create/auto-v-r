@@ -26,6 +26,7 @@ import {
   removeReactionTarget,
 } from "@/app/actions/reactions"
 import type { ReactionMode, ReactionTarget } from "@/lib/types"
+import { isTelegramLink, stripSpaces } from "@/lib/validation"
 
 // Common Telegram reaction emojis offered as quick-pick chips. Users can also
 // type any custom emoji that a channel allows.
@@ -270,9 +271,13 @@ function ConfigFields({
             <Input
               type="number"
               min={0}
+              max={userbots || undefined}
               placeholder="0"
               value={reactMin || ""}
-              onChange={(e) => setReactMin(Math.max(0, Number.parseInt(e.target.value || "0", 10)))}
+              onChange={(e) => {
+                const n = Math.max(0, Number.parseInt(e.target.value || "0", 10))
+                setReactMin(userbots > 0 ? Math.min(n, userbots) : n)
+              }}
               className="h-9 w-24"
             />
           </div>
@@ -282,9 +287,13 @@ function ConfigFields({
             <Input
               type="number"
               min={0}
+              max={userbots || undefined}
               placeholder="0"
               value={reactMax || ""}
-              onChange={(e) => setReactMax(Math.max(0, Number.parseInt(e.target.value || "0", 10)))}
+              onChange={(e) => {
+                const n = Math.max(0, Number.parseInt(e.target.value || "0", 10))
+                setReactMax(userbots > 0 ? Math.min(n, userbots) : n)
+              }}
               className="h-9 w-24"
             />
           </div>
@@ -435,6 +444,10 @@ export function ReactionsSection() {
   const atLimit = targets.length >= max
 
   function handleAdd() {
+    if (!isTelegramLink(link)) {
+      toast.error("Enter a valid Telegram link (@channel, t.me/channel or private invite link).")
+      return
+    }
     startTransition(async () => {
       const fd = new FormData()
       fd.set("channel_link", link)
@@ -479,7 +492,7 @@ export function ReactionsSection() {
               <Input
                 id="reaction_link"
                 value={link}
-                onChange={(e) => setLink(e.target.value)}
+                onChange={(e) => setLink(stripSpaces(e.target.value))}
                 placeholder="@channel, t.me/channel or private invite link"
                 className="pl-9"
                 disabled={atLimit}

@@ -20,6 +20,7 @@ import {
   removeLivestreamBots,
 } from "@/app/actions/livestream"
 import type { LivestreamTarget } from "@/lib/types"
+import { isTelegramLink, stripSpaces, clampCount } from "@/lib/validation"
 
 interface Participant {
   account_id: number
@@ -60,7 +61,10 @@ function TargetCard({
   const inStreamCount = participants.filter((p) => ACTIVE_PARTICIPANT_STATUSES.includes(p.status)).length
   const availableToAdd = Math.max(0, loggedInCount - inStreamCount)
 
-  function run(fn: () => Promise<{ error?: string; count?: number } | void>, success: (n: number) => string) {
+  function run(
+    fn: () => Promise<{ error?: string; count?: number; ok?: boolean } | void>,
+    success: (n: number) => string,
+  ) {
     startTransition(async () => {
       const res = await fn()
       if (res && "error" in res && res.error) {
@@ -135,8 +139,9 @@ function TargetCard({
             <Input
               type="number"
               min={1}
+              max={Math.max(1, availableToAdd)}
               value={addAmount}
-              onChange={(e) => setAddAmount(Math.max(1, Number(e.target.value) || 1))}
+              onChange={(e) => setAddAmount(clampCount(Number(e.target.value) || 1, availableToAdd))}
               className="h-8 w-20"
               aria-label="How many userbots to add"
               disabled={pending}
@@ -161,8 +166,9 @@ function TargetCard({
             <Input
               type="number"
               min={1}
+              max={Math.max(1, joinedCount)}
               value={removeAmount}
-              onChange={(e) => setRemoveAmount(Math.max(1, Number(e.target.value) || 1))}
+              onChange={(e) => setRemoveAmount(clampCount(Number(e.target.value) || 1, joinedCount))}
               className="h-8 w-20"
               aria-label="How many userbots to remove"
               disabled={pending}
@@ -230,6 +236,14 @@ export function LivestreamSection() {
   const locked = Boolean(runningTask)
 
   function handleJoin(formData: FormData) {
+    const link = String(formData.get("chat_link") || "")
+    if (!isTelegramLink(link)) {
+      toast.error("Enter a valid Telegram link (@channel, t.me/link or t.me/+invite).")
+      return
+    }
+    // Never dispatch more than the userbots we actually have.
+    const raw = String(formData.get("count") || "").trim()
+    if (raw) formData.set("count", String(clampCount(Number.parseInt(raw, 10) || 1, loggedInCount)))
     startTransition(async () => {
       const res = await joinLivestream(formData)
       if (res?.error) {
@@ -273,6 +287,9 @@ export function LivestreamSection() {
                     placeholder="@channel, t.me/link or t.me/+invite"
                     className="pl-9"
                     required
+                    onInput={(e) => {
+                      e.currentTarget.value = stripSpaces(e.currentTarget.value)
+                    }}
                   />
                 </div>
               </div>
@@ -284,8 +301,14 @@ export function LivestreamSection() {
                     name="count"
                     type="number"
                     min={1}
+                    max={Math.max(1, loggedInCount)}
                     inputMode="numeric"
                     placeholder="All logged-in bots"
+                    onInput={(e) => {
+                      const digits = e.currentTarget.value.replace(/[^0-9]/g, "")
+                      e.currentTarget.value =
+                        digits === "" ? "" : String(clampCount(Number.parseInt(digits, 10), loggedInCount))
+                    }}
                   />
                 </div>
                 <Button type="submit" disabled={pending} className="gap-2 sm:ml-auto">

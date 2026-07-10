@@ -13,6 +13,7 @@ import { Eye, Play, Pause, Trash2, Loader2, Link2, AlertCircle } from "lucide-re
 import { toast } from "sonner"
 import { addViewTarget, toggleViewTarget, removeViewTarget } from "@/app/actions/view"
 import type { ViewTarget } from "@/lib/types"
+import { isTelegramLink, stripSpaces } from "@/lib/validation"
 
 const STATUS_STYLES: Record<string, string> = {
   active: "bg-chart-3/20 text-chart-3 border-transparent",
@@ -40,6 +41,11 @@ export function ViewTargetsSection() {
   const userbots = data?.userbots ?? 0
 
   function handleAdd(formData: FormData) {
+    const link = String(formData.get("channel_link") || "")
+    if (!isTelegramLink(link)) {
+      toast.error("Enter a valid Telegram link (@channel or t.me/channel).")
+      return
+    }
     startTransition(async () => {
       const res = await addViewTarget(formData)
       if (res?.error) {
@@ -74,6 +80,9 @@ export function ViewTargetsSection() {
                     placeholder="@channel or t.me/channel"
                     className="pl-9"
                     required
+                    onInput={(e) => {
+                      e.currentTarget.value = stripSpaces(e.currentTarget.value)
+                    }}
                   />
                 </div>
                 <Button type="submit" disabled={pending} className="gap-2">

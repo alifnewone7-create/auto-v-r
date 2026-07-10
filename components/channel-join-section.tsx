@@ -23,6 +23,7 @@ import {
 import { toast } from "sonner"
 import { joinChannel, retryChannelJoin, deleteChannelJoin } from "@/app/actions/channel-join"
 import type { ChannelJoinTargetRow } from "@/lib/types"
+import { isTelegramLink, stripSpaces, clampCount } from "@/lib/validation"
 
 const STATUS_STYLES: Record<string, string> = {
   joining: "bg-chart-4/20 text-chart-4 border-transparent",
@@ -144,6 +145,14 @@ export function ChannelJoinSection() {
   const loggedInCount = data?.logged_in_count ?? 0
 
   function handleJoin(formData: FormData) {
+    const link = String(formData.get("chat_link") || "")
+    if (!isTelegramLink(link)) {
+      toast.error("Enter a valid Telegram link (@channel, t.me/link or t.me/+invite).")
+      return
+    }
+    // Never dispatch more than the userbots we actually have.
+    const raw = String(formData.get("count") || "").trim()
+    if (raw) formData.set("count", String(clampCount(Number.parseInt(raw, 10) || 1, loggedInCount)))
     startTransition(async () => {
       const res = await joinChannel(formData)
       if (res?.error) {
@@ -176,6 +185,9 @@ export function ChannelJoinSection() {
                   placeholder="@channel, t.me/link or t.me/+invite"
                   className="pl-9"
                   required
+                  onInput={(e) => {
+                    e.currentTarget.value = stripSpaces(e.currentTarget.value)
+                  }}
                 />
               </div>
             </div>
@@ -187,8 +199,14 @@ export function ChannelJoinSection() {
                   name="count"
                   type="number"
                   min={1}
+                  max={Math.max(1, loggedInCount)}
                   inputMode="numeric"
                   placeholder="All logged-in bots"
+                  onInput={(e) => {
+                    const digits = e.currentTarget.value.replace(/[^0-9]/g, "")
+                    e.currentTarget.value =
+                      digits === "" ? "" : String(clampCount(Number.parseInt(digits, 10), loggedInCount))
+                  }}
                 />
               </div>
               <Button type="submit" disabled={pending} className="gap-2 sm:ml-auto">
