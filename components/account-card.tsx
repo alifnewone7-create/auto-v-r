@@ -131,11 +131,11 @@ export function AccountCard({ account, onChange }: { account: AccountRow; onChan
         <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
           <div>
             <p className="text-xs text-muted-foreground">App title</p>
-            <p className="font-medium">{account.app_title}</p>
+            <p className="font-medium">{account.app_title || "—"}</p>
           </div>
           <div>
             <p className="text-xs text-muted-foreground">Short name</p>
-            <p className="font-medium">{account.short_name}</p>
+            <p className="font-medium">{account.short_name || "—"}</p>
           </div>
           <div>
             <p className="text-xs text-muted-foreground">API ID</p>
@@ -170,7 +170,7 @@ export function AccountCard({ account, onChange }: { account: AccountRow; onChan
               <div className="flex items-center justify-between gap-2 rounded-md border border-border bg-secondary/50 p-2">
                 <span className="flex items-center gap-2 text-xs text-muted-foreground">
                   <MessageSquare className="size-3.5" />
-                  Telegram login code from tg-lion
+                  Telegram login code from iamhear
                 </span>
                 <span className="font-mono text-base font-semibold tracking-widest text-foreground">
                   {account.provision_code}

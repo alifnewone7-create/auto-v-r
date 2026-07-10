@@ -72,7 +72,7 @@ export function BuyAccountDialog({ onBought }: { onBought: () => void }) {
       />
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Buy &amp; auto-provision from tg-lion</DialogTitle>
+          <DialogTitle>Buy &amp; auto-provision with iamhear</DialogTitle>
           <DialogDescription>
             Pick a country and how many accounts you want. The agent buys them one by one and, for each, logs in,
             collects the API, turns off the old 2FA and sets your new one — fully automatic.
@@ -136,15 +136,9 @@ export function BuyAccountDialog({ onBought }: { onBought: () => void }) {
             </p>
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="label">Label (optional)</Label>
-              <Input id="label" name="label" placeholder="e.g. Bot" />
-            </div>
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="max_price">Max price (optional)</Label>
-              <Input id="max_price" name="max_price" placeholder="e.g. 1.5" inputMode="decimal" />
-            </div>
+          <div className="flex flex-col gap-2">
+            <Label htmlFor="label">Label (optional)</Label>
+            <Input id="label" name="label" placeholder="e.g. Bot" />
           </div>
 
           <DialogFooter>
