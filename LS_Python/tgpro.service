@@ -19,10 +19,11 @@ Type=simple
 User=root
 WorkingDirectory=/root/tgpro
 
-# Python that has the deps installed. Must match where you ran
-#   /usr/bin/python3.12 -m pip install -r requirements.txt
-# If you use a virtualenv instead, change this to /root/tgpro/.venv/bin/python
-ExecStart=/usr/bin/python3.12 -m agent.supervisor
+# Python that has the deps installed — the virtualenv at /root/tgpro/.venv.
+# Deps must be installed into this same venv:
+#   cd /root/tgpro && source .venv/bin/activate && pip install -r requirements.txt
+# For a small setup you can change agent.supervisor -> agent.worker below.
+ExecStart=/root/tgpro/.venv/bin/python -m agent.supervisor
 
 # Ensure root's user site-packages are visible under systemd too.
 Environment=HOME=/root
