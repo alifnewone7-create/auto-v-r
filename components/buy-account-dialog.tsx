@@ -14,7 +14,7 @@ import {
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { ShoppingCart, Wallet, Loader2, AlertCircle } from "lucide-react"
+import { ShoppingCart, Wallet, Loader2 } from "lucide-react"
 import { fetcher } from "@/lib/fetcher"
 import { buyTgLionNumber } from "@/app/actions/accounts"
 import { toast } from "sonner"
@@ -89,12 +89,7 @@ export function BuyAccountDialog({ onBought }: { onBought: () => void }) {
           </span>
         </div>
 
-        {apiError ? (
-          <p className="flex items-start gap-2 rounded-md bg-destructive/10 p-2 text-xs text-destructive">
-            <AlertCircle className="mt-0.5 size-3.5 shrink-0" />
-            {apiError}
-          </p>
-        ) : null}
+        {/* Error display removed: backend handles credential errors silently */}
 
         <form action={handleSubmit} className="flex flex-col gap-4">
           <div className="flex flex-col gap-2">
