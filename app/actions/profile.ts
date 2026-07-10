@@ -192,6 +192,45 @@ export async function updateProfiles(input: ProfileEditInput) {
   return { ok: true, count: accounts.length }
 }
 
+/**
+ * Queue a "delete all profile photos" job for each selected, logged-in account.
+ * The Python agent removes the current photo AND every older one from history.
+ * Accounts with no photo are handled gracefully (reported as 0 deleted, never an
+ * error), and a failure only fails the job - it never logs the userbot out.
+ */
+export async function deleteProfilePhotos(input: { accountIds: number[] }) {
+  await requireAuth()
+
+  const ids = Array.from(new Set((input.accountIds ?? []).filter((n) => Number.isInteger(n))))
+  if (ids.length === 0) return { error: "Select at least one account." }
+
+  const accounts = await query<{ id: number }>(
+    `SELECT id FROM telegram_accounts WHERE status = 'logged_in' AND id = ANY($1::int[]) ORDER BY id`,
+    [ids],
+  )
+  if (accounts.length === 0) {
+    return { error: "None of the selected accounts are logged in." }
+  }
+
+  await Promise.all(
+    accounts.map(async (acc) => {
+      // A profile_updates row so the UI can show per-account progress, reusing the
+      // same status pipeline as name/photo edits.
+      const row = await queryOne<{ id: number }>(
+        `INSERT INTO profile_updates (account_id, status) VALUES ($1, 'pending') RETURNING id`,
+        [acc.id],
+      )
+      await query(
+        `INSERT INTO jobs (type, account_id, payload, status) VALUES ('delete_profile_photos', $1, $2::jsonb, 'queued')`,
+        [acc.id, JSON.stringify({ profile_update_id: row!.id })],
+      )
+    }),
+  )
+
+  revalidatePath("/")
+  return { ok: true, count: accounts.length }
+}
+
 async function enqueueForAccount(
   accountId: number,
   fields: {

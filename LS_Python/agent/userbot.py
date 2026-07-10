@@ -1887,3 +1887,65 @@ async def update_profile(
         changed.append("photo")
 
     return {"changed": changed, "username": final_username}
+
+
+async def delete_profile_photos(
+    account_id: int,
+    api_id: int,
+    api_hash: str,
+    session_string: str,
+) -> dict:
+    """
+    Delete ALL of an account's profile photos - the current one and every older
+    one. Telegram keeps a history of past profile pictures, so we page through
+    them with get_chat_photos("me") and delete them in batches.
+
+    Safe by design:
+      - If the account has no profile photo at all, this is a no-op that returns
+        {"deleted": 0} instead of raising, so an empty account never errors.
+      - Never raises for the "nothing to delete" case; only genuine transport
+        failures propagate (and even those only fail the JOB, never the login -
+        update_profile is not an AUTH_JOB_TYPE, so the userbot stays logged in).
+    """
+    entry = await _ensure_online(account_id, api_id, api_hash, session_string)
+    client: Client = entry["client"]
+
+    # Collect every profile photo id (current + history). Guard the listing so a
+    # hiccup while paging doesn't crash the whole job.
+    file_ids: list[str] = []
+    try:
+        async for photo in client.get_chat_photos("me"):
+            fid = getattr(photo, "file_id", None)
+            if fid:
+                file_ids.append(fid)
+    except Exception as e:
+        # Couldn't even list them - treat as "nothing we can do" rather than a
+        # hard error, so one bad account never blocks the batch.
+        print(f"[!] could not list profile photos for account {account_id}: "
+              f"{e.__class__.__name__}: {e}")
+        return {"deleted": 0}
+
+    if not file_ids:
+        # No profile picture set - perfectly normal, not an error.
+        return {"deleted": 0}
+
+    deleted = 0
+    # Delete in modest batches so one FloodWait doesn't force us to redo everything.
+    BATCH = 50
+    for i in range(0, len(file_ids), BATCH):
+        batch = file_ids[i : i + BATCH]
+        try:
+            await _flood_retry(
+                lambda b=batch: client.delete_profile_photos(b),
+                what="deleting profile photos",
+            )
+            deleted += len(batch)
+        except Exception as e:
+            # Log and continue: a photo may have already been removed elsewhere.
+            # We never re-raise here, so a partial failure still counts what worked
+            # and keeps the account safely logged in.
+            print(f"[!] failed deleting a photo batch for account {account_id}: "
+                  f"{e.__class__.__name__}: {e}")
+            continue
+
+    return {"deleted": deleted}

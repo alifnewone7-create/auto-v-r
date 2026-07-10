@@ -13,10 +13,32 @@ import { Label } from "@/components/ui/label"
 import { Badge } from "@/components/ui/badge"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Separator } from "@/components/ui/separator"
-import { UserCog, Loader2, ImageIcon, X, CheckCircle2, AlertCircle, Clock, Users, ListPlus } from "lucide-react"
+import {
+  UserCog,
+  Loader2,
+  ImageIcon,
+  X,
+  CheckCircle2,
+  AlertCircle,
+  Clock,
+  Users,
+  ListPlus,
+  Trash2,
+} from "lucide-react"
 import { toast } from "sonner"
-import { updateProfiles } from "@/app/actions/profile"
+import { updateProfiles, deleteProfilePhotos } from "@/app/actions/profile"
 import type { ProfileAccountRow } from "@/lib/types"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog"
 
 const STATUS_META: Record<
   string,
@@ -74,6 +96,7 @@ export function ProfileSection() {
   const [autoUsername, setAutoUsername] = useState(true) // generate username from name
   const [photoDataUrls, setPhotoDataUrls] = useState<string[]>([]) // pool of images, randomly assigned per account
   const [pending, startTransition] = useTransition()
+  const [deleting, startDeleteTransition] = useTransition()
   const fileRef = useRef<HTMLInputElement>(null)
 
   const parsedNames = useMemo(
@@ -160,6 +183,24 @@ export function ProfileSection() {
         return
       }
       toast.success(`Queued profile changes for ${res?.count ?? selected.size} account(s).`)
+      mutate()
+    })
+  }
+
+  function handleDeletePhotos() {
+    if (selected.size === 0) {
+      toast.error("Select at least one account.")
+      return
+    }
+    startDeleteTransition(async () => {
+      const res = await deleteProfilePhotos({ accountIds: Array.from(selected) })
+      if (res?.error) {
+        toast.error(res.error)
+        return
+      }
+      toast.success(
+        `Queued photo deletion for ${res?.count ?? selected.size} account(s). Accounts without a photo are skipped automatically.`,
+      )
       mutate()
     })
   }
@@ -356,6 +397,54 @@ export function ProfileSection() {
               Apply to selected
             </Button>
           </div>
+        </CardContent>
+      </Card>
+
+      {/* Danger zone: wipe current + all past profile photos for selected accounts. */}
+      <Card className="border-destructive/30">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2 text-base">
+            <Trash2 className="size-4 text-destructive" />
+            Delete profile photos
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <p className="text-sm text-muted-foreground">
+            Removes the <span className="font-medium text-foreground">current</span> photo and{" "}
+            <span className="font-medium text-foreground">every older</span> profile picture for the selected accounts.
+            Accounts with no photo are skipped safely, and this never logs a userbot out. This cannot be undone.
+          </p>
+          <AlertDialog>
+            <AlertDialogTrigger asChild>
+              <Button
+                variant="destructive"
+                disabled={deleting || selected.size === 0}
+                className="shrink-0 gap-2"
+              >
+                {deleting ? <Loader2 className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+                Delete all photos
+              </Button>
+            </AlertDialogTrigger>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Delete all profile photos?</AlertDialogTitle>
+                <AlertDialogDescription>
+                  This permanently removes the current and all previous profile pictures for{" "}
+                  {selected.size} selected account{selected.size === 1 ? "" : "s"}. Accounts without a photo are skipped.
+                  This action cannot be undone.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                <AlertDialogAction
+                  onClick={handleDeletePhotos}
+                  className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                >
+                  Delete photos
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
         </CardContent>
       </Card>
 

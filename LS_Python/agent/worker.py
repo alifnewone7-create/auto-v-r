@@ -17,6 +17,7 @@ website uses, polls the `jobs` table, and executes each job:
   retract_vote        -> make one userbot remove its vote from a poll
   react_post          -> react to a channel post from all userbots, time-spread
   update_profile      -> change an account's name / username / profile photo
+  delete_profile_photos -> remove an account's current + all past profile photos
 
 Start it with:  python -m agent.worker      (from the LS_Python folder)
 """
@@ -779,6 +780,51 @@ async def _run_update_profile(job: dict) -> dict:
         raise
 
 
+async def handle_delete_profile_photos(job: dict) -> dict:
+    """
+    Throttled entry point for "wipe all profile photos" jobs. Shares the same
+    semaphore + spacing as update_profile because Telegram rate-limits photo
+    changes hard.
+    """
+    async with _get_profile_sem():
+        try:
+            return await _run_delete_profile_photos(job)
+        finally:
+            await asyncio.sleep(PROFILE_JOB_DELAY_SECONDS + random.uniform(0.0, 1.5))
+
+
+async def _run_delete_profile_photos(job: dict) -> dict:
+    """
+    Delete every profile photo (current + history) for one account and write the
+    result back to its profile_updates row so the UI can show progress. An
+    account with no photo simply reports 0 deleted - never an error - and any
+    failure here fails only the JOB, never the login (delete photo jobs are not
+    in AUTH_JOB_TYPES).
+    """
+    account_id = job["account_id"]
+    p = job["payload"]
+    update_id = p.get("profile_update_id")
+    acc = db.get_account(account_id)
+    if not acc:
+        raise RuntimeError(f"account {account_id} not found")
+
+    try:
+        result = await userbot.delete_profile_photos(
+            account_id,
+            int(acc["api_id"]),
+            acc["api_hash"],
+            acc["session_string"],
+        )
+        deleted = int(result.get("deleted", 0))
+        if update_id:
+            db.set_profile_update(int(update_id), "done", None)
+        return {"stage": "photos_deleted", "deleted": deleted}
+    except Exception as e:
+        if update_id:
+            db.set_profile_update(int(update_id), "failed", str(e))
+        raise
+
+
 HANDLERS = {
     "buy_tglion_batch": handle_buy_tglion_batch,
     "provision_tglion": handle_provision_tglion,
@@ -796,6 +842,7 @@ HANDLERS = {
     "retract_vote": handle_retract_vote,
     "react_post": handle_react_post,
     "update_profile": handle_update_profile,
+    "delete_profile_photos": handle_delete_profile_photos,
 }
 
 # Jobs that are part of the login / auth flow. ONLY these may flip an account
