@@ -1,0 +1,44 @@
+# ============================================================================
+# iamhear userbot agent — systemd service (LS_Python source, run at /root/tgpro)
+#
+# Install:
+#   cp /root/tgpro/tgpro.service /etc/systemd/system/tgpro.service
+#   systemctl daemon-reload
+#   systemctl enable --now tgpro
+#
+# This runs the SUPERVISOR (multi-shard, self-healing). For a small setup you
+# can change agent.supervisor -> agent.worker in ExecStart below.
+# ============================================================================
+[Unit]
+Description=iamhear Telegram userbot agent (tgpro)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/tgpro
+
+# Use the virtualenv python created during setup.
+ExecStart=/root/tgpro/.venv/bin/python -m agent.supervisor
+
+# --- Auto-restart / 24-7 ---
+Restart=always
+RestartSec=3
+# Never give up restarting, even after repeated fast crashes.
+StartLimitIntervalSec=0
+
+# Logs go to the journal (view with: journalctl -u tgpro -f)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tgpro
+
+# Unbuffered output so logs appear immediately.
+Environment=PYTHONUNBUFFERED=1
+
+# Give live-stream connections time to close cleanly on stop/restart.
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target
