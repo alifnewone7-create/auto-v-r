@@ -1,0 +1,34 @@
+# Ready-to-use systemd unit for /root/tgpro (runs as root).
+# Install exactly as-is (no edits needed if you follow the README paths):
+#   cp /root/tgpro/telegram-pro.service /etc/systemd/system/telegram-pro.service
+#   systemctl daemon-reload
+#   systemctl enable --now telegram-pro
+#   journalctl -u telegram-pro -f          # live logs
+#
+# NOTE: point PYTHON/ExecStart at python3.12 (or 3.11). NOT 3.13/3.14.
+
+[Unit]
+Description=Telegram_pro agent (compiled, 24/7)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/tgpro
+# The agent reads .env from WorkingDirectory automatically; EnvironmentFile
+# also exports the vars to systemd (harmless if duplicated).
+EnvironmentFile=/root/tgpro/.env
+ExecStart=/usr/bin/python3.12 -m agent.supervisor
+
+# --- 24/7 auto-restart hardening ---
+Restart=always
+RestartSec=3
+# If it crash-loops, keep retrying forever instead of giving up.
+StartLimitIntervalSec=0
+# Give running jobs a moment to finish on stop/restart.
+TimeoutStopSec=20
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

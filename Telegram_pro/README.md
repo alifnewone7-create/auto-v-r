@@ -45,6 +45,52 @@ python -m agent.supervisor
 python -m agent.worker
 ```
 
+## VPS deploy at `/root/tgpro` (24/7 with systemd auto-restart)
+
+Copy the whole `Telegram_pro/` folder to the VPS as `/root/tgpro`, then:
+
+```bash
+# 1. install Python 3.12 + build tools (Ubuntu/Debian)
+apt update
+apt install -y python3.12 python3.12-venv python3.12-dev build-essential git
+
+# 2. dependencies (installed system-wide for python3.12)
+cd /root/tgpro
+python3.12 -m pip install -r requirements.txt
+
+# 3. RECOMPILE for this VPS's Python (the shipped .pyc may be a different
+#    version). Needs the LS_Python source folder next to /root/tgpro,
+#    e.g. /root/LS_Python. Skip only if the magic numbers already match.
+python3.12 build.py --clean --source /root/LS_Python
+
+# 4. create the .env (fill in DATABASE_URL, TGLION_*, etc.)
+cp .env.example .env
+nano .env
+
+# 5. install the systemd service (ready-made, no edits needed)
+cp /root/tgpro/telegram-pro.service /etc/systemd/system/telegram-pro.service
+systemctl daemon-reload
+systemctl enable --now telegram-pro     # start now + on every boot
+```
+
+Manage / monitor it:
+
+```bash
+systemctl status telegram-pro       # is it running?
+journalctl -u telegram-pro -f       # live logs
+systemctl restart telegram-pro      # restart
+systemctl stop telegram-pro         # stop
+```
+
+`Restart=always` + `RestartSec=3` + `StartLimitIntervalSec=0` mean the agent
+comes back automatically after a crash, an OOM kill, or a server reboot — truly
+24/7. The `supervisor` process additionally restarts individual worker shards
+inside the service, so a single shard dying never takes the whole agent down.
+
+> If you did **not** install python3.12 system-wide but used a venv, change
+> `ExecStart` in the service to your venv python, e.g.
+> `/root/tgpro/.venv/bin/python -m agent.supervisor`.
+
 ## IMPORTANT — Python version
 
 `.pyc` byte-code is locked to the exact Python version that produced it (the
