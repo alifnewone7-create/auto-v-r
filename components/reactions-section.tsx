@@ -230,19 +230,23 @@ function ConfigFields({
                 <span className="text-xs text-muted-foreground">Minutes</span>
                 <Input
                   type="number"
-                  min={1}
+                  min={5}
                   max={60}
                   placeholder="5"
                   value={minutes || ""}
                   onChange={(e) =>
                     setMinutes(Math.min(60, Math.max(0, Number.parseInt(e.target.value || "0", 10))))
                   }
+                  onBlur={(e) => {
+                    const n = Number.parseInt(e.target.value || "0", 10)
+                    setMinutes(Math.min(60, Math.max(5, Number.isNaN(n) ? 5 : n)))
+                  }}
                   className="h-9 w-24"
                 />
               </div>
             </div>
             <p className="text-xs text-muted-foreground">
-              Between 1 and 60 minutes. Userbots react one by one, spread evenly across this window so it looks like
+              Between 5 and 60 minutes. Userbots react one by one, spread evenly across this window so it looks like
               real users. A longer window is safer (more spacing); 5–15 minutes works well for most channels.
             </p>
           </div>
@@ -305,7 +309,7 @@ function EditDialog({ target, onSaved, userbots }: { target: ReactionTarget; onS
   const [chatId, setChatId] = useState(target.chat_id != null ? String(target.chat_id) : "")
   const [emojis, setEmojis] = useState<string[]>(target.emojis)
   const [mode, setMode] = useState<ReactionMode>(target.mode)
-  const [minutes, setMinutes] = useState(Math.min(60, Math.max(1, target.custom_minutes)))
+  const [minutes, setMinutes] = useState(Math.min(60, Math.max(5, target.custom_minutes)))
   const [reactMin, setReactMin] = useState(target.react_min ?? 0)
   const [reactMax, setReactMax] = useState(target.react_max ?? 0)
   const [pending, startTransition] = useTransition()
@@ -314,7 +318,7 @@ function EditDialog({ target, onSaved, userbots }: { target: ReactionTarget; onS
     setChatId(target.chat_id != null ? String(target.chat_id) : "")
     setEmojis(target.emojis)
     setMode(target.mode)
-    setMinutes(Math.min(60, Math.max(1, target.custom_minutes)))
+    setMinutes(Math.min(60, Math.max(5, target.custom_minutes)))
     setReactMin(target.react_min ?? 0)
     setReactMax(target.react_max ?? 0)
   }
