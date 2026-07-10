@@ -94,6 +94,18 @@ DB_THREAD_WORKERS = max(8, int(os.environ.get("AGENT_DB_THREAD_WORKERS", "24")))
 RECONCILE_SECONDS = max(5.0, float(os.environ.get("AGENT_RECONCILE_SECONDS", "15")))
 # How often to poll watched channels for new posts (live-handler fallback).
 VIEW_POLL_SECONDS = float(os.environ.get("AGENT_VIEW_POLL_SECONDS", "5"))
+# Per-target resolve backoff. When resolving a view/reaction target fails we put
+# that target on a cooldown so the 5s poll loop STOPS hammering Telegram for it.
+# Hammering an invite link (messages.CheckChatInvite) or an invalid channel every
+# cycle is exactly what triggers - and keeps growing - 420 FLOOD_WAIT_X. On a
+# FloodWait we honor Telegram's requested wait (capped); on any other resolve
+# error we back off a fixed amount before trying again.
+RESOLVE_ERROR_BACKOFF = float(os.environ.get("AGENT_RESOLVE_ERROR_BACKOFF", "300"))
+RESOLVE_FLOOD_CAP = float(os.environ.get("AGENT_RESOLVE_FLOOD_CAP", "3600"))
+RESOLVE_FLOOD_EXTRA = float(os.environ.get("AGENT_RESOLVE_FLOOD_EXTRA", "15"))
+# target_id -> monotonic timestamp before which we must not re-resolve it.
+_view_resolve_cooldown: dict[int, float] = {}
+_reaction_resolve_cooldown: dict[int, float] = {}
 # Safety cap: never enqueue more than this many posts at once from one detection
 # (prevents a huge backfill if last_seen somehow falls far behind).
 VIEW_MAX_BACKFILL = int(os.environ.get("AGENT_VIEW_MAX_BACKFILL", "30"))
@@ -988,6 +1000,17 @@ async def live_view_dispatch(chat_id: int, message_id: int) -> None:
     )
 
 
+def _resolve_backoff_seconds(exc: Exception) -> tuple[float, str]:
+    """Given a resolve failure, decide how long to skip re-polling this target.
+    Returns (seconds, human_reason). FloodWaits honor Telegram's requested wait
+    (plus a small buffer, capped); everything else uses a fixed backoff."""
+    flood = userbot.flood_wait_seconds(exc)
+    if flood is not None:
+        wait = min(float(flood) + RESOLVE_FLOOD_EXTRA, RESOLVE_FLOOD_CAP)
+        return wait, f"rate limited by Telegram, retrying in ~{int(wait)}s"
+    return RESOLVE_ERROR_BACKOFF, f"resolve failed, retrying in ~{int(RESOLVE_ERROR_BACKOFF)}s"
+
+
 async def poll_view_targets() -> None:
     """
     Fallback detector: for each active channel, look up the latest post id and
@@ -1000,10 +1023,18 @@ async def poll_view_targets() -> None:
         print(f"[!] view targets query failed: {e}")
         return
 
+    now = time.monotonic()
     for t in targets:
+        # Skip targets that are on a resolve cooldown (FloodWait / bad link) so we
+        # don't keep hammering Telegram and inflating the required wait.
+        if now < _view_resolve_cooldown.get(t["id"], 0.0):
+            continue
         try:
             ref = t["chat_id"] if t["chat_id"] is not None else t["channel_link"]
             chat_id, title, latest = await userbot.resolve_channel_latest(ref)
+
+            # Resolved fine - clear any prior cooldown.
+            _view_resolve_cooldown.pop(t["id"], None)
 
             if t["chat_id"] is None or not t["title"]:
                 db.set_view_target_meta(t["id"], chat_id, title)
@@ -1024,8 +1055,10 @@ async def poll_view_targets() -> None:
             # No warm userbots yet - try again next cycle, don't spam errors.
             return
         except Exception as e:
-            db.set_view_target_error(t["id"], str(e)[:500])
-            print(f"[!] view poll failed for target {t['id']}: {e}")
+            wait, reason = _resolve_backoff_seconds(e)
+            _view_resolve_cooldown[t["id"]] = time.monotonic() + wait
+            db.set_view_target_error(t["id"], f"{reason}: {str(e)[:300]}")
+            print(f"[!] view poll failed for target {t['id']}: {e} ({reason})")
 
 
 async def dispatch_reactions_for_target(target: dict, chat_id: int, latest_id: int) -> None:
@@ -1087,10 +1120,17 @@ async def poll_reaction_targets() -> None:
         print(f"[!] reaction targets query failed: {e}")
         return
 
+    now = time.monotonic()
     for t in targets:
+        # Same per-target cooldown as views: don't re-resolve a flooded / invalid
+        # target every cycle - that is what keeps FLOOD_WAIT climbing.
+        if now < _reaction_resolve_cooldown.get(t["id"], 0.0):
+            continue
         try:
             ref = t["chat_id"] if t["chat_id"] is not None else t["channel_link"]
             chat_id, title, latest = await userbot.resolve_channel_latest(ref)
+
+            _reaction_resolve_cooldown.pop(t["id"], None)
 
             if t["chat_id"] is None or not t["title"]:
                 db.set_reaction_target_meta(t["id"], chat_id, title)
@@ -1104,8 +1144,10 @@ async def poll_reaction_targets() -> None:
         except userbot.UserbotError:
             return  # no warm userbots yet
         except Exception as e:
-            db.set_reaction_target_error(t["id"], str(e)[:500])
-            print(f"[!] reaction poll failed for target {t['id']}: {e}")
+            wait, reason = _resolve_backoff_seconds(e)
+            _reaction_resolve_cooldown[t["id"]] = time.monotonic() + wait
+            db.set_reaction_target_error(t["id"], f"{reason}: {str(e)[:300]}")
+            print(f"[!] reaction poll failed for target {t['id']}: {e} ({reason})")
 
 
 async def startup_warmup() -> None:

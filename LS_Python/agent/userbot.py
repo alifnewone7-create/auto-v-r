@@ -164,6 +164,13 @@ def _flood_seconds(exc: Exception) -> int | None:
             return int(m.group(1))
     return None
 
+
+def flood_wait_seconds(exc: Exception) -> int | None:
+    """Public wrapper around `_flood_seconds` for callers outside this module
+    (e.g. the worker's poll loops) that need to detect Telegram FloodWaits
+    raised straight from a raw Pyrogram call."""
+    return _flood_seconds(exc)
+
 # In-memory pool of IN-PROGRESS login clients, keyed by phone number.
 # The userbot login is split across two jobs (send_login_code -> submit_login_code)
 # that both run inside this same long-running worker process. We MUST keep the
