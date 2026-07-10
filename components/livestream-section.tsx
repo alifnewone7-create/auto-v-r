@@ -9,7 +9,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Badge } from "@/components/ui/badge"
 import { Separator } from "@/components/ui/separator"
-import { Radio, LogOut, Trash2, Loader2, CheckCircle2, XCircle, Link2, Plus, Minus, Users, AlertCircle, Square, Hand } from "lucide-react"
+import { Radio, LogOut, Trash2, Loader2, CheckCircle2, XCircle, Link2, Plus, Minus, Users, AlertCircle, Square } from "lucide-react"
 import { toast } from "sonner"
 import {
   joinLivestream,
@@ -18,8 +18,7 @@ import {
   deleteLivestream,
   addLivestreamBots,
   removeLivestreamBots,
-  raiseHandLivestream,
-} from "@/app/actions/livestream"
+  } from "@/app/actions/livestream"
 import type { LivestreamTarget } from "@/lib/types"
 import { isTelegramLink, stripSpaces, clampCount } from "@/lib/validation"
 
@@ -58,7 +57,6 @@ function TargetCard({
   // when the action actually fires.
   const [addAmount, setAddAmount] = useState("1")
   const [removeAmount, setRemoveAmount] = useState("1")
-  const [raiseAmount, setRaiseAmount] = useState("1")
   const [pending, startTransition] = useTransition()
 
   // Turn whatever is in a quantity box into a valid 1..max integer at submit time.
@@ -204,59 +202,6 @@ function TargetCard({
         </div>
         <p className="text-xs text-muted-foreground">
           {`${availableToAdd} free userbot${availableToAdd === 1 ? "" : "s"} left to add · ${loggedInCount} logged in total`}
-        </p>
-
-        {/* Raise / lower hand ("ask to speak") for a number of joined userbots */}
-        <div className="flex flex-col gap-2 rounded-lg border border-border p-3 sm:flex-row sm:items-center">
-          <div className="flex items-center gap-2">
-            <Hand className="size-4 shrink-0 text-primary" />
-            <Input
-              type="text"
-              inputMode="numeric"
-              value={raiseAmount}
-              onChange={onAmountChange(setRaiseAmount)}
-              onBlur={() => setRaiseAmount(String(parseAmount(raiseAmount, joinedCount)))}
-              className="h-8 w-20"
-              aria-label="How many userbots should raise their hand"
-              disabled={pending}
-            />
-            <Button
-              size="sm"
-              className="h-8 gap-1"
-              disabled={pending || joinedCount < 1}
-              title={joinedCount < 1 ? "No joined userbots to raise a hand" : "Ask to speak (raise hand)"}
-              onClick={() =>
-                run(
-                  () => raiseHandLivestream(target.id, parseAmount(raiseAmount, joinedCount), true),
-                  (n) => `${n} userbot${n === 1 ? "" : "s"} raised their hand (asking to speak).`,
-                )
-              }
-            >
-              {pending ? <Loader2 className="size-3.5 animate-spin" /> : <Hand className="size-3.5" />}
-              Raise hand
-            </Button>
-          </div>
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-8 gap-1 bg-transparent sm:ml-auto"
-            disabled={pending || joinedCount < 1}
-            title={joinedCount < 1 ? "No joined userbots" : "Lower hand for the same number of bots"}
-            onClick={() =>
-              run(
-                () => raiseHandLivestream(target.id, parseAmount(raiseAmount, joinedCount), false),
-                (n) => `${n} userbot${n === 1 ? "" : "s"} lowered their hand.`,
-              )
-            }
-          >
-            <Minus className="size-3.5" />
-            Lower hand
-          </Button>
-        </div>
-        <p className="text-xs text-muted-foreground">
-          {`Ask to speak: pick how many of the ${joinedCount} joined userbot${
-            joinedCount === 1 ? "" : "s"
-          } should raise their hand in the live stream.`}
         </p>
 
         <Separator />
