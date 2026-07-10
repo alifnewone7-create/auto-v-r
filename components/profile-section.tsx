@@ -71,7 +71,7 @@ export function ProfileSection() {
   const [firstName, setFirstName] = useState("")
   const [lastName, setLastName] = useState("")
   const [username, setUsername] = useState("")
-  const [autoUsername, setAutoUsername] = useState(true) // generate username from name
+  const [autoUsername, setAutoUsername] = useState(false) // generate username from name
   const [photoDataUrls, setPhotoDataUrls] = useState<string[]>([]) // pool of images, randomly assigned per account
   const [noRepeat, setNoRepeat] = useState(false) // use each name/photo once, skip extra accounts
   const [pending, startTransition] = useTransition()
