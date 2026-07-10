@@ -9,22 +9,28 @@ export function stripSpaces(value: string): string {
   return value.replace(/\s+/g, "")
 }
 
-// True only for a well-formed Telegram link / handle. Accepts:
-//   @username
-//   username            (bare public username)
-//   t.me/username       (+ optional /123 message id, trailing slash)
-//   t.me/+invitehash    and  t.me/joinchat/hash
-//   telegram.me/...     and  https:// / http:// / www. prefixes
+// True ONLY for a real Telegram link / handle. To keep out arbitrary text, we
+// require an explicit Telegram marker: either a leading "@" or a t.me /
+// telegram.me domain. A bare word like "banana" is NOT accepted. Accepts:
+//   @username                          (4-32 char handle: letters/digits/_)
+//   t.me/username                      (+ optional /123 message id)
+//   t.me/+invitehash    t.me/joinchat/hash
+//   telegram.me/...   dog.tg/...       and https:// / http:// / www. prefixes
 export function isTelegramLink(raw: string): boolean {
   const s = stripSpaces(raw)
   if (!s) return false
 
-  // @username or bare public username (5-32 chars, letters/digits/underscore).
-  if (/^@?[a-zA-Z][a-zA-Z0-9_]{3,31}$/.test(s)) return true
+  // @username only (the "@" is what proves intent; bare words are rejected).
+  if (/^@[a-zA-Z][a-zA-Z0-9_]{3,31}$/.test(s)) return true
 
+  // Domain-based links: strip scheme + optional www., then require t.me /
+  // telegram.me followed by a public username, invite hash, or post link.
   const noProto = s.replace(/^https?:\/\//i, "").replace(/^www\./i, "")
-  // t.me / telegram.me public, invite (+hash / joinchat/hash) and post links.
-  if (/^(t|telegram)\.me\/(\+[a-zA-Z0-9_-]+|joinchat\/[a-zA-Z0-9_-]+|[a-zA-Z0-9_]{3,32}(\/[0-9]+)?)\/?$/i.test(noProto)) {
+  if (
+    /^(t|telegram)\.me\/(\+[a-zA-Z0-9_-]+|joinchat\/[a-zA-Z0-9_-]+|[a-zA-Z][a-zA-Z0-9_]{3,31}(\/[0-9]+)?)\/?$/i.test(
+      noProto,
+    )
+  ) {
     return true
   }
   return false
