@@ -141,6 +141,7 @@ export function ChannelJoinSection() {
     { refreshInterval: 3000 },
   )
   const [pending, startTransition] = useTransition()
+  const [link, setLink] = useState("")
   const targets = data?.targets ?? []
   const loggedInCount = data?.logged_in_count ?? 0
 
@@ -185,8 +186,11 @@ export function ChannelJoinSection() {
                   placeholder="@channel, t.me/link or t.me/+invite"
                   className="pl-9"
                   required
-                  onInput={(e) => {
-                    e.currentTarget.value = stripSpaces(e.currentTarget.value)
+                  value={link}
+                  onChange={(e) => {
+                    const cleaned = stripSpaces(e.target.value)
+                    setLink(cleaned)
+                    e.target.value = cleaned
                   }}
                 />
               </div>
@@ -209,7 +213,11 @@ export function ChannelJoinSection() {
                   }}
                 />
               </div>
-              <Button type="submit" disabled={pending} className="gap-2 sm:ml-auto">
+              <Button
+                type="submit"
+                disabled={pending || !isTelegramLink(link)}
+                className="gap-2 sm:ml-auto"
+              >
                 {pending ? <Loader2 className="size-4 animate-spin" /> : <UserPlus className="size-4" />}
                 Join with userbots
               </Button>

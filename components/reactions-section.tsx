@@ -538,7 +538,11 @@ export function ReactionsSection() {
                 userbots === 1 ? "" : "s"
               }.`}
             </p>
-            <Button onClick={handleAdd} disabled={pending || atLimit} className="gap-2">
+            <Button
+              onClick={handleAdd}
+              disabled={pending || atLimit || !isTelegramLink(link)}
+              className="gap-2"
+            >
               {pending ? <Loader2 className="size-4 animate-spin" /> : <Plus className="size-4" />}
               Add channel
             </Button>

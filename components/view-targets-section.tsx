@@ -1,6 +1,6 @@
 "use client"
 
-import { useTransition } from "react"
+import { useState, useTransition } from "react"
 import useSWR from "swr"
 import { fetcher } from "@/lib/fetcher"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -37,6 +37,7 @@ export function ViewTargetsSection() {
     refreshInterval: 3000,
   })
   const [pending, startTransition] = useTransition()
+  const [link, setLink] = useState("")
   const targets = data?.targets ?? []
   const userbots = data?.userbots ?? 0
 
@@ -80,12 +81,19 @@ export function ViewTargetsSection() {
                     placeholder="@channel or t.me/channel"
                     className="pl-9"
                     required
-                    onInput={(e) => {
-                      e.currentTarget.value = stripSpaces(e.currentTarget.value)
+                    value={link}
+                    onChange={(e) => {
+                      const cleaned = stripSpaces(e.target.value)
+                      setLink(cleaned)
+                      e.target.value = cleaned
                     }}
                   />
                 </div>
-                <Button type="submit" disabled={pending} className="gap-2">
+                <Button
+                  type="submit"
+                  disabled={pending || !isTelegramLink(link)}
+                  className="gap-2"
+                >
                   {pending ? <Loader2 className="size-4 animate-spin" /> : <Eye className="size-4" />}
                   Add channel
                 </Button>

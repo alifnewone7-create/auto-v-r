@@ -145,6 +145,7 @@ export function VoteSection() {
     refreshInterval: 3000,
   })
   const [pending, startTransition] = useTransition()
+  const [link, setLink] = useState("")
   const targets = data?.targets ?? []
   const userbots = data?.userbots ?? 0
 
@@ -188,12 +189,19 @@ export function VoteSection() {
                     placeholder="t.me/channel/123, @channel or t.me/+invite"
                     className="pl-9"
                     required
-                    onInput={(e) => {
-                      e.currentTarget.value = stripSpaces(e.currentTarget.value)
+                    value={link}
+                    onChange={(e) => {
+                      const cleaned = stripSpaces(e.target.value)
+                      setLink(cleaned)
+                      e.target.value = cleaned
                     }}
                   />
                 </div>
-                <Button type="submit" disabled={pending} className="gap-2">
+                <Button
+                  type="submit"
+                  disabled={pending || !isTelegramLink(link)}
+                  className="gap-2"
+                >
                   {pending ? <Loader2 className="size-4 animate-spin" /> : <Vote className="size-4" />}
                   Detect poll
                 </Button>
