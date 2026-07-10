@@ -1,9 +1,11 @@
 "use client"
 
+import { useState } from "react"
 import { Radio, Users, LogOut, Eye, Vote, Smile, UserCog, UserPlus } from "lucide-react"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Button } from "@/components/ui/button"
 import { logoutAction } from "@/app/actions/auth"
+import { MobileNav } from "@/components/mobile-nav"
 import { AgentStatusBar } from "@/components/agent-status-bar"
 import { AccountsSection } from "@/components/accounts-section"
 import { LivestreamSection } from "@/components/livestream-section"
@@ -14,6 +16,8 @@ import { ChannelJoinSection } from "@/components/channel-join-section"
 import { ProfileSection } from "@/components/profile-section"
 
 export function Dashboard() {
+  const [activeTab, setActiveTab] = useState("accounts")
+
   return (
     <div className="min-h-screen bg-background text-foreground">
       <header className="border-b border-border">
@@ -27,47 +31,52 @@ export function Dashboard() {
               <p className="text-xs text-muted-foreground">Userbot Control Panel</p>
             </div>
           </div>
-          <form action={logoutAction}>
+          
+          {/* Desktop logout button */}
+          <form action={logoutAction} className="hidden md:block">
             <Button variant="ghost" size="sm" type="submit" className="gap-2 text-muted-foreground">
               <LogOut className="size-4" />
-              <span className="hidden sm:inline">Sign out</span>
+              <span>Sign out</span>
             </Button>
           </form>
+
+          {/* Mobile hamburger menu */}
+          <MobileNav activeTab={activeTab} onTabChange={setActiveTab} />
         </div>
       </header>
 
       <main className="mx-auto max-w-6xl px-4 py-6 sm:px-6">
         <AgentStatusBar />
 
-        <Tabs defaultValue="accounts" className="mt-6">
-          <TabsList>
+        <Tabs value={activeTab} onValueChange={setActiveTab} className="mt-6">
+          <TabsList className="hidden w-full md:flex md:flex-wrap lg:flex-nowrap">
             <TabsTrigger value="accounts" className="gap-2">
               <Users className="size-4" />
-              Userbots
+              <span className="hidden lg:inline">Userbots</span>
             </TabsTrigger>
             <TabsTrigger value="channel-join" className="gap-2">
               <UserPlus className="size-4" />
-              Channel Join
+              <span className="hidden lg:inline">Channel Join</span>
             </TabsTrigger>
             <TabsTrigger value="livestream" className="gap-2">
               <Radio className="size-4" />
-              Live Stream Join
+              <span className="hidden lg:inline">Live Stream</span>
             </TabsTrigger>
             <TabsTrigger value="view" className="gap-2">
               <Eye className="size-4" />
-              Live View
+              <span className="hidden lg:inline">Live View</span>
             </TabsTrigger>
             <TabsTrigger value="vote" className="gap-2">
               <Vote className="size-4" />
-              Vote
+              <span className="hidden lg:inline">Vote</span>
             </TabsTrigger>
             <TabsTrigger value="reactions" className="gap-2">
               <Smile className="size-4" />
-              Reactions
+              <span className="hidden lg:inline">Reactions</span>
             </TabsTrigger>
             <TabsTrigger value="profile" className="gap-2">
               <UserCog className="size-4" />
-              Profile
+              <span className="hidden lg:inline">Profile</span>
             </TabsTrigger>
           </TabsList>
 
