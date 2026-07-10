@@ -392,6 +392,7 @@ _STALE_REQUEUE_TYPES = (
     "join_livestream",
     "leave_livestream",
     "leave_livestream_all",
+    "join_channel",
     "cast_vote",
     "retract_vote",
     "detect_poll",
@@ -557,6 +558,70 @@ def livestream_target_status(target_id: int) -> str | None:
     """
     row = query_one("SELECT status FROM livestream_targets WHERE id = %s", (target_id,))
     return row["status"] if row else None
+
+
+# ---------------------------------------------------------------------------
+# Channel Join helpers (get userbots into a channel/group)
+# ---------------------------------------------------------------------------
+
+def channel_join_target_exists(target_id: int) -> bool:
+    """
+    True if the channel-join task still exists. The handler uses this to skip a
+    queued join whose task was deleted from the website, so a bot is never joined
+    for a task that's already gone.
+    """
+    return query_one("SELECT 1 AS ok FROM channel_join_targets WHERE id = %s", (target_id,)) is not None
+
+
+def set_channel_join_participant(target_id: int, account_id: int, status: str, error: str | None = None) -> None:
+    """
+    Record one userbot's join outcome. Guarded by an EXISTS check so a late
+    write for a deleted task can't violate the foreign key (mirrors the
+    livestream set_participant guard).
+    """
+    query(
+        """
+        INSERT INTO channel_join_participants (target_id, account_id, status, last_error)
+        SELECT %s, %s, %s, %s
+        WHERE EXISTS (SELECT 1 FROM channel_join_targets WHERE id = %s)
+        ON CONFLICT (target_id, account_id)
+        DO UPDATE SET status = EXCLUDED.status, last_error = EXCLUDED.last_error, updated_at = now()
+        """,
+        (target_id, account_id, status, (error or None) and error[:500], target_id),
+    )
+
+
+def recount_channel_join(target_id: int) -> None:
+    """
+    Recompute counts + overall status from the participant rows. 'joined' and
+    'already_member' both count as success. Status: joining while any are still
+    pending, else done (none failed), failed (none joined) or partial.
+    """
+    query(
+        """
+        UPDATE channel_join_targets t SET
+            joined_count = s.joined,
+            failed_count = s.failed,
+            total_count  = s.total,
+            status = CASE
+                       WHEN s.pending > 0 THEN 'joining'
+                       WHEN s.failed = 0 THEN 'done'
+                       WHEN s.joined = 0 THEN 'failed'
+                       ELSE 'partial'
+                     END,
+            updated_at = now()
+        FROM (
+            SELECT
+                count(*)::int AS total,
+                count(*) FILTER (WHERE status IN ('joined','already_member'))::int AS joined,
+                count(*) FILTER (WHERE status = 'failed')::int AS failed,
+                count(*) FILTER (WHERE status IN ('pending','joining'))::int AS pending
+            FROM channel_join_participants WHERE target_id = %s
+        ) s
+        WHERE t.id = %s
+        """,
+        (target_id, target_id),
+    )
 
 
 # ---------------------------------------------------------------------------

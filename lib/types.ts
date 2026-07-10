@@ -59,6 +59,7 @@ export type JobType =
   | "submit_login_code" // pass the userbot login code (+ 2FA password) to the agent
   | "join_livestream" // join the live stream / video chat of a chat
   | "leave_livestream" // leave the live stream
+  | "join_channel" // join a channel/group so future view/react/vote actions work
   | "view_post" // view a channel post from every logged-in userbot
   | "detect_poll" // read the most recent poll in a channel and fill in vote_targets
   | "cast_vote" // make one userbot vote on a poll option
@@ -220,6 +221,42 @@ export interface AccountMessage {
   telegram_message_id: number | null
   message_date: string | null
   created_at: string
+}
+
+// Channel Join: get every userbot into a channel/group so later view/react/vote
+// actions work. A target is one "join this chat with N userbots" task.
+//  joining -> at least one bot still pending
+//  done    -> all bots joined / already members
+//  partial -> some joined, some failed
+//  failed  -> every bot failed
+export type ChannelJoinStatus = "joining" | "done" | "partial" | "failed"
+// Per-bot outcome. 'already_member' counts as success (bot is in the chat).
+export type ChannelJoinParticipantStatus = "pending" | "joining" | "joined" | "already_member" | "failed"
+
+export interface ChannelJoinTarget {
+  id: number
+  chat_link: string
+  title: string | null
+  status: ChannelJoinStatus
+  total_count: number
+  joined_count: number
+  failed_count: number
+  last_error: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface ChannelJoinParticipant {
+  account_id: number
+  phone: string
+  label: string | null
+  status: ChannelJoinParticipantStatus
+  last_error: string | null
+}
+
+// A channel_join_targets row enriched with its per-bot participant rows.
+export interface ChannelJoinTargetRow extends ChannelJoinTarget {
+  participants: ChannelJoinParticipant[]
 }
 
 // A telegram account row enriched with the latest profile-edit result, used by

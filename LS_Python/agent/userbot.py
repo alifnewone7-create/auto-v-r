@@ -961,6 +961,140 @@ def _normalize_link(chat_link: str) -> str:
 
 
 # ===========================================================================
+# Channel Join: get a userbot into a channel/group (no live stream / group call)
+# ===========================================================================
+
+# Telegram RPC error fragments that mean the userbot IS ALREADY a member. These
+# must be treated as SUCCESS, never as a failure, so re-running a join is safe.
+_ALREADY_MEMBER_MARKERS = (
+    "USER_ALREADY_PARTICIPANT",
+    "ALREADY A MEMBER",
+    "ALREADY PARTICIPANT",
+)
+
+# Map common permanent join failures to a short, human-readable reason so the
+# panel can show exactly WHY a userbot could not join, instead of a raw RPC name.
+# Anything not listed here is reported with its own message but still never
+# crashes the agent.
+_JOIN_ERROR_REASONS = (
+    ("INVITE_HASH_EXPIRED", "Invite link expired — get a fresh link."),
+    ("INVITE_HASH_INVALID", "Invalid invite link."),
+    ("INVITE_REQUEST_SENT", "Join request sent — waiting for admin approval."),
+    ("USER_CHANNELS_TOO_MUCH", "This userbot is in too many chats already."),
+    ("CHANNELS_TOO_MUCH", "This userbot is in too many chats already."),
+    ("USERNAME_NOT_OCCUPIED", "No such channel/username — check the link."),
+    ("USERNAME_INVALID", "Invalid channel username/link."),
+    ("PEER_ID_INVALID", "Wrong or unreachable link."),
+    ("CHANNEL_PRIVATE", "Channel is private — use an invite link."),
+    ("CHANNEL_INVALID", "Invalid channel."),
+    ("INVITE_HASH_EMPTY", "Empty invite link."),
+    ("USER_BANNED_IN_CHANNEL", "This userbot is banned from that chat."),
+    ("CHAT_INVALID", "Invalid chat link."),
+    ("CHAT_WRITE_FORBIDDEN", "This userbot can't join that chat."),
+)
+
+
+def _classify_join_error(exc: Exception) -> str:
+    """
+    Turn a failed join into either the sentinel string 'already' (the bot is in
+    fact already a member -> success) or a short human-readable failure reason.
+    Uses text matching so it works across pyrofork versions without importing
+    version-specific error classes.
+    """
+    text = f"{getattr(exc, 'ID', '')} {getattr(exc, 'MESSAGE', '')} {exc}".upper()
+    for marker in _ALREADY_MEMBER_MARKERS:
+        if marker in text:
+            return "already"
+    for marker, reason in _JOIN_ERROR_REASONS:
+        if marker in text:
+            return reason
+    # Unknown but non-fatal: surface a trimmed generic message. Still no crash.
+    return f"Could not join: {exc.__class__.__name__}"
+
+
+async def _do_join_chat(client: Client, chat_link: str) -> str:
+    """
+    Join a public @username / t.me link OR a private invite link with ONE client.
+    Returns "joined" or "already_member". Raises FloodWaitError for a durable
+    retry, or UserbotError(reason) for a permanent, clearly-explained failure.
+    Never lets a raw exception escape unclassified.
+    """
+    link = _normalize_link(chat_link)
+    is_invite = ("+" in chat_link) or ("joinchat" in chat_link)
+    join_arg = chat_link if is_invite else link
+
+    try:
+        await client.join_chat(join_arg)
+        return "joined"
+    except FloodWait as e:
+        raise FloodWaitError(int(getattr(e, "value", None) or getattr(e, "x", 0) or 60), what="channel join")
+    except Exception as e:
+        secs = _flood_seconds(e)
+        if secs is not None:
+            raise FloodWaitError(secs, what="channel join")
+        kind = _classify_join_error(e)
+        if kind == "already":
+            return "already_member"
+        # Public links sometimes throw when a join isn't required but the bot can
+        # still resolve the chat as an existing member — verify before failing.
+        if not is_invite:
+            try:
+                await client.get_chat(link)
+                return "already_member"
+            except Exception:
+                pass
+        raise UserbotError(kind)
+
+
+async def join_channel_only(
+    account_id: int, api_id: int, api_hash: str, session_string: str, chat_link: str
+) -> str:
+    """
+    Make ONE userbot join a channel / group (plain membership — NO live stream /
+    group call). This is what gets bots into a chat so later view / react / vote
+    actions work.
+
+    Fault-tolerant by design (the whole point of the feature):
+      * already a member            -> returns "already_member" (success)
+      * expired / invalid / wrong link, private, banned, too many chats
+                                    -> raises UserbotError with a clear reason so
+                                       ONLY this bot is marked failed
+      * Telegram flood/rate limit   -> raises FloodWaitError so the worker
+                                       durably reschedules (bot still joins later)
+    None of these ever crash the agent or log the userbot out.
+
+    Reuses the account's warm client if one is already online (e.g. from a live
+    stream); otherwise it spins up a lightweight in-memory client just for the
+    join and shuts it down afterwards so we don't hold hundreds of idle clients.
+    """
+    # Trickle joins through the same concurrency gate + jitter as stream joins so
+    # a 500-1000 bot burst arrives smoothly and stays inside Telegram's limits.
+    async with _get_join_sem():
+        if JOIN_STAGGER_SECONDS > 0:
+            await asyncio.sleep(random.uniform(0.0, JOIN_STAGGER_SECONDS))
+
+        reuse = _POOL.get(account_id)
+        if reuse is not None:
+            return await _do_join_chat(reuse["client"], chat_link)
+
+        client = Client(
+            name=f"join_{account_id}",
+            api_id=api_id,
+            api_hash=api_hash,
+            session_string=session_string,
+            in_memory=True,
+        )
+        await client.start()
+        try:
+            return await _do_join_chat(client, chat_link)
+        finally:
+            try:
+                await client.stop()
+            except Exception:
+                pass
+
+
+# ===========================================================================
 # Live View: auto-view future channel posts with every logged-in userbot
 # ===========================================================================
 

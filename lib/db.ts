@@ -251,6 +251,35 @@ CREATE TABLE IF NOT EXISTS account_messages (
 
 CREATE INDEX IF NOT EXISTS account_messages_account_created_idx
   ON account_messages (account_id, created_at DESC);
+
+-- Channel Join: make every userbot a member of a channel/group so future
+-- view/react/vote actions work. Joins are idempotent + fault-tolerant (already
+-- a member counts as success; expired/wrong/banned links are skipped per-bot).
+CREATE TABLE IF NOT EXISTS channel_join_targets (
+  id           SERIAL PRIMARY KEY,
+  chat_link    TEXT NOT NULL,
+  title        TEXT,
+  status       TEXT NOT NULL DEFAULT 'joining',   -- joining | done | partial | failed
+  total_count  INTEGER NOT NULL DEFAULT 0,
+  joined_count INTEGER NOT NULL DEFAULT 0,
+  failed_count INTEGER NOT NULL DEFAULT 0,
+  last_error   TEXT,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS channel_join_participants (
+  target_id  INTEGER NOT NULL REFERENCES channel_join_targets(id) ON DELETE CASCADE,
+  account_id INTEGER NOT NULL REFERENCES telegram_accounts(id)    ON DELETE CASCADE,
+  status     TEXT NOT NULL DEFAULT 'pending',    -- pending | joining | joined | already_member | failed
+  last_error TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (target_id, account_id)
+);
+
+CREATE INDEX IF NOT EXISTS channel_join_targets_status_idx ON channel_join_targets (status);
+CREATE INDEX IF NOT EXISTS channel_join_participants_target_idx ON channel_join_participants (target_id);
 `
 
 // Reads every scripts/*.sql file in filename order and returns them as an

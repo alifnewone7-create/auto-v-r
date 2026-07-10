@@ -530,6 +530,48 @@ async def handle_leave_livestream_all(job: dict) -> dict:
     return {"stage": "left_all", "left": left, "requested": len(account_ids)}
 
 
+async def handle_join_channel(job: dict) -> dict:
+    """
+    Join ONE userbot into a channel/group (plain membership, no live stream) so
+    later view/react/vote actions work for it.
+
+    Robust by design: 'already a member' is recorded as success; a bad/expired/
+    wrong link, private channel, ban or "too many chats" is recorded as a per-bot
+    failure with a clear reason (only THIS bot is marked failed); a Telegram flood
+    is re-raised so the worker durably reschedules the job. None of these crash
+    the agent, and a join failure never logs the userbot out (join_channel is not
+    in AUTH_JOB_TYPES).
+    """
+    account_id = job["account_id"]
+    target_id = job["payload"]["target_id"]
+    chat_link = job["payload"]["chat_link"]
+
+    # Skip if the task was deleted from the website while this job was queued.
+    if not await db.arun(db.channel_join_target_exists, target_id):
+        return {"stage": "skipped", "reason": "task deleted", "target_id": target_id}
+
+    acc = await db.arun(db.get_account, account_id)
+
+    try:
+        result = await userbot.join_channel_only(
+            account_id, int(acc["api_id"]), acc["api_hash"], acc["session_string"], chat_link
+        )
+        status = "already_member" if result == "already_member" else "joined"
+        await db.arun(db.set_channel_join_participant, target_id, account_id, status, None)
+    except userbot.FloodWaitError:
+        # Leave the participant 'pending' and let the worker reschedule the job.
+        raise
+    except Exception as e:
+        await db.arun(db.set_channel_join_participant, target_id, account_id, "failed", str(e)[:500])
+        await db.arun(db.recount_channel_join, target_id)
+        # Swallow: one bot's permanent join failure must not fail the batch or
+        # bubble up. The per-bot reason is already stored for the UI.
+        return {"stage": "join_failed", "target_id": target_id, "error": str(e)[:200]}
+
+    await db.arun(db.recount_channel_join, target_id)
+    return {"stage": result, "target_id": target_id}
+
+
 async def handle_view_post(job: dict) -> dict:
     """
     View a single channel post from EVERY warm userbot. One of these jobs is
@@ -733,6 +775,7 @@ HANDLERS = {
     "join_livestream": handle_join_livestream,
     "leave_livestream": handle_leave_livestream,
     "leave_livestream_all": handle_leave_livestream_all,
+    "join_channel": handle_join_channel,
     "view_post": handle_view_post,
     "detect_poll": handle_detect_poll,
     "cast_vote": handle_cast_vote,

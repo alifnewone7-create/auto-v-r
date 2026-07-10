@@ -1,6 +1,6 @@
 "use client"
 
-import { Radio, Users, LogOut, Eye, Vote, Smile, UserCog } from "lucide-react"
+import { Radio, Users, LogOut, Eye, Vote, Smile, UserCog, UserPlus } from "lucide-react"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Button } from "@/components/ui/button"
 import { logoutAction } from "@/app/actions/auth"
@@ -10,6 +10,7 @@ import { LivestreamSection } from "@/components/livestream-section"
 import { ViewTargetsSection } from "@/components/view-targets-section"
 import { VoteSection } from "@/components/vote-section"
 import { ReactionsSection } from "@/components/reactions-section"
+import { ChannelJoinSection } from "@/components/channel-join-section"
 import { ProfileSection } from "@/components/profile-section"
 
 export function Dashboard() {
@@ -44,6 +45,10 @@ export function Dashboard() {
               <Users className="size-4" />
               Userbots
             </TabsTrigger>
+            <TabsTrigger value="channel-join" className="gap-2">
+              <UserPlus className="size-4" />
+              Channel Join
+            </TabsTrigger>
             <TabsTrigger value="livestream" className="gap-2">
               <Radio className="size-4" />
               Live Stream Join
@@ -68,6 +73,9 @@ export function Dashboard() {
 
           <TabsContent value="accounts" className="mt-6">
             <AccountsSection />
+          </TabsContent>
+          <TabsContent value="channel-join" className="mt-6">
+            <ChannelJoinSection />
           </TabsContent>
           <TabsContent value="livestream" className="mt-6">
             <LivestreamSection />
