@@ -90,8 +90,6 @@ function ConfigFields({
   setEmojis,
   mode,
   setMode,
-  hours,
-  setHours,
   minutes,
   setMinutes,
   reactMin,
@@ -104,8 +102,6 @@ function ConfigFields({
   setEmojis: (e: string[]) => void
   mode: ReactionMode
   setMode: (m: ReactionMode) => void
-  hours: number
-  setHours: (n: number) => void
   minutes: number
   setMinutes: (n: number) => void
   reactMin: number
@@ -231,31 +227,23 @@ function ConfigFields({
             <Label className="text-xs">Finish all reactions within</Label>
             <div className="flex items-end gap-3">
               <div className="flex flex-col gap-1">
-                <span className="text-xs text-muted-foreground">Hours</span>
-                <Input
-                  type="number"
-                  min={0}
-                  placeholder="0"
-                  value={hours || ""}
-                  onChange={(e) => setHours(Math.max(0, Number.parseInt(e.target.value || "0", 10)))}
-                  className="h-9 w-20"
-                />
-              </div>
-              <div className="flex flex-col gap-1">
                 <span className="text-xs text-muted-foreground">Minutes</span>
                 <Input
                   type="number"
-                  min={0}
-                  max={59}
-                  placeholder="0"
+                  min={1}
+                  max={60}
+                  placeholder="5"
                   value={minutes || ""}
-                  onChange={(e) => setMinutes(Math.max(0, Number.parseInt(e.target.value || "0", 10)))}
-                  className="h-9 w-20"
+                  onChange={(e) =>
+                    setMinutes(Math.min(60, Math.max(0, Number.parseInt(e.target.value || "0", 10))))
+                  }
+                  className="h-9 w-24"
                 />
               </div>
             </div>
             <p className="text-xs text-muted-foreground">
-              Minimum 1 minute. Userbots react one by one, spread across this exact window so it looks like real users.
+              Between 1 and 60 minutes. Userbots react one by one, spread evenly across this window so it looks like
+              real users. A longer window is safer (more spacing); 5–15 minutes works well for most channels.
             </p>
           </div>
         ) : null}
@@ -317,8 +305,7 @@ function EditDialog({ target, onSaved, userbots }: { target: ReactionTarget; onS
   const [chatId, setChatId] = useState(target.chat_id != null ? String(target.chat_id) : "")
   const [emojis, setEmojis] = useState<string[]>(target.emojis)
   const [mode, setMode] = useState<ReactionMode>(target.mode)
-  const [hours, setHours] = useState(Math.floor(target.custom_minutes / 60))
-  const [minutes, setMinutes] = useState(target.custom_minutes % 60)
+  const [minutes, setMinutes] = useState(Math.min(60, Math.max(1, target.custom_minutes)))
   const [reactMin, setReactMin] = useState(target.react_min ?? 0)
   const [reactMax, setReactMax] = useState(target.react_max ?? 0)
   const [pending, startTransition] = useTransition()
@@ -327,8 +314,7 @@ function EditDialog({ target, onSaved, userbots }: { target: ReactionTarget; onS
     setChatId(target.chat_id != null ? String(target.chat_id) : "")
     setEmojis(target.emojis)
     setMode(target.mode)
-    setHours(Math.floor(target.custom_minutes / 60))
-    setMinutes(target.custom_minutes % 60)
+    setMinutes(Math.min(60, Math.max(1, target.custom_minutes)))
     setReactMin(target.react_min ?? 0)
     setReactMax(target.react_max ?? 0)
   }
@@ -339,7 +325,7 @@ function EditDialog({ target, onSaved, userbots }: { target: ReactionTarget; onS
       fd.set("chat_id", chatId)
       fd.set("emojis", JSON.stringify(emojis))
       fd.set("mode", mode)
-      fd.set("custom_hours", String(hours))
+      fd.set("custom_hours", "0")
       fd.set("custom_minutes", String(minutes))
       fd.set("react_min", String(reactMin))
       fd.set("react_max", String(reactMax))
@@ -397,8 +383,6 @@ function EditDialog({ target, onSaved, userbots }: { target: ReactionTarget; onS
           setEmojis={setEmojis}
           mode={mode}
           setMode={setMode}
-          hours={hours}
-          setHours={setHours}
           minutes={minutes}
           setMinutes={setMinutes}
           reactMin={reactMin}
@@ -437,7 +421,6 @@ export function ReactionsSection() {
   const [chatId, setChatId] = useState("")
   const [emojis, setEmojis] = useState<string[]>(["👍", "🔥", "❤️"])
   const [mode, setMode] = useState<ReactionMode>("medium")
-  const [hours, setHours] = useState(0)
   const [minutes, setMinutes] = useState(5)
   const [reactMin, setReactMin] = useState(0)
   const [reactMax, setReactMax] = useState(0)
@@ -454,7 +437,7 @@ export function ReactionsSection() {
       fd.set("chat_id", chatId)
       fd.set("emojis", JSON.stringify(emojis))
       fd.set("mode", mode)
-      fd.set("custom_hours", String(hours))
+      fd.set("custom_hours", "0")
       fd.set("custom_minutes", String(minutes))
       fd.set("react_min", String(reactMin))
       fd.set("react_max", String(reactMax))
@@ -468,7 +451,6 @@ export function ReactionsSection() {
       setChatId("")
       setEmojis(["👍", "🔥", "❤️"])
       setMode("medium")
-      setHours(0)
       setMinutes(5)
       setReactMin(0)
       setReactMax(0)
@@ -524,8 +506,6 @@ export function ReactionsSection() {
             setEmojis={setEmojis}
             mode={mode}
             setMode={setMode}
-            hours={hours}
-            setHours={setHours}
             minutes={minutes}
             setMinutes={setMinutes}
             reactMin={reactMin}
