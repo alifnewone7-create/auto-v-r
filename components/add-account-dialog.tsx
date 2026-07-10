@@ -38,9 +38,9 @@ export function AddAccountDialog({ onAdded }: { onAdded: () => void }) {
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger
         render={
-          <Button className="gap-2">
+          <Button className="gap-2" aria-label="Add account">
             <Plus className="size-4" />
-            Add account
+            <span className="hidden sm:inline">Add account</span>
           </Button>
         }
       />
