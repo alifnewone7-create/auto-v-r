@@ -27,12 +27,14 @@ export function Dashboard() {
             {/* Mobile hamburger menu - top left corner */}
             <MobileNav activeTab={activeTab} onTabChange={setActiveTab} />
 
-            <div className="flex size-9 items-center justify-center rounded-lg bg-primary text-primary-foreground">
-              <Radio className="size-5" />
-            </div>
+            <img
+              src="/telegram-pro.jpg"
+              alt="Telegram Pro"
+              className="size-9 rounded-lg object-cover"
+            />
             <div>
-              <h1 className="text-base font-semibold leading-tight tracking-tight">Iamhear</h1>
-              <p className="text-xs text-muted-foreground">Userbot Control Panel</p>
+              <h1 className="text-base font-semibold leading-tight tracking-tight">Telegram Pro</h1>
+              <p className="text-xs text-muted-foreground">Manage Your User Using Telegram Pro</p>
             </div>
           </div>
 

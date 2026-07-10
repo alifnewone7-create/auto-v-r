@@ -11,25 +11,23 @@ const geistMono = Geist_Mono({
 })
 
 export const metadata: Metadata = {
-  title: 'Iamhear — Userbot Control Panel',
-  description: 'Manage Telegram userbots and join live streams at scale.',
+  title: 'Telegram Pro',
+  description: 'Manage Your User Using Telegram Pro',
   generator: 'v0.app',
   icons: {
-    icon: [
-      {
-        url: '/icon-light-32x32.png',
-        media: '(prefers-color-scheme: light)',
-      },
-      {
-        url: '/icon-dark-32x32.png',
-        media: '(prefers-color-scheme: dark)',
-      },
-      {
-        url: '/icon.svg',
-        type: 'image/svg+xml',
-      },
-    ],
-    apple: '/apple-icon.png',
+    icon: '/telegram-pro.jpg',
+    apple: '/telegram-pro.jpg',
+  },
+  openGraph: {
+    title: 'Telegram Pro',
+    description: 'Manage Your User Using Telegram Pro',
+    images: [{ url: '/telegram-pro.jpg', width: 1260, height: 1260, alt: 'Telegram Pro' }],
+  },
+  twitter: {
+    card: 'summary_large_image',
+    title: 'Telegram Pro',
+    description: 'Manage Your User Using Telegram Pro',
+    images: ['/telegram-pro.jpg'],
   },
 }
 
