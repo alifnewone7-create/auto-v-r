@@ -902,17 +902,45 @@ async def leave_livestream_all(account_ids: list[int], chat_link: str) -> int:
     return sum(1 for ok in results if ok)
 
 
+async def _resolve_input_group_call(client: "Client", link: str):
+    """
+    Return the chat's live-stream InputGroupCall (id + access_hash) as seen by
+    THIS client, or None when no group call is active. The group call's
+    access_hash is global, so a call resolved by one bot is valid for every bot —
+    but resolving per-client is the most reliable way to survive access-hash
+    cache misses.
+    """
+    from pyrogram.raw.functions.channels import GetFullChannel
+
+    chat = await client.get_chat(link)
+    peer = await client.resolve_peer(chat.id)
+    full = await client.invoke(GetFullChannel(channel=peer))
+    return getattr(full.full_chat, "call", None)
+
+
 async def raise_hand_livestream(account_ids: list[int], chat_link: str, raise_hand: bool = True) -> int:
     """
     Make MANY already-joined userbots RAISE (or LOWER) their hand in a chat's
     live stream / video chat — i.e. "ask to speak".
 
-    This only touches bots that are already warm and in the call (present in
-    `_POOL`); it never cold-starts or re-joins anyone, so it is cheap and safe to
-    fire for hundreds of bots. We resolve the chat's InputGroupCall ONCE using any
-    warm client, then invoke `phone.EditGroupCallParticipant(raise_hand=...)` for
-    every bot concurrently. Each call is individually guarded, so a flood or a bot
-    that already left just counts as "not raised" and never crashes the agent.
+    Only bots that are already warm and in the call (present in `_POOL`) are
+    touched; this never cold-starts or re-joins anyone.
+
+    WHY THE OLD VERSION MOSTLY FAILED ("only 1 worked, lower never worked"):
+      * It fired `EditGroupCallParticipant` for ALL bots at the exact same instant
+        with `asyncio.gather`. Telegram rate-limits per-participant edits on a
+        single group call HARD, so all but a couple got FLOOD_WAIT — and the bare
+        `except: return False` swallowed every error, so it looked like "nothing
+        happened" with no clue why.
+
+    THE FIX (mirrors the throttled, flood-aware join path):
+      * A bounded semaphore + jittered stagger so edits trickle in instead of
+        stampeding — this is what actually makes raise/lower land for everyone.
+      * Real FLOOD_WAIT handling: short waits are slept-through and retried,
+        long ones are skipped for that one bot (never crashes the batch).
+      * Per-bot re-resolve of the InputGroupCall if the shared one is stale
+        (GROUPCALL_INVALID / GROUP_CALL_INVALID), then one retry.
+      * Failures are logged (not silently dropped) so issues are diagnosable.
 
     Returns how many bots successfully raised/lowered their hand.
     """
@@ -922,53 +950,85 @@ async def raise_hand_livestream(account_ids: list[int], chat_link: str, raise_ha
     # Lazy imports so a schema/version mismatch can't break module import at
     # startup — worst case this one feature errors, the agent stays up.
     from pyrogram.raw.functions.phone import EditGroupCallParticipant
-    from pyrogram.raw.functions.channels import GetFullChannel
     from pyrogram.raw.types import InputPeerSelf
 
+    action = "raise" if raise_hand else "lower"
     link = _normalize_link(chat_link)
+    ids = [int(a) for a in account_ids]
 
-    # Resolve the live stream's InputGroupCall a single time from any warm client.
-    # The group call object (id + access_hash) is the same for every participant,
-    # so one lookup is enough for the whole batch.
-    input_call = None
-    for aid in account_ids:
-        entry = _POOL.get(int(aid))
+    # Resolve the live stream's InputGroupCall once from any warm client, as a
+    # shared default. Per-bot code re-resolves if this turns out stale.
+    shared_call = None
+    for aid in ids:
+        entry = _POOL.get(aid)
         if not entry:
             continue
         try:
-            client: Client = entry["client"]
-            chat = await client.get_chat(link)
-            full = await client.invoke(GetFullChannel(channel=await client.resolve_peer(chat.id)))
-            input_call = getattr(full.full_chat, "call", None)
-            if input_call is not None:
+            shared_call = await _resolve_input_group_call(entry["client"], link)
+            if shared_call is not None:
                 break
-        except Exception:
+        except Exception as e:
+            print(f"[hand] resolve group call failed via {aid}: {e.__class__.__name__}: {e}")
             continue
 
-    if input_call is None:
+    if shared_call is None:
         # No active group call (stream ended) or none of these bots are warm.
+        print(f"[hand] {action}: no active group call / no warm bots for {link}")
         return 0
 
-    async def _raise(aid: int) -> bool:
+    # Throttle exactly like joins do: at most N edits in flight, small jittered
+    # gap before each so Telegram doesn't flood the batch into oblivion.
+    sem = asyncio.Semaphore(JOIN_MAX_CONCURRENCY)
+
+    async def _one(aid: int) -> bool:
         entry = _POOL.get(aid)
         if not entry:
             return False
         client: Client = entry["client"]
-        try:
-            await client.invoke(
-                EditGroupCallParticipant(
-                    call=input_call,
-                    participant=InputPeerSelf(),
-                    raise_hand=bool(raise_hand),
-                )
-            )
-            return True
-        except Exception:
-            # Flood, already-left, or transient RPC error — skip this one bot.
+        call = shared_call
+        async with sem:
+            if JOIN_STAGGER_SECONDS > 0:
+                await asyncio.sleep(random.uniform(0.0, JOIN_STAGGER_SECONDS))
+            for attempt in range(1, 4):
+                try:
+                    await client.invoke(
+                        EditGroupCallParticipant(
+                            call=call,
+                            participant=InputPeerSelf(),
+                            raise_hand=bool(raise_hand),
+                        )
+                    )
+                    return True
+                except Exception as e:
+                    secs = _flood_seconds(e)
+                    if secs is not None:
+                        # Short flood -> wait it out and retry; long -> give up on
+                        # this one bot only (the rest of the batch is unaffected).
+                        if secs <= 20 and attempt < 3:
+                            await asyncio.sleep(secs + 1)
+                            continue
+                        print(f"[hand] {action} flood for {aid}: waiting {secs}s, skipping")
+                        return False
+                    msg = str(e).upper()
+                    if ("GROUPCALL_INVALID" in msg or "GROUP_CALL_INVALID" in msg) and attempt < 3:
+                        # Our shared call handle is stale for this bot — re-resolve
+                        # from its own client and retry once.
+                        try:
+                            fresh = await _resolve_input_group_call(client, link)
+                            if fresh is not None:
+                                call = fresh
+                                continue
+                        except Exception:
+                            pass
+                        return False
+                    print(f"[hand] {action} failed for {aid}: {e.__class__.__name__}: {e}")
+                    return False
             return False
 
-    results = await asyncio.gather(*(_raise(int(a)) for a in account_ids))
-    return sum(1 for ok in results if ok)
+    results = await asyncio.gather(*(_one(a) for a in ids))
+    ok = sum(1 for r in results if r)
+    print(f"[hand] {action}: {ok}/{len(ids)} bots done for {link}")
+    return ok
 
 
 async def _has_active_group_call(client: Client, chat_id: int) -> bool:

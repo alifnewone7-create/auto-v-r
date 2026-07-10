@@ -53,10 +53,19 @@ function TargetCard({
   loggedInCount: number
   onChanged: () => void
 }) {
-  const [addAmount, setAddAmount] = useState(1)
-  const [removeAmount, setRemoveAmount] = useState(1)
-  const [raiseAmount, setRaiseAmount] = useState(1)
+  // Kept as strings so the fields can be CLEARED while typing (an empty box)
+  // instead of snapping back to "1" on every keystroke. We parse + clamp only
+  // when the action actually fires.
+  const [addAmount, setAddAmount] = useState("1")
+  const [removeAmount, setRemoveAmount] = useState("1")
+  const [raiseAmount, setRaiseAmount] = useState("1")
   const [pending, startTransition] = useTransition()
+
+  // Turn whatever is in a quantity box into a valid 1..max integer at submit time.
+  const parseAmount = (raw: string, max: number) => clampCount(Number.parseInt(raw, 10) || 1, max)
+  // Allow only digits while typing; "" stays "" so the box can be emptied.
+  const onAmountChange = (setter: (v: string) => void) => (e: React.ChangeEvent<HTMLInputElement>) =>
+    setter(e.target.value.replace(/[^\d]/g, ""))
 
   const participants = target.participants
   const joinedCount = participants.filter((p) => p.status === "joined").length
@@ -139,11 +148,11 @@ function TargetCard({
         <div className="flex flex-col gap-2 rounded-lg border border-border p-3 sm:flex-row sm:items-center">
           <div className="flex items-center gap-2">
             <Input
-              type="number"
-              min={1}
-              max={Math.max(1, availableToAdd)}
+              type="text"
+              inputMode="numeric"
               value={addAmount}
-              onChange={(e) => setAddAmount(clampCount(Number(e.target.value) || 1, availableToAdd))}
+              onChange={onAmountChange(setAddAmount)}
+              onBlur={() => setAddAmount(String(parseAmount(addAmount, availableToAdd)))}
               className="h-8 w-20"
               aria-label="How many userbots to add"
               disabled={pending}
@@ -155,7 +164,7 @@ function TargetCard({
               title={availableToAdd < 1 ? "No free userbots left to add" : undefined}
               onClick={() =>
                 run(
-                  () => addLivestreamBots(target.id, addAmount),
+                  () => addLivestreamBots(target.id, parseAmount(addAmount, availableToAdd)),
                   (n) => `Sending ${n} more userbot${n === 1 ? "" : "s"} in.`,
                 )
               }
@@ -166,11 +175,11 @@ function TargetCard({
           </div>
           <div className="flex items-center gap-2 sm:ml-auto">
             <Input
-              type="number"
-              min={1}
-              max={Math.max(1, joinedCount)}
+              type="text"
+              inputMode="numeric"
               value={removeAmount}
-              onChange={(e) => setRemoveAmount(clampCount(Number(e.target.value) || 1, joinedCount))}
+              onChange={onAmountChange(setRemoveAmount)}
+              onBlur={() => setRemoveAmount(String(parseAmount(removeAmount, joinedCount)))}
               className="h-8 w-20"
               aria-label="How many userbots to remove"
               disabled={pending}
@@ -183,7 +192,7 @@ function TargetCard({
               title={joinedCount < 1 ? "No joined userbots to remove" : undefined}
               onClick={() =>
                 run(
-                  () => removeLivestreamBots(target.id, removeAmount),
+                  () => removeLivestreamBots(target.id, parseAmount(removeAmount, joinedCount)),
                   (n) => `Removing ${n} userbot${n === 1 ? "" : "s"} from the stream.`,
                 )
               }
@@ -202,11 +211,11 @@ function TargetCard({
           <div className="flex items-center gap-2">
             <Hand className="size-4 shrink-0 text-primary" />
             <Input
-              type="number"
-              min={1}
-              max={Math.max(1, joinedCount)}
+              type="text"
+              inputMode="numeric"
               value={raiseAmount}
-              onChange={(e) => setRaiseAmount(clampCount(Number(e.target.value) || 1, joinedCount))}
+              onChange={onAmountChange(setRaiseAmount)}
+              onBlur={() => setRaiseAmount(String(parseAmount(raiseAmount, joinedCount)))}
               className="h-8 w-20"
               aria-label="How many userbots should raise their hand"
               disabled={pending}
@@ -218,7 +227,7 @@ function TargetCard({
               title={joinedCount < 1 ? "No joined userbots to raise a hand" : "Ask to speak (raise hand)"}
               onClick={() =>
                 run(
-                  () => raiseHandLivestream(target.id, raiseAmount, true),
+                  () => raiseHandLivestream(target.id, parseAmount(raiseAmount, joinedCount), true),
                   (n) => `${n} userbot${n === 1 ? "" : "s"} raised their hand (asking to speak).`,
                 )
               }
@@ -235,7 +244,7 @@ function TargetCard({
             title={joinedCount < 1 ? "No joined userbots" : "Lower hand for the same number of bots"}
             onClick={() =>
               run(
-                () => raiseHandLivestream(target.id, raiseAmount, false),
+                () => raiseHandLivestream(target.id, parseAmount(raiseAmount, joinedCount), false),
                 (n) => `${n} userbot${n === 1 ? "" : "s"} lowered their hand.`,
               )
             }
