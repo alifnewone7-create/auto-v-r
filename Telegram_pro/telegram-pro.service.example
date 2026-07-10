@@ -1,0 +1,26 @@
+# systemd unit for the compiled Telegram_pro agent.
+# Install:
+#   sudo cp telegram-pro.service.example /etc/systemd/system/telegram-pro.service
+#   (edit User, WorkingDirectory and ExecStart paths below)
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now telegram-pro
+#   journalctl -u telegram-pro -f      # live logs
+
+[Unit]
+Description=Telegram_pro agent (compiled)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=youruser
+WorkingDirectory=/home/youruser/Telegram_pro
+# Point PYTHON at your 3.11/3.12 interpreter (NOT 3.13/3.14).
+Environment=PYTHON=/usr/bin/python3.12
+EnvironmentFile=/home/youruser/Telegram_pro/.env
+ExecStart=/usr/bin/python3.12 -m agent.supervisor
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

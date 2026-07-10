@@ -1,0 +1,23 @@
+# Telegram Userbot - Live Stream Auto Join
+#
+# GURUTTOPURNO: Official "pyrogram" ar py-tgcalls ekhon ar mele na
+# (ImportError: cannot import name 'GroupcallForbidden').
+# Tai amra "pyrofork" use korchi - eta Pyrogram-er maintained fork,
+# "pyrogram" namei import hoy ebong py-tgcalls-er sathe thik moto kaj kore.
+#
+# Install korar age PURONO pyrogram thakle SORIYE felun, tarpor install korun:
+#
+#   pip uninstall -y pyrogram tgcrypto
+#   pip install -r requirements.txt
+#
+# (Python 3.11 ba 3.12 use korun - 3.13/3.14 e py-tgcalls stable noy)
+
+pyrofork>=2.3.45
+tgcrypto>=1.2.5
+py-tgcalls>=2.1.0
+
+# --- Agent (server-based control panel) extras ---
+psycopg[binary]>=3.1     # talks to the Neon Postgres job queue
+psycopg_pool>=3.2        # warm connection pool (keeps the event loop responsive at scale)
+httpx>=0.27              # my.telegram.org automation
+python-dotenv>=1.0       # loads .env (DATABASE_URL etc.)
