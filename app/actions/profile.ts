@@ -26,6 +26,14 @@ export interface ProfileEditInput {
   // photos. When more than one is supplied, each selected account is assigned a
   // RANDOM photo from the pool. Empty/omitted leaves the photo unchanged.
   photoDataUrls?: string[]
+  // Distribution mode for the name / photo pools:
+  //  - false (default, "cycle"): every selected account is changed; the pool is
+  //    shuffled and cycled, so a 2-name pool applied to 300 accounts repeats
+  //    across all 300.
+  //  - true ("no repeat"): each name / photo is used AT MOST ONCE. Only the
+  //    first max(names, photos) accounts change; the rest are skipped. So a
+  //    2-name + 2-photo pool over 300 accounts changes exactly 2 accounts.
+  noRepeat?: boolean
 }
 
 // "Rahim Hasan" -> { first: "Rahim", last: "Hasan" }; "Afiya" -> { first: "Afiya", last: "" }
@@ -134,43 +142,73 @@ export async function updateProfiles(input: ProfileEditInput) {
     return { error: "None of the selected accounts are logged in." }
   }
 
-  // Build a randomized name assignment: shuffle the pool and hand out names.
-  // When there are more accounts than names, we reshuffle and keep cycling so
-  // the distribution stays random rather than repeating in order.
-  let bag: { first: string; last: string }[] = []
-  const nextName = () => {
-    if (bag.length === 0) bag = shuffle(namePool)
-    return bag.pop()!
+  const noRepeat = Boolean(input.noRepeat)
+
+  // Decide, per account, which name / photo it receives.
+  //
+  // Two distribution modes:
+  //  - Cycle (default): shuffle the pool(s) and hand a RANDOM entry to EVERY
+  //    selected account, reshuffling when a bag empties. A 2-name pool applied
+  //    to 300 accounts changes all 300 (names repeat).
+  //  - No-repeat: each name / photo is used AT MOST ONCE. Only the first
+  //    max(names, photos) accounts are changed; the rest are skipped entirely.
+  //    So 3 names + 2 photos changes 3 accounts (acc1: name+photo, acc2:
+  //    name+photo, acc3: name only), and every other selected account is left
+  //    untouched. Accounts beyond a given pool just skip that field (null),
+  //    which the Python agent treats as "leave unchanged" - never an error.
+  type Assignment = { first: string | null; last: string | null; photoAssetId: number | null }
+  let assignments: Assignment[]
+  let targetAccounts = accounts
+
+  if (noRepeat && (useNamePool || usesPhotoPool)) {
+    const shuffledNames = shuffle(namePool)
+    const shuffledPhotos = shuffle(photoAssetIds)
+    const limit = Math.min(accounts.length, Math.max(shuffledNames.length, shuffledPhotos.length))
+    targetAccounts = accounts.slice(0, limit)
+    assignments = targetAccounts.map((_, i) => {
+      const picked = useNamePool && i < shuffledNames.length ? shuffledNames[i] : null
+      return {
+        // In name-pool mode, accounts past the pool get no name change (null).
+        // In single-name mode, the manual name still applies to each target.
+        first: picked ? picked.first : useNamePool ? null : firstName || null,
+        last: picked ? picked.last || null : useNamePool ? null : lastName || null,
+        photoAssetId: usesPhotoPool && i < shuffledPhotos.length ? shuffledPhotos[i] : null,
+      }
+    })
+  } else {
+    // Cycle mode: shuffle-and-cycle so the distribution stays random and even.
+    let bag: { first: string; last: string }[] = []
+    const nextName = () => {
+      if (bag.length === 0) bag = shuffle(namePool)
+      return bag.pop()!
+    }
+    let photoBag: number[] = []
+    const nextPhotoAssetId = (): number | null => {
+      if (!usesPhotoPool) return null
+      if (photoBag.length === 0) photoBag = shuffle(photoAssetIds)
+      return photoBag.pop()!
+    }
+    assignments = accounts.map(() => {
+      if (useNamePool) {
+        const picked = nextName()
+        return { first: picked.first, last: picked.last || null, photoAssetId: nextPhotoAssetId() }
+      }
+      return { first: firstName || null, last: lastName || null, photoAssetId: nextPhotoAssetId() }
+    })
   }
 
-  // Same shuffle-and-cycle strategy for photos: each account gets a random image
-  // from the pool, reshuffling once the bag empties so distribution stays even.
-  let photoBag: number[] = []
-  const nextPhotoAssetId = (): number | null => {
-    if (!usesPhotoPool) return null
-    if (photoBag.length === 0) photoBag = shuffle(photoAssetIds)
-    return photoBag.pop()!
-  }
-
-  // Queue one profile_updates row + one update_profile job per account.
+  // Queue one profile_updates row + one update_profile job per TARGET account.
   await Promise.all(
-    accounts.map((acc, idx) => {
-      let accFirst = firstName || null
-      let accLast = lastName || null
+    targetAccounts.map((acc, idx) => {
+      const assign = assignments[idx]
+      const accFirst = assign.first
+      const accLast = assign.last
       let username: string | null = null
       let usernameBase: string | null = null
 
-      if (useNamePool) {
-        const picked = nextName()
-        accFirst = picked.first
-        accLast = picked.last || null // no last name -> stays empty
-      }
-
       if (autoUsername) {
         // Seed the username from the (assigned) name; the agent finalizes it.
-        const seedName = useNamePool
-          ? [accFirst, accLast].filter(Boolean).join(" ")
-          : [firstName, lastName].filter(Boolean).join(" ")
+        const seedName = [accFirst, accLast].filter(Boolean).join(" ")
         usernameBase = slugifyName(seedName) || null
       } else if (baseUsername) {
         // Manual username: give each account a distinct suffix when applying to many.
@@ -183,13 +221,13 @@ export async function updateProfiles(input: ProfileEditInput) {
         username,
         usernameBase,
         autoUsername,
-        photoAssetId: nextPhotoAssetId(),
+        photoAssetId: assign.photoAssetId,
       })
     }),
   )
 
   revalidatePath("/")
-  return { ok: true, count: accounts.length }
+  return { ok: true, count: targetAccounts.length }
 }
 
 /**

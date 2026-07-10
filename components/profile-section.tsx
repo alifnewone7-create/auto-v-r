@@ -73,6 +73,7 @@ export function ProfileSection() {
   const [username, setUsername] = useState("")
   const [autoUsername, setAutoUsername] = useState(true) // generate username from name
   const [photoDataUrls, setPhotoDataUrls] = useState<string[]>([]) // pool of images, randomly assigned per account
+  const [noRepeat, setNoRepeat] = useState(false) // use each name/photo once, skip extra accounts
   const [pending, startTransition] = useTransition()
   const fileRef = useRef<HTMLInputElement>(null)
 
@@ -134,6 +135,12 @@ export function ProfileSection() {
 
   const multipleWithUsername = !autoUsername && username.trim() !== "" && selected.size > 1
 
+  // Size of the largest pool being applied (names + photos). In no-repeat mode
+  // this caps how many accounts actually change; beyond it, accounts are skipped.
+  const poolMax = Math.max(nameMode ? parsedNames.length : 0, photoDataUrls.length)
+  const willChange = noRepeat && poolMax > 0 ? Math.min(selected.size, poolMax) : selected.size
+  const willSkip = Math.max(0, selected.size - willChange)
+
   function handleApply() {
     if (selected.size === 0) {
       toast.error("Select at least one account.")
@@ -154,6 +161,7 @@ export function ProfileSection() {
         username: autoUsername ? "" : username,
         autoUsername,
         photoDataUrls,
+        noRepeat,
       })
       if (res?.error) {
         toast.error(res.error)
@@ -342,6 +350,24 @@ export function ProfileSection() {
             <input ref={fileRef} type="file" accept="image/*" multiple className="hidden" onChange={onPickPhoto} />
           </div>
 
+          {/* Distribution mode: reuse the pool across all accounts, or use each
+              name/photo once and skip the extras. */}
+          <div className="flex flex-col gap-2 rounded-lg border border-border bg-muted/30 p-3">
+            <label className="flex cursor-pointer items-start gap-2">
+              <Checkbox checked={noRepeat} onCheckedChange={(v) => setNoRepeat(Boolean(v))} className="mt-0.5" />
+              <span className="text-sm font-medium">No repeat &mdash; use each name / photo once, skip extra accounts</span>
+            </label>
+            <p className="text-xs text-muted-foreground">
+              {noRepeat
+                ? poolMax > 0
+                  ? `Only ${willChange} account${willChange === 1 ? "" : "s"} will change (one per name/photo)${
+                      willSkip > 0 ? `, ${willSkip} skipped` : ""
+                    }. When counts differ, the larger pool wins (e.g. 3 names + 2 photos = 3 accounts, the 3rd gets a name only).`
+                  : "Add a name list or photos above to use this mode."
+                : "Off: the pool is reused across every selected account (names/photos repeat as needed)."}
+            </p>
+          </div>
+
           <Separator />
 
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
@@ -349,6 +375,9 @@ export function ProfileSection() {
               {selected.size === 0
                 ? "No accounts selected"
                 : `${selected.size} account${selected.size === 1 ? "" : "s"} selected`}
+              {selected.size > 0 && noRepeat && poolMax > 0 && willChange !== selected.size
+                ? ` · ${willChange} will change`
+                : ""}
               {summary.length > 0 ? ` · changing ${summary.join(", ")}` : ""}
             </p>
             <Button onClick={handleApply} disabled={pending || selected.size === 0} className="gap-2">
