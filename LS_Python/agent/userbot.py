@@ -1321,20 +1321,62 @@ async def retract_poll_vote(
 # it looks like real users reacting one by one.
 # ===========================================================================
 
-async def _react_once(client: Client, chat_id: int, message_id: int, emojis: list[str]) -> bool:
+# Telegram RPC error fragments that mean reactions are STRUCTURALLY impossible on
+# this post for EVERY userbot (reactions disabled, restricted to a set of emojis
+# that doesn't include ours, no permission, post deleted, channel private, etc.),
+# as opposed to a transient hiccup on a single account. When we see these we can
+# safely stop trying the rest of the pool instead of firing a guaranteed-to-fail
+# call at every single userbot.
+_REACTIONS_BLOCKED_MARKERS = (
+    "REACTION_INVALID",
+    "REACTION_EMPTY",
+    "REACTIONS_ALL_DISABLED",
+    "CHAT_SEND_REACTIONS_FORBIDDEN",
+    "CHAT_ADMIN_REQUIRED",
+    "CHAT_WRITE_FORBIDDEN",
+    "CHANNEL_PRIVATE",
+    "USER_BANNED_IN_CHANNEL",
+    "MSG_ID_INVALID",
+    "MESSAGE_ID_INVALID",
+    "PEER_ID_INVALID",
+)
+
+
+def _reaction_error_kind(exc: Exception) -> str:
+    """
+    Classify a failed reaction as 'blocked' (the whole channel/post will reject
+    reactions from anyone with our emoji set) vs 'transient' (retryable or
+    specific to one account). Used to decide whether to skip the rest of the pool.
+    """
+    text = f"{getattr(exc, 'ID', '')} {getattr(exc, 'MESSAGE', '')} {exc}".upper()
+    for marker in _REACTIONS_BLOCKED_MARKERS:
+        if marker in text:
+            return "blocked"
+    return "transient"
+
+
+async def _react_once(client: Client, chat_id: int, message_id: int, emojis: list[str]) -> str:
     """
     Make ONE userbot react with a random emoji from `emojis`. If the channel does
-    not allow that emoji on this post, quietly try the next one. If none are
-    allowed, skip without raising (returns False). Returns True on success.
+    not allow that emoji on this post, quietly try the next one.
+
+    NEVER raises - a rejected reaction can never crash the worker. Returns:
+      "ok"        - a reaction landed
+      "blocked"   - every emoji was rejected for a permission/config reason, so
+                    no other userbot will be able to react to this post either
+      "transient" - failed for a retryable / account-specific reason
     """
+    last_kind = "transient"
     for emoji in random.sample(emojis, len(emojis)):
         try:
             await client.send_reaction(chat_id, int(message_id), emoji=emoji)
-            return True
-        except Exception:
-            # ReactionInvalid / not allowed / transient -> try the next emoji.
+            return "ok"
+        except Exception as e:  # noqa: BLE001 - one bad react must never abort the run
+            # A different emoji might still be accepted, so remember the verdict
+            # and keep trying the rest; only the final outcome matters.
+            last_kind = _reaction_error_kind(e)
             continue
-    return False
+    return last_kind
 
 
 async def react_post_scheduled(
@@ -1400,17 +1442,52 @@ async def react_post_scheduled(
             return 0
         clients = random.sample(clients, my_count)
 
+    # ---- Probe phase -------------------------------------------------------
+    # Before firing at the whole pool, let a couple of userbots test the post.
+    # If reactions are not allowed here (disabled, restricted emoji set, no
+    # permission, deleted post, private channel, ...) the probes come back
+    # "blocked" and we skip the rest of the pool quietly - no crash, no wasted
+    # calls hammering a post that will reject everyone.
+    probe_n = min(2, len(clients))
+    probe_clients = clients[:probe_n]
+    rest_clients = clients[probe_n:]
+
+    probe_results = await asyncio.gather(
+        *(_react_once(c, chat_id, message_id, emojis) for c in probe_clients),
+        return_exceptions=True,
+    )
+    success = sum(1 for r in probe_results if r == "ok")
+    blocked = sum(1 for r in probe_results if r == "blocked")
+
+    # Every probe was blocked and none succeeded -> reactions are impossible on
+    # this post for anyone. Stop here instead of trying the remaining userbots.
+    if probe_n > 0 and success == 0 and blocked == probe_n:
+        print(
+            f"[react] skipping post {chat_id}/{message_id}: reactions not allowed "
+            f"(all {probe_n} probe userbot(s) blocked); remaining {len(rest_clients)} skipped"
+        )
+        return 0
+
+    if not rest_clients:
+        return success
+
+    # ---- Fan out to the rest of the pool -----------------------------------
     # Front-loaded, uneven arrival times inside the window: a burst of early
     # reactions right after the post, then a thinning tail - just like real users.
-    offsets = _natural_arrival_offsets(len(clients), window_seconds)
+    offsets = _natural_arrival_offsets(len(rest_clients), window_seconds)
 
-    async def _scheduled(client: Client, delay: float) -> bool:
+    async def _scheduled(client: Client, delay: float) -> str:
         if delay > 0:
             await asyncio.sleep(delay)
         return await _react_once(client, chat_id, message_id, emojis)
 
-    results = await asyncio.gather(*(_scheduled(c, d) for c, d in zip(clients, offsets)))
-    return sum(1 for ok in results if ok)
+    # return_exceptions=True: even an unexpected error on one userbot can never
+    # bubble up and take down the job / worker.
+    results = await asyncio.gather(
+        *(_scheduled(c, d) for c, d in zip(rest_clients, offsets)),
+        return_exceptions=True,
+    )
+    return success + sum(1 for r in results if r == "ok")
 
 
 # ===========================================================================
