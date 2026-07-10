@@ -4,6 +4,17 @@ import { useState } from "react"
 import { Radio, Users, LogOut, Eye, Vote, Smile, UserCog, UserPlus, Trash2 } from "lucide-react"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Button } from "@/components/ui/button"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog"
 import { logoutAction } from "@/app/actions/auth"
 import { MobileNav } from "@/components/mobile-nav"
 import { AgentStatusBar } from "@/components/agent-status-bar"
@@ -38,13 +49,31 @@ export function Dashboard() {
             </div>
           </div>
 
-          {/* Desktop logout button */}
-          <form action={logoutAction} className="hidden md:block">
-            <Button variant="ghost" size="sm" type="submit" className="gap-2 text-muted-foreground">
-              <LogOut className="size-4" />
-              <span>Sign out</span>
-            </Button>
-          </form>
+          {/* Desktop logout button with confirmation */}
+          <AlertDialog>
+            <AlertDialogTrigger asChild>
+              <Button variant="ghost" size="sm" className="hidden gap-2 text-muted-foreground md:flex">
+                <LogOut className="size-4" />
+                <span>Sign out</span>
+              </Button>
+            </AlertDialogTrigger>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Sign out?</AlertDialogTitle>
+                <AlertDialogDescription>
+                  You will be signed out of the Telegram Pro control panel and returned to the login screen.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                <form action={logoutAction}>
+                  <AlertDialogAction type="submit" className="w-full">
+                    Sign out
+                  </AlertDialogAction>
+                </form>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
         </div>
       </header>
 
