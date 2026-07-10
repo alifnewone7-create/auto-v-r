@@ -36,6 +36,18 @@ const PRESET_EMOJIS = [
   "🫡", "💅", "🗿", "🆒", "😘", "😎", "🤷", "😡",
 ]
 
+// Extracts ONLY emoji characters from an arbitrary string, dropping letters,
+// digits, punctuation, whitespace and any other non-emoji symbol. This keeps
+// full multi-codepoint emoji intact (variation selectors, ZWJ sequences like
+// 👨‍👩‍👧, skin-tone modifiers, keycaps like 1️⃣, and flags/regional indicators).
+function keepEmojiOnly(input: string): string {
+  if (!input) return ""
+  const emojiPattern =
+    /(\p{RI}\p{RI}|\p{Extended_Pictographic}(\u{FE0F}|\u{20E3})?(\u200D\p{Extended_Pictographic}(\u{FE0F}|\u{20E3})?)*|[0-9#*]\u{FE0F}?\u{20E3})/gu
+  const matches = input.match(emojiPattern)
+  return matches ? matches.join("") : ""
+}
+
 const MODES: { value: ReactionMode; label: string; desc: string }[] = [
   { value: "slow", label: "Slow", desc: "Reactions trickle in slowly over several minutes." },
   { value: "medium", label: "Medium", desc: "Reactions arrive at a natural, moderate pace." },
@@ -109,7 +121,8 @@ function ConfigFields({
   }
 
   function addCustom() {
-    const e = custom.trim()
+    // Keep only emoji characters; drop any letters, numbers, spaces, symbols etc.
+    const e = keepEmojiOnly(custom)
     if (!e) return
     if (!emojis.includes(e)) setEmojis([...emojis, e])
     setCustom("")
@@ -165,7 +178,14 @@ function ConfigFields({
         <div className="flex gap-2">
           <Input
             value={custom}
-            onChange={(ev) => setCustom(ev.target.value)}
+            inputMode="none"
+            onChange={(ev) => setCustom(keepEmojiOnly(ev.target.value))}
+            onPaste={(ev) => {
+              // Block raw paste and only keep the emoji characters from it.
+              ev.preventDefault()
+              const pasted = ev.clipboardData.getData("text")
+              setCustom((prev) => keepEmojiOnly(prev + pasted))
+            }}
             onKeyDown={(ev) => {
               if (ev.key === "Enter") {
                 ev.preventDefault()
