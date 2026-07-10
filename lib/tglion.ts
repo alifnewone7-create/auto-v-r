@@ -36,6 +36,8 @@ function creds() {
 }
 
 async function call(action: string, extra: Record<string, string | undefined> = {}): Promise<any> {
+  // Lazily check credentials only when actually making a call, not on module import.
+  // This prevents the error from appearing at startup if the feature isn't being used.
   const { apiKey, userId } = creds()
   const url = new URL(BASE_URL)
   url.searchParams.set("action", action)
