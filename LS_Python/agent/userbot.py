@@ -35,6 +35,25 @@ from pytgcalls import PyTgCalls
 from pytgcalls.types import MediaStream
 
 
+# --- Silence the WebRTC transport log flood ---------------------------------
+# When a group-call media socket dies, NTgCalls / py-tgcalls / pyrogram log
+# "socket.send() raised exception" (and similar) on EVERY retry — dozens per
+# second per bad transport. At the default log level that flood does real harm:
+# it saturates the shard's single event loop doing I/O for the log lines, which
+# in turn delays the WebRTC keepalives of the still-healthy bots on that shard
+# and gets THEM evicted too (the whole-stream cascade). Pinning these noisy
+# third-party loggers to ERROR keeps a single wedged transport from taking the
+# rest of the stream down with it. Our own diagnostics use print(), so nothing
+# useful is lost.
+import logging as _logging
+
+for _noisy in ("pytgcalls", "ntgcalls", "pyrogram", "pyrogram.session", "pyrogram.connection"):
+    try:
+        _logging.getLogger(_noisy).setLevel(_logging.ERROR)
+    except Exception:
+        pass
+
+
 class LoginNeeds2FA(Exception):
     """Raised when the account has two-factor auth and we need the password."""
 
@@ -125,6 +144,22 @@ REJOIN_BACKOFF_BASE_SECONDS = max(1.0, float(_os.environ.get("AGENT_REJOIN_BACKO
 REJOIN_BACKOFF_MAX_SECONDS = max(
     REJOIN_BACKOFF_BASE_SECONDS, float(_os.environ.get("AGENT_REJOIN_BACKOFF_MAX", "120"))
 )
+
+# Hard ceiling on how long a single group-call play()/rejoin may take. A WEDGED
+# NTgCalls WebRTC transport (the "socket.send() raised exception" spin that
+# happens when Telegram migrates/restarts a group-call media server) can make
+# play() hang forever, holding a join-semaphore slot and blocking every other
+# bot's recovery. If we exceed this we abandon the attempt, tear the client down,
+# and rebuild a FRESH native transport on the next sweep.
+REJOIN_PLAY_TIMEOUT = max(15.0, float(_os.environ.get("AGENT_PLAY_TIMEOUT", "45")))
+
+# After this many consecutive failed rejoins on the SAME PyTgCalls instance we
+# stop re-play()ing on it and fully REBUILD the Client + PyTgCalls. Re-playing on
+# a broken native WebRTC transport can never recover (MTProto still reports
+# is_connected=True, so nothing else tears it down) — only a fresh instance
+# clears the spinning socket. This is THE fix for "livestream drops but views /
+# reactions keep working".
+REBUILD_AFTER_FAILS = max(1, int(_os.environ.get("AGENT_REBUILD_AFTER_FAILS", "1")))
 
 # Accounts that are SUPPOSED to be in a live stream right now, so we can put
 # them back if Telegram/NTgCalls drops the call (network blip, server move, or a
@@ -683,12 +718,18 @@ async def _rejoin_one(account_id: int, target: dict) -> bool:
         if JOIN_STAGGER_SECONDS > 0:
             await asyncio.sleep(random.uniform(0.0, JOIN_STAGGER_SECONDS))
         try:
-            # Revive the client/calls pair if it was lost (process churn, pyrogram
-            # disconnect). A pooled-but-dead client can't rejoin, so rebuild it.
+            # Decide whether to REBUILD from scratch or reuse the warm instance.
+            # Rebuild when either the MTProto client died OR we've already failed
+            # to rejoin on the existing PyTgCalls at least REBUILD_AFTER_FAILS
+            # times: re-play()ing on a wedged NTgCalls transport can never recover
+            # (MTProto still says is_connected=True), so the only real fix is a
+            # fresh Client+PyTgCalls with a brand-new native WebRTC socket.
             entry = _POOL.get(account_id)
+            prior_fails = _JOIN_FAILS.get(account_id, 0)
             if entry is not None:
                 client = entry.get("client")
-                if client is not None and not getattr(client, "is_connected", True):
+                mtproto_dead = client is not None and not getattr(client, "is_connected", True)
+                if mtproto_dead or prior_fails >= REBUILD_AFTER_FAILS:
                     await _teardown_client(account_id)
                     entry = None
             if not entry:
@@ -700,11 +741,32 @@ async def _rejoin_one(account_id: int, target: dict) -> bool:
                 )
             calls: PyTgCalls = entry["calls"]
 
-            await calls.play(chat_id, _listen_only_stream())
+            # Timeout-guard the join: a wedged transport can make play() hang
+            # forever, holding this semaphore slot and starving everyone else's
+            # recovery. On timeout we tear the client down so the next sweep
+            # rebuilds a fresh transport instead of retrying the broken one.
+            await asyncio.wait_for(
+                calls.play(chat_id, _listen_only_stream()),
+                timeout=REJOIN_PLAY_TIMEOUT,
+            )
             _LIVE_STATE[account_id] = "connected"
             _JOIN_FAILS.pop(account_id, None)
             _NEXT_RETRY_AT.pop(account_id, None)
             return True
+        except asyncio.TimeoutError:
+            # Wedged negotiation — drop the whole client so it can't keep spinning
+            # its dead socket; a clean rebuild happens on the next sweep.
+            await _teardown_client(account_id)
+            fails = _JOIN_FAILS.get(account_id, 0) + 1
+            _JOIN_FAILS[account_id] = fails
+            delay = min(
+                REJOIN_BACKOFF_MAX_SECONDS,
+                REJOIN_BACKOFF_BASE_SECONDS * (2 ** (fails - 1)),
+            )
+            delay += random.uniform(0.0, min(5.0, delay * 0.25))
+            _NEXT_RETRY_AT[account_id] = time.monotonic() + delay
+            _LIVE_STATE[account_id] = "dropped"
+            return False
         except Exception as e:
             if _already_in_call(e):
                 _LIVE_STATE[account_id] = "connected"
@@ -894,11 +956,30 @@ async def join_livestream(
         last_exc: Exception | None = None
         for attempt in range(1, JOIN_RETRY_ATTEMPTS + 1):
             try:
-                await calls.play(chat_id, _listen_only_stream())
+                # Timeout-guard so a wedged WebRTC negotiation can't hang forever
+                # holding the join-semaphore slot (see REJOIN_PLAY_TIMEOUT).
+                await asyncio.wait_for(
+                    calls.play(chat_id, _listen_only_stream()),
+                    timeout=REJOIN_PLAY_TIMEOUT,
+                )
                 # Remember we belong here so auto-rejoin can restore us on a drop.
                 _ACTIVE_JOINS[account_id] = target_info
                 _LIVE_STATE[account_id] = "connected"
                 return  # joined successfully
+            except asyncio.TimeoutError as e:
+                # Negotiation stalled — rebuild a clean transport before retrying
+                # so we don't keep hammering a half-open socket.
+                last_exc = e
+                await _teardown_client(account_id)
+                if attempt < JOIN_RETRY_ATTEMPTS:
+                    entry = await _ensure_online(account_id, api_id, api_hash, session_string)
+                    calls = entry["calls"]
+                    await asyncio.sleep(1.5 * attempt + random.uniform(0.0, 1.0))
+                    continue
+                _forget_join(account_id)
+                raise UserbotError(
+                    f"Live stream join timed out after {JOIN_RETRY_ATTEMPTS} tries."
+                ) from last_exc
             except ChatAdminRequired:
                 # Race: the live stream ended between our check and the join.
                 _forget_join(account_id)
