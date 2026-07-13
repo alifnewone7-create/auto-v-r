@@ -565,7 +565,7 @@ def _attach_rejoin_handler(account_id: int, calls: PyTgCalls) -> None:
 
                 # Only events that mean the bot TRULY left the call count as a
                 # drop. (LeftGroupCall / KickedFromGroupCall / Disconnected /
-                # ClosedVoiceChat.) The reconciler then rejoins it — unless the
+                # ClosedVoiceChat.) The reconciler then rejoins it �� unless the
                 # host's whole stream has ended, which its per-chat liveness check
                 # confirms separately.
                 if any(k in name for k in ("left", "leav", "kick", "disconnect", "closed")):
@@ -680,20 +680,45 @@ async def _teardown_client(account_id: int) -> None:
         pass
 
 
+def _chat_id_variants(chat_id: int) -> set[int]:
+    """
+    All integer forms the same Telegram chat can appear as, so membership checks
+    never fail on a representation mismatch. A supergroup/channel may be seen as
+    the full -100xxxxxxxxxx marked id, or as the bare xxxxxxxxxx internal id
+    (and, defensively, the positive form). py-tgcalls does NOT always key its
+    active-call dict with the same form pyrogram hands us, and that mismatch was
+    making fully-connected bots look 'dropped' every sweep.
+    """
+    variants: set[int] = {chat_id}
+    s = str(chat_id)
+    if s.startswith("-100"):
+        variants.add(int(s[4:]))          # bare internal id
+        variants.add(-int(s[1:]))         # legacy chat form
+    variants.add(abs(chat_id))            # positive fallback
+    return variants
+
+
 def _connected_chat_ids(calls: PyTgCalls) -> set[int] | None:
     """
     Best-effort set of chat_ids this PyTgCalls instance currently has an ACTIVE
-    call in. py-tgcalls versions differ, so we feature-detect a few known
-    accessors. Returns None when we genuinely cannot tell — in that case we fall
-    back to our own event-tracked _LIVE_STATE, which is always available.
+    call in, normalised across every id representation. py-tgcalls versions
+    differ, so we feature-detect a few known accessors. Returns None when we
+    genuinely cannot tell — in that case we fall back to our own event-tracked
+    _LIVE_STATE, which is always available.
     """
-    for attr in ("calls", "active_calls", "_calls"):
+    for attr in ("calls", "active_calls", "_calls", "_group_calls"):
         holder = getattr(calls, attr, None)
         if isinstance(holder, dict):
-            try:
-                return {int(k) for k in holder.keys()}
-            except Exception:
-                continue
+            found: set[int] = set()
+            ok = False
+            for k in holder.keys():
+                try:
+                    found |= _chat_id_variants(int(k))
+                    ok = True
+                except Exception:
+                    continue
+            if ok:
+                return found
     return None
 
 
@@ -729,6 +754,18 @@ async def _rejoin_one(account_id: int, target: dict) -> bool:
             if entry is not None:
                 client = entry.get("client")
                 mtproto_dead = client is not None and not getattr(client, "is_connected", True)
+                # NEVER tear down a bot that is actually still in the call. If the
+                # WebRTC layer reports us connected to this chat, the "drop" was a
+                # false positive (e.g. a transient sweep glitch) — just resync our
+                # view and keep the live, working transport as-is. Rebuilding here
+                # is exactly what was kicking healthy users out of the stream.
+                if not mtproto_dead:
+                    connected = _connected_chat_ids(entry["calls"])
+                    if connected is not None and (_chat_id_variants(chat_id) & connected):
+                        _LIVE_STATE[account_id] = "connected"
+                        _JOIN_FAILS.pop(account_id, None)
+                        _NEXT_RETRY_AT.pop(account_id, None)
+                        return True
                 if mtproto_dead or prior_fails >= REBUILD_AFTER_FAILS:
                     await _teardown_client(account_id)
                     entry = None
@@ -870,8 +907,10 @@ async def reconcile_active_joins() -> int:
                 else:
                     connected = _connected_chat_ids(entry["calls"])
                     if connected is not None:
-                        # Version exposes real state — trust it (and sync our view).
-                        dropped = chat_id not in connected
+                        # Version exposes real state — trust it (and sync our
+                        # view). Match against EVERY id representation so a
+                        # format mismatch can't mark a live bot as dropped.
+                        dropped = not (_chat_id_variants(chat_id) & connected)
                         _LIVE_STATE[account_id] = "dropped" if dropped else "connected"
                     else:
                         # Fall back to our own event-tracked state.
