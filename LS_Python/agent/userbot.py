@@ -64,6 +64,28 @@ class FloodWaitError(UserbotError):
 # { account_id: {"client": Client, "calls": PyTgCalls} }
 _POOL: dict[int, dict] = {}
 
+# --- Concurrent-start guards (fix for AUTH_KEY_DUPLICATED) ------------------
+# Telegram rejects a session that is connected from two places AT THE SAME TIME
+# with [406 AUTH_KEY_DUPLICATED]. Within this process that happens because the
+# `if account_id in _POOL` check in _ensure_online is not atomic: when prewarm,
+# a join job and the reconciler all want the same account at once, several
+# coroutines pass the check together and each does client.start() on the SAME
+# session -> duplicate. These guards serialise startup so a given account, AND a
+# given session string, is only ever brought online by ONE coroutine at a time.
+_START_LOCKS: dict[int, asyncio.Lock] = {}
+# Session strings currently being connected (or already connected). Guards the
+# real-world case where the same session_string was imported under more than one
+# account row: starting both would duplicate the auth key.
+_SESSIONS_IN_USE: dict[str, int] = {}
+
+
+def _start_lock(account_id: int) -> asyncio.Lock:
+    lock = _START_LOCKS.get(account_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _START_LOCKS[account_id] = lock
+    return lock
+
 # --- Live-stream join throttling -------------------------------------------
 # Joining a group call is FAR heavier than a normal API call: every join
 # negotiates a full WebRTC/NTgCalls connection (ICE + DTLS + native threads)
@@ -408,23 +430,66 @@ async def provision_userbot(
 
 
 async def _ensure_online(account_id: int, api_id: int, api_hash: str, session_string: str) -> dict:
-    """Start (or reuse) a live Client + PyTgCalls for this account."""
+    """
+    Start (or reuse) a live Client + PyTgCalls for this account.
+
+    Serialised per-account with a lock so overlapping callers (prewarm + join +
+    reconciler) can never run two client.start() calls on the same session at
+    once — which is what triggers [406 AUTH_KEY_DUPLICATED]. We also refuse to
+    bring a session ONLINE if the same session_string is already in use under a
+    different account row, because that duplicates the auth key just the same.
+    """
+    # Fast path: already warm. (Cheap check outside the lock is fine — we
+    # re-check inside the lock before creating anything.)
     if account_id in _POOL:
         return _POOL[account_id]
 
-    client = Client(
-        name=f"bot_{account_id}",
-        api_id=api_id,
-        api_hash=api_hash,
-        session_string=session_string,
-        in_memory=True,
-    )
-    await client.start()
-    calls = PyTgCalls(client)
-    await calls.start()
-    _POOL[account_id] = {"client": client, "calls": calls}
-    _attach_rejoin_handler(account_id, calls)
-    return _POOL[account_id]
+    async with _start_lock(account_id):
+        # Re-check inside the lock: another coroutine may have warmed it while we
+        # were waiting for the lock.
+        if account_id in _POOL:
+            return _POOL[account_id]
+
+        # Guard against the same session string being connected under two account
+        # rows — Telegram treats that as the same auth key used in two places.
+        owner = _SESSIONS_IN_USE.get(session_string)
+        if owner is not None and owner != account_id:
+            raise UserbotError(
+                f"Session for account {account_id} is already in use by account "
+                f"{owner} (duplicate session_string). Skipping to avoid "
+                f"AUTH_KEY_DUPLICATED — re-login this account with its own session."
+            )
+
+        client = Client(
+            name=f"bot_{account_id}",
+            api_id=api_id,
+            api_hash=api_hash,
+            session_string=session_string,
+            in_memory=True,
+        )
+        try:
+            await client.start()
+        except Exception as e:
+            # Leave nothing half-connected behind, and free the session claim.
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            _SESSIONS_IN_USE.pop(session_string, None)
+            if "AUTH_KEY_DUPLICATED" in str(e).upper():
+                raise UserbotError(
+                    f"account {account_id}: AUTH_KEY_DUPLICATED — this session is "
+                    f"logged in somewhere else (another agent/shard, a second copy "
+                    f"of this process, or a duplicated session_string). Ensure only "
+                    f"ONE agent runs this account, or re-login to mint a fresh session."
+                ) from e
+            raise
+        calls = PyTgCalls(client)
+        await calls.start()
+        _POOL[account_id] = {"client": client, "calls": calls}
+        _SESSIONS_IN_USE[session_string] = account_id
+        _attach_rejoin_handler(account_id, calls)
+        return _POOL[account_id]
 
 
 def _attach_rejoin_handler(account_id: int, calls: PyTgCalls) -> None:
@@ -494,6 +559,24 @@ async def prewarm(accounts: list[dict]) -> int:
     Connections are opened concurrently so warming 100 accounts takes about as
     long as warming one.
     """
+    # Drop rows that share a session_string BEFORE connecting: bringing the same
+    # session online twice is exactly what earns [406 AUTH_KEY_DUPLICATED]. We
+    # keep the first row for each session and warn about the rest.
+    seen_sessions: dict[str, int] = {}
+    unique: list[dict] = []
+    for acc in accounts:
+        sess = acc.get("session_string")
+        if sess and sess in seen_sessions:
+            print(
+                f"[!] account {acc.get('id')} shares its session_string with "
+                f"account {seen_sessions[sess]} — skipping to avoid "
+                f"AUTH_KEY_DUPLICATED. Re-login it to get its own session."
+            )
+            continue
+        if sess:
+            seen_sessions[sess] = acc.get("id")
+        unique.append(acc)
+
     async def _warm(acc: dict) -> bool:
         try:
             await _ensure_online(
@@ -504,7 +587,7 @@ async def prewarm(accounts: list[dict]) -> int:
             print(f"[!] prewarm failed for account {acc.get('id')}: {e}")
             return False
 
-    results = await asyncio.gather(*(_warm(a) for a in accounts))
+    results = await asyncio.gather(*(_warm(a) for a in unique))
     return sum(1 for ok in results if ok)
 
 
@@ -546,6 +629,12 @@ async def _teardown_client(account_id: int) -> None:
     """
     entry = _POOL.pop(account_id, None)
     _REJOIN_ATTACHED.discard(account_id)
+    # Release this account's session claim so it (or its session string) can be
+    # brought online again cleanly. Without this, a rebuilt client would be
+    # blocked by our own _SESSIONS_IN_USE guard.
+    for sess, owner in list(_SESSIONS_IN_USE.items()):
+        if owner == account_id:
+            _SESSIONS_IN_USE.pop(sess, None)
     if not entry:
         return
     client = entry.get("client")
