@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import threading
+from contextlib import contextmanager
 from typing import Any, Optional
 
 import psycopg
@@ -23,6 +24,51 @@ from psycopg.rows import dict_row
 
 # DATABASE_URL is the Neon connection string. Same value as the website's env.
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+
+# ---------------------------------------------------------------------------
+# File-descriptor limit — the fix for [Errno 24] "Too many open files"
+# ---------------------------------------------------------------------------
+# Each live userbot holds a Telegram TCP client PLUS a PyTgCalls WebRTC
+# connection (several sockets each). With hundreds of accounts that easily blows
+# past Linux's default soft limit of 1024 open files. Once we run out of FDs the
+# process can't open ANY new socket, so DNS resolution, new DB connections and
+# pytgcalls keepalives all start failing at once — which is exactly the log
+# cascade (failed to resolve host / connection is bad / socket.send() raised
+# exception) that makes live-stream members drop. Raising the soft limit to the
+# hard maximum gives us the thousands of FDs a large fleet legitimately needs.
+def raise_fd_limit() -> None:
+    try:
+        import resource  # POSIX only; absent on Windows dev machines.
+    except Exception:
+        return
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        # Aim high; cap the request when the hard limit is "unlimited".
+        desired = hard if hard != resource.RLIM_INFINITY else 1_048_576
+        if soft < desired:
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (desired, hard))
+            except (ValueError, OSError):
+                # Some kernels reject jumping straight to the hard max; step down
+                # until one is accepted so we still gain as much headroom as we can.
+                for target in (65536, 32768, 16384, 8192, 4096):
+                    if target <= soft:
+                        break
+                    try:
+                        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+                        break
+                    except (ValueError, OSError):
+                        continue
+        new_soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        print(f"[db] open-file limit: {soft} -> {new_soft}")
+    except Exception as e:
+        print(f"[db] could not raise open-file limit ({e}); large fleets may hit 'Too many open files'.")
+
+
+# Apply as early as possible: db is imported before any userbot/PyTgCalls sockets
+# are created, so the higher limit is in effect for the whole process.
+raise_fd_limit()
 
 # ---------------------------------------------------------------------------
 # Sharding — spread the userbots across several worker PROCESSES
@@ -108,7 +154,16 @@ def _connect() -> psycopg.Connection:
     return psycopg.connect(DATABASE_URL, row_factory=dict_row, autocommit=True)
 
 
-def query(sql: str, params: tuple = ()) -> list[dict[str, Any]]:
+@contextmanager
+def _acquire():
+    """
+    Yield a DB connection, ALWAYS preferring the warm pool. This is the single
+    place every query/claim/expand goes through, so the whole agent shares a
+    bounded set of connections (<= AGENT_DB_POOL_MAX) instead of opening a fresh
+    TCP+TLS socket per call. Bypassing the pool on the hot polling path was what
+    added constant FD churn and froze the event loop on handshakes. Falls back to
+    a per-call connection only when psycopg_pool isn't installed.
+    """
     if not DATABASE_URL:
         raise RuntimeError(
             "DATABASE_URL is not set. Copy .env.example to .env and paste your "
@@ -116,15 +171,15 @@ def query(sql: str, params: tuple = ()) -> list[dict[str, Any]]:
         )
     pool = _get_pool()
     if pool is not None:
-        # Reuse a warm pooled connection (fast, no TLS handshake per call).
         with pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, params)
-                if cur.description is None:
-                    return []
-                return cur.fetchall()
-    # Fallback: fresh connection per call (only when psycopg_pool isn't installed).
-    with _connect() as conn:
+            yield conn
+    else:
+        with _connect() as conn:
+            yield conn
+
+
+def query(sql: str, params: tuple = ()) -> list[dict[str, Any]]:
+    with _acquire() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
             if cur.description is None:
@@ -160,7 +215,7 @@ def claim_next_job() -> Optional[dict[str, Any]]:
     FOR UPDATE SKIP LOCKED makes this safe even if you run multiple agents:
     two agents will never grab the same job.
     """
-    with _connect() as conn:
+    with _acquire() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -208,7 +263,7 @@ def claim_next_jobs(
     if shard_count < 1:
         shard_count = 1
 
-    with _connect() as conn:
+    with _acquire() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -273,7 +328,7 @@ def expand_fanout_jobs(shard_count: int) -> int:
     """
     if shard_count <= 1:
         return 0
-    with _connect() as conn:
+    with _acquire() as conn:
         with conn.cursor() as cur:
             # Lock a batch of un-tagged fan-out templates so two shard-0 restarts
             # can't double-expand the same row.
