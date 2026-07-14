@@ -204,6 +204,28 @@ def _get_join_sem() -> asyncio.Semaphore:
     return _join_sem
 
 
+# Bounded concurrency gate for VIEW / REACT / VOTE actions. This is the fix for
+# "doing views/reactions/votes kicks everyone out of the live stream". Those
+# actions used to fire one MTProto call per account across the WHOLE pool at once
+# via a single asyncio.gather. On a shard where hundreds of those same accounts
+# are also carrying a PyTgCalls WebRTC group call, that unbounded burst saturates
+# the single event loop and starves the WebRTC keepalive/ping callbacks — so
+# Telegram drops the bots from the call even though nothing is wrong with the
+# stream. Capping how many action calls are in flight at once keeps the loop
+# responsive so keepalives always get their turn, exactly like the join gate.
+ACTION_MAX_CONCURRENCY = max(1, int(_os.environ.get("AGENT_ACTION_CONCURRENCY", "25")))
+
+_action_sem: "asyncio.Semaphore | None" = None
+
+
+def _get_action_sem() -> asyncio.Semaphore:
+    """Bounded concurrency gate for view/react/vote actions (created in the loop)."""
+    global _action_sem
+    if _action_sem is None:
+        _action_sem = asyncio.Semaphore(ACTION_MAX_CONCURRENCY)
+    return _action_sem
+
+
 def _flood_seconds(exc: Exception) -> int | None:
     """
     If `exc` is (or wraps) a Telegram FloodWait, return the required wait in
@@ -565,7 +587,7 @@ def _attach_rejoin_handler(account_id: int, calls: PyTgCalls) -> None:
 
                 # Only events that mean the bot TRULY left the call count as a
                 # drop. (LeftGroupCall / KickedFromGroupCall / Disconnected /
-                # ClosedVoiceChat.) The reconciler then rejoins it �� unless the
+                # ClosedVoiceChat.) The reconciler then rejoins it ��� unless the
                 # host's whole stream has ended, which its per-chat liveness check
                 # confirms separately.
                 if any(k in name for k in ("left", "leav", "kick", "disconnect", "closed")):
@@ -1540,19 +1562,23 @@ async def view_post_all(chat_id: int, message_id: int, spread_seconds: float = 0
         return 0
 
     offsets = _natural_arrival_offsets(len(clients), spread_seconds)
+    sem = _get_action_sem()
 
     async def _one(client: Client, delay: float) -> bool:
         if delay > 0:
             await asyncio.sleep(delay)
-        try:
-            peer = await client.resolve_peer(chat_id)
-            await client.invoke(
-                GetMessagesViews(peer=peer, id=[int(message_id)], increment=True)
-            )
-            return True
-        except Exception as e:
-            print(f"[!] view failed (msg {message_id}): {e.__class__.__name__}: {e}")
-            return False
+        # Gate the actual MTProto work so a big pool can't flood the event loop
+        # and starve the WebRTC keepalives of bots that are in a live stream.
+        async with sem:
+            try:
+                peer = await client.resolve_peer(chat_id)
+                await client.invoke(
+                    GetMessagesViews(peer=peer, id=[int(message_id)], increment=True)
+                )
+                return True
+            except Exception as e:
+                print(f"[!] view failed (msg {message_id}): {e.__class__.__name__}: {e}")
+                return False
 
     results = await asyncio.gather(*(_one(c, d) for c, d in zip(clients, offsets)))
     return sum(1 for ok in results if ok)
@@ -1620,19 +1646,23 @@ async def view_post_scheduled(
         clients = random.sample(clients, my_count)
 
     offsets = _natural_arrival_offsets(len(clients), spread_seconds)
+    sem = _get_action_sem()
 
     async def _one(client: Client, delay: float) -> bool:
         if delay > 0:
             await asyncio.sleep(delay)
-        try:
-            peer = await client.resolve_peer(chat_id)
-            await client.invoke(
-                GetMessagesViews(peer=peer, id=[int(message_id)], increment=True)
-            )
-            return True
-        except Exception as e:
-            print(f"[!] view failed (msg {message_id}): {e.__class__.__name__}: {e}")
-            return False
+        # Gate the actual MTProto work so a big pool can't flood the event loop
+        # and starve the WebRTC keepalives of bots that are in a live stream.
+        async with sem:
+            try:
+                peer = await client.resolve_peer(chat_id)
+                await client.invoke(
+                    GetMessagesViews(peer=peer, id=[int(message_id)], increment=True)
+                )
+                return True
+            except Exception as e:
+                print(f"[!] view failed (msg {message_id}): {e.__class__.__name__}: {e}")
+                return False
 
     results = await asyncio.gather(*(_one(c, d) for c, d in zip(clients, offsets)))
     return sum(1 for ok in results if ok)
@@ -1849,7 +1879,10 @@ async def vote_on_poll(
     except Exception:
         resolved = chat_id
 
-    await client.vote_poll(resolved, int(message_id), int(option_index))
+    # Gate the vote so a batch of vote jobs can't saturate the event loop and
+    # starve live-stream WebRTC keepalives (bots getting kicked mid-stream).
+    async with _get_action_sem():
+        await client.vote_poll(resolved, int(message_id), int(option_index))
 
 
 async def retract_poll_vote(
@@ -1872,7 +1905,10 @@ async def retract_poll_vote(
     client: Client = entry["client"]
 
     peer = await client.resolve_peer(chat_id if chat_id is not None else _normalize_link(chat_link))
-    await client.invoke(SendVote(peer=peer, msg_id=int(message_id), options=[]))
+    # Gate the retract so a batch can't saturate the event loop and starve
+    # live-stream WebRTC keepalives.
+    async with _get_action_sem():
+        await client.invoke(SendVote(peer=peer, msg_id=int(message_id), options=[]))
 
 
 # ===========================================================================
@@ -2010,9 +2046,16 @@ async def react_post_scheduled(
     probe_n = min(2, len(clients))
     probe_clients = clients[:probe_n]
     rest_clients = clients[probe_n:]
+    sem = _get_action_sem()
+
+    async def _gated_react(client: Client) -> str:
+        # Gate the reaction call so a pool-wide burst can't saturate the event
+        # loop and starve live-stream WebRTC keepalives (bots getting kicked).
+        async with sem:
+            return await _react_once(client, chat_id, message_id, emojis)
 
     probe_results = await asyncio.gather(
-        *(_react_once(c, chat_id, message_id, emojis) for c in probe_clients),
+        *(_gated_react(c) for c in probe_clients),
         return_exceptions=True,
     )
     success = sum(1 for r in probe_results if r == "ok")
@@ -2038,7 +2081,7 @@ async def react_post_scheduled(
     async def _scheduled(client: Client, delay: float) -> str:
         if delay > 0:
             await asyncio.sleep(delay)
-        return await _react_once(client, chat_id, message_id, emojis)
+        return await _gated_react(client)
 
     # return_exceptions=True: even an unexpected error on one userbot can never
     # bubble up and take down the job / worker.
