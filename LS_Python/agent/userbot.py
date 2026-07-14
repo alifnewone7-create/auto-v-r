@@ -215,7 +215,21 @@ def _get_join_sem() -> asyncio.Semaphore:
 # responsive so keepalives always get their turn, exactly like the join gate.
 ACTION_MAX_CONCURRENCY = max(1, int(_os.environ.get("AGENT_ACTION_CONCURRENCY", "25")))
 
+# How long a pool client will silently wait out a FLOOD_WAIT before raising,
+# instead of thrashing/reconnecting the connection (which drops the group call).
+CLIENT_SLEEP_THRESHOLD = max(10, int(_os.environ.get("AGENT_SLEEP_THRESHOLD", "90")))
+
+# Minimum gap between two MTProto actions on the SAME account. Combined with the
+# per-account lock below this guarantees a single account never fires overlapping
+# or back-to-back-instant calls on the connection that is carrying its live-stream
+# group call — the burst that made Telegram reset the session and drop the call.
+ACTION_PER_ACCOUNT_GAP = max(0.0, float(_os.environ.get("AGENT_ACTION_ACCOUNT_GAP", "0.4")))
+
 _action_sem: "asyncio.Semaphore | None" = None
+# Per-account serialisation for actions, plus the monotonic time of each
+# account's last action so we can enforce ACTION_PER_ACCOUNT_GAP.
+_action_locks: dict[int, asyncio.Lock] = {}
+_action_last_at: dict[int, float] = {}
 
 
 def _get_action_sem() -> asyncio.Semaphore:
@@ -224,6 +238,47 @@ def _get_action_sem() -> asyncio.Semaphore:
     if _action_sem is None:
         _action_sem = asyncio.Semaphore(ACTION_MAX_CONCURRENCY)
     return _action_sem
+
+
+def _account_action_lock(account_id: int) -> asyncio.Lock:
+    lock = _action_locks.get(account_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _action_locks[account_id] = lock
+    return lock
+
+
+class _account_action:
+    """
+    Async context manager wrapping ONE MTProto action for a given account so it
+    is (a) globally throttled by the action semaphore, (b) serialised per account,
+    and (c) spaced by at least ACTION_PER_ACCOUNT_GAP. This keeps the account's
+    call-carrying connection calm enough that the live stream is never dropped
+    while it still does views/reactions/votes.
+    """
+
+    def __init__(self, account_id: int):
+        self.account_id = account_id
+        self._sem = _get_action_sem()
+        self._lock = _account_action_lock(account_id)
+
+    async def __aenter__(self):
+        await self._sem.acquire()
+        await self._lock.acquire()
+        gap = ACTION_PER_ACCOUNT_GAP
+        if gap > 0:
+            last = _action_last_at.get(self.account_id)
+            if last is not None:
+                wait = gap - (time.monotonic() - last)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        _action_last_at[self.account_id] = time.monotonic()
+        self._lock.release()
+        self._sem.release()
+        return False
 
 
 def _flood_seconds(exc: Exception) -> int | None:
@@ -523,6 +578,16 @@ async def _ensure_online(account_id: int, api_id: int, api_hash: str, session_st
             api_hash=api_hash,
             session_string=session_string,
             in_memory=True,
+            # This connection carries the live-stream group-call signalling AND
+            # the view/react/vote MTProto traffic. A burst of actions across the
+            # pool earns FLOOD_WAIT; with pyrogram's default sleep_threshold of
+            # 10s, anything longer is RAISED, which thrashes/reconnects the
+            # session — and a reconnect drops the group call, which is why doing
+            # views/reactions/votes kicked every bot out of the live stream at
+            # once. A high threshold lets the client quietly WAIT OUT a flood
+            # (the native WebRTC media keeps flowing meanwhile) instead of
+            # tearing down the connection.
+            sleep_threshold=CLIENT_SLEEP_THRESHOLD,
         )
         try:
             await client.start()
@@ -1557,19 +1622,19 @@ async def view_post_all(chat_id: int, message_id: int, spread_seconds: float = 0
     real viewers arriving one after another instead of a single instant spike.
     Returns how many userbots successfully registered a view.
     """
-    clients = [entry["client"] for entry in _POOL.values()]
-    if not clients:
+    members = [(aid, entry["client"]) for aid, entry in _POOL.items()]
+    if not members:
         return 0
 
-    offsets = _natural_arrival_offsets(len(clients), spread_seconds)
-    sem = _get_action_sem()
+    offsets = _natural_arrival_offsets(len(members), spread_seconds)
 
-    async def _one(client: Client, delay: float) -> bool:
+    async def _one(account_id: int, client: Client, delay: float) -> bool:
         if delay > 0:
             await asyncio.sleep(delay)
-        # Gate the actual MTProto work so a big pool can't flood the event loop
-        # and starve the WebRTC keepalives of bots that are in a live stream.
-        async with sem:
+        # Serialise + pace + globally throttle per account so this MTProto work
+        # can never overwhelm the connection carrying that account's live-stream
+        # group call (which used to reset the session and drop the stream).
+        async with _account_action(account_id):
             try:
                 peer = await client.resolve_peer(chat_id)
                 await client.invoke(
@@ -1580,7 +1645,7 @@ async def view_post_all(chat_id: int, message_id: int, spread_seconds: float = 0
                 print(f"[!] view failed (msg {message_id}): {e.__class__.__name__}: {e}")
                 return False
 
-    results = await asyncio.gather(*(_one(c, d) for c, d in zip(clients, offsets)))
+    results = await asyncio.gather(*(_one(a, c, d) for (a, c), d in zip(members, offsets)))
     return sum(1 for ok in results if ok)
 
 
@@ -1613,8 +1678,8 @@ async def view_post_scheduled(
 
     Returns how many userbots successfully registered a view.
     """
-    clients = [entry["client"] for entry in _POOL.values()]
-    if not clients:
+    members = [(aid, entry["client"]) for aid, entry in _POOL.items()]
+    if not members:
         return 0
 
     # Pick a "low to high" amount of userbots for this specific post.
@@ -1640,20 +1705,20 @@ async def view_post_scheduled(
 
         # Cap at this shard's local pool (shares are only ever short, never over,
         # which keeps the global total <= the requested "high").
-        my_count = min(my_count, len(clients))
+        my_count = min(my_count, len(members))
         if my_count <= 0:
             return 0
-        clients = random.sample(clients, my_count)
+        members = random.sample(members, my_count)
 
-    offsets = _natural_arrival_offsets(len(clients), spread_seconds)
-    sem = _get_action_sem()
+    offsets = _natural_arrival_offsets(len(members), spread_seconds)
 
-    async def _one(client: Client, delay: float) -> bool:
+    async def _one(account_id: int, client: Client, delay: float) -> bool:
         if delay > 0:
             await asyncio.sleep(delay)
-        # Gate the actual MTProto work so a big pool can't flood the event loop
-        # and starve the WebRTC keepalives of bots that are in a live stream.
-        async with sem:
+        # Serialise + pace + globally throttle per account so this MTProto work
+        # can never overwhelm the connection carrying that account's live-stream
+        # group call (which used to reset the session and drop the stream).
+        async with _account_action(account_id):
             try:
                 peer = await client.resolve_peer(chat_id)
                 await client.invoke(
@@ -1664,7 +1729,7 @@ async def view_post_scheduled(
                 print(f"[!] view failed (msg {message_id}): {e.__class__.__name__}: {e}")
                 return False
 
-    results = await asyncio.gather(*(_one(c, d) for c, d in zip(clients, offsets)))
+    results = await asyncio.gather(*(_one(a, c, d) for (a, c), d in zip(members, offsets)))
     return sum(1 for ok in results if ok)
 
 
