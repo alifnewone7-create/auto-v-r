@@ -161,7 +161,11 @@ REJOIN_PLAY_TIMEOUT = max(15.0, float(_os.environ.get("AGENT_PLAY_TIMEOUT", "45"
 # reactions keep working".
 REBUILD_AFTER_FAILS = max(1, int(_os.environ.get("AGENT_REBUILD_AFTER_FAILS", "1")))
 
-# Accounts that are SUPPOSED to be in a live stream right now.
+# Accounts that are SUPPOSED to be in a live stream right now, so we can put
+# them back if Telegram/NTgCalls drops the call (network blip, server move, or a
+# server-side call restart — the usual cause of "300 joined, 270 suddenly left").
+# We also stash the account's creds so a dropped/disconnected client can be
+# fully revived (not just re-played) during recovery.
 # { account_id: {"chat_id": int, "chat_link": str,
 #                "api_id": int, "api_hash": str, "session_string": str} }
 _ACTIVE_JOINS: dict[int, dict] = {}
@@ -172,13 +176,22 @@ _ACTIVE_JOINS: dict[int, dict] = {}
 # tell who dropped. Values: "connected" | "dropped".
 _LIVE_STATE: dict[int, str] = {}
 
+# Clients that already have the auto-rejoin handler attached (attach once).
+_REJOIN_ATTACHED: set[int] = set()
+
 # Per-chat count of consecutive "the live stream looks gone" readings. We only
 # release a chat's bots once this reaches STREAM_GONE_CONFIRMATIONS, so a single
 # transient false reading can never make everyone leave. Reset the instant the
 # stream looks alive again.
 _STREAM_GONE_STRIKES: dict[int, int] = {}
 
+# Per-account count of consecutive failed rejoin attempts. Drives the backoff
+# below. A failing bot is retried forever, never abandoned — just less often.
+_JOIN_FAILS: dict[int, int] = {}
 
+# Per-account earliest monotonic time we may retry a failed rejoin. Set from the
+# exponential backoff after a failure; cleared on success or intentional leave.
+_NEXT_RETRY_AT: dict[int, float] = {}
 
 _join_sem: "asyncio.Semaphore | None" = None
 
@@ -532,9 +545,26 @@ async def _ensure_online(account_id: int, api_id: int, api_hash: str, session_st
         await calls.start()
         _POOL[account_id] = {"client": client, "calls": calls}
         _SESSIONS_IN_USE[session_string] = account_id
+        _attach_rejoin_handler(account_id, calls)
         return _POOL[account_id]
 
 
+def _attach_rejoin_handler(account_id: int, calls: PyTgCalls) -> None:
+    """
+    When this account's group call ends/drops unexpectedly while it is still
+    supposed to be listening, MARK it dropped so the throttled reconciler brings
+    it back. We deliberately do NOT rejoin inline here: when a server-side call
+    restart drops hundreds of bots at the same instant, hundreds of inline
+    rejoins would fire simultaneously, bypass the concurrency gate, and overload
+    the process again — causing the very oscillation we're fixing. Marking +
+    centralised throttled recovery makes even a full mass-drop come back
+    smoothly. Guarded + feature-detected so it can never crash the agent.
+    """
+    if account_id in _REJOIN_ATTACHED:
+        return
+    on_update = getattr(calls, "on_update", None)
+    if not callable(on_update):
+        return
 
     try:
 
@@ -638,12 +668,9 @@ def _already_in_call(exc: Exception) -> bool:
     return "already" in m and ("call" in m or "join" in m)
 
 
-def _forget_join(account_id: int, reason: str = "unknown") -> None:
+def _forget_join(account_id: int) -> None:
     """Stop tracking an account for live-stream keep-alive (intentional leave or
     a stream that has genuinely ended). Clears the target and all state views."""
-    if account_id in _ACTIVE_JOINS:
-        target = _ACTIVE_JOINS[account_id]
-        print(f"[DROP] account {account_id} leaving chat {target.get('chat_id')} — reason: {reason}")
     _ACTIVE_JOINS.pop(account_id, None)
     _LIVE_STATE.pop(account_id, None)
     _JOIN_FAILS.pop(account_id, None)
@@ -717,54 +744,223 @@ def _connected_chat_ids(calls: PyTgCalls) -> set[int] | None:
     return None
 
 
+async def _rejoin_one(account_id: int, target: dict) -> bool:
+    """
+    Bring a single dropped account back into its live stream, THROUGH the shared
+    join throttle (concurrency gate + stagger) so a mass recovery never spikes.
+
+    Key rule: this NEVER gives up on a bot. If the client died it is rebuilt from
+    scratch; if the rejoin fails right now (rate limit, momentary error) the bot
+    simply stays 'dropped' and is retried on the next sweep. The only thing that
+    ever stops a bot being tracked is the stream genuinely ending (decided once,
+    per-chat, in reconcile_active_joins) or the user leaving. Never raises.
+
+    Whether the host's stream is still running is decided ONCE per chat by the
+    caller — we intentionally do NOT check it here, because doing so per-account
+    fired a GetFullChannel from every client every sweep and that flood was itself
+    a cause of the mass-drop we are healing.
+    """
+    chat_id = int(target["chat_id"])
+    async with _get_join_sem():
+        if JOIN_STAGGER_SECONDS > 0:
+            await asyncio.sleep(random.uniform(0.0, JOIN_STAGGER_SECONDS))
+        try:
+            # Decide whether to REBUILD from scratch or reuse the warm instance.
+            # Rebuild when either the MTProto client died OR we've already failed
+            # to rejoin on the existing PyTgCalls at least REBUILD_AFTER_FAILS
+            # times: re-play()ing on a wedged NTgCalls transport can never recover
+            # (MTProto still says is_connected=True), so the only real fix is a
+            # fresh Client+PyTgCalls with a brand-new native WebRTC socket.
+            entry = _POOL.get(account_id)
+            prior_fails = _JOIN_FAILS.get(account_id, 0)
+            if entry is not None:
+                client = entry.get("client")
+                mtproto_dead = client is not None and not getattr(client, "is_connected", True)
+                # NEVER tear down a bot that is actually still in the call. If the
+                # WebRTC layer reports us connected to this chat, the "drop" was a
+                # false positive (e.g. a transient sweep glitch) — just resync our
+                # view and keep the live, working transport as-is. Rebuilding here
+                # is exactly what was kicking healthy users out of the stream.
+                if not mtproto_dead:
+                    connected = _connected_chat_ids(entry["calls"])
+                    if connected is not None and (_chat_id_variants(chat_id) & connected):
+                        _LIVE_STATE[account_id] = "connected"
+                        _JOIN_FAILS.pop(account_id, None)
+                        _NEXT_RETRY_AT.pop(account_id, None)
+                        return True
+                if mtproto_dead or prior_fails >= REBUILD_AFTER_FAILS:
+                    await _teardown_client(account_id)
+                    entry = None
+            if not entry:
+                entry = await _ensure_online(
+                    account_id,
+                    int(target["api_id"]),
+                    target["api_hash"],
+                    target["session_string"],
+                )
+            calls: PyTgCalls = entry["calls"]
+
+            # Timeout-guard the join: a wedged transport can make play() hang
+            # forever, holding this semaphore slot and starving everyone else's
+            # recovery. On timeout we tear the client down so the next sweep
+            # rebuilds a fresh transport instead of retrying the broken one.
+            await asyncio.wait_for(
+                calls.play(chat_id, _listen_only_stream()),
+                timeout=REJOIN_PLAY_TIMEOUT,
+            )
+            _LIVE_STATE[account_id] = "connected"
+            _JOIN_FAILS.pop(account_id, None)
+            _NEXT_RETRY_AT.pop(account_id, None)
+            return True
+        except asyncio.TimeoutError:
+            # Wedged negotiation — drop the whole client so it can't keep spinning
+            # its dead socket; a clean rebuild happens on the next sweep.
+            await _teardown_client(account_id)
+            fails = _JOIN_FAILS.get(account_id, 0) + 1
+            _JOIN_FAILS[account_id] = fails
+            delay = min(
+                REJOIN_BACKOFF_MAX_SECONDS,
+                REJOIN_BACKOFF_BASE_SECONDS * (2 ** (fails - 1)),
+            )
+            delay += random.uniform(0.0, min(5.0, delay * 0.25))
+            _NEXT_RETRY_AT[account_id] = time.monotonic() + delay
+            _LIVE_STATE[account_id] = "dropped"
+            return False
+        except Exception as e:
+            if _already_in_call(e):
+                _LIVE_STATE[account_id] = "connected"
+                _JOIN_FAILS.pop(account_id, None)
+                _NEXT_RETRY_AT.pop(account_id, None)
+                return True
+            # Could not rejoin right now (rate limit / transient error). Stay
+            # 'dropped' — we NEVER abandon the bot — but back off before the next
+            # try so a wave of failures can't re-play-storm the event loop.
+            fails = _JOIN_FAILS.get(account_id, 0) + 1
+            _JOIN_FAILS[account_id] = fails
+            delay = min(
+                REJOIN_BACKOFF_MAX_SECONDS,
+                REJOIN_BACKOFF_BASE_SECONDS * (2 ** (fails - 1)),
+            )
+            # Small jitter so many bots don't all come off backoff on the same tick.
+            delay += random.uniform(0.0, min(5.0, delay * 0.25))
+            _NEXT_RETRY_AT[account_id] = time.monotonic() + delay
+            _LIVE_STATE[account_id] = "dropped"
+            return False
+
+
 async def reconcile_active_joins() -> int:
     """
-    Check if the host's live stream is still running and release all bots if it
-    has ended. NO auto-rejoin mechanism — bots that get dropped stay dropped.
-    
-    This is the fix for the cascade drop problem: the rejoin system itself was
-    causing the storms that kicked out healthy bots. Without it, bots stay stable
-    as long as the stream is live.
+    Relentless keep-alive that makes "300 joined, 270 suddenly left" self-heal and
+    keeps every bot in the stream for as long as the agent runs and the host's
+    stream stays live — bots only ever leave when YOU stop the task.
+
+    Two design rules make this robust (and fix the old auto-drop bug):
+
+      1. Liveness is checked ONCE PER CHAT (not per account). The old code called
+         GetFullChannel from every dropped client every sweep; with hundreds of
+         bots that flood was itself a cause of the mass-drop, and a single
+         transient "call is None" reading made it `_forget_join` the bot forever
+         (so dropped bots vanished from the backend and the panel and never came
+         back). Now one warm client answers for the whole chat.
+
+      2. We only RELEASE a chat's bots after the stream is confirmed gone
+         STREAM_GONE_CONFIRMATIONS times in a row. A momentary blip can never make
+         everyone leave; while the stream is live (or we're unsure) every dropped
+         bot is rejoined through the throttle, forever.
+
+    Returns how many bots were rejoined this sweep.
     """
     if not _ACTIVE_JOINS:
         return 0
 
-    # Group by chat to check stream status once per chat (not per account).
-    by_chat: dict[int, list[int]] = {}
-    for account_id, target in list(_ACTIVE_JOINS.items()):
-        by_chat.setdefault(int(target["chat_id"]), []).append(account_id)
+    now = time.monotonic()
 
-    for chat_id, member_ids in by_chat.items():
-        # Check if the stream is still live, using any connected client.
+    # Group the accounts that SHOULD be live by their chat, so each stream's
+    # liveness is checked a single time regardless of how many bots are in it.
+    by_chat: dict[int, list[tuple[int, dict]]] = {}
+    for account_id, target in list(_ACTIVE_JOINS.items()):
+        by_chat.setdefault(int(target["chat_id"]), []).append((account_id, target))
+
+    to_rejoin: list[tuple[int, dict]] = []
+
+    for chat_id, members in by_chat.items():
+        # --- Is the host's live stream still running? Ask ONCE, via any warm
+        #     client we still hold for this chat. _has_active_group_call already
+        #     returns True on a transient error, so `live` is only False when the
+        #     call is genuinely absent.
         live = True
-        for account_id in member_ids:
+        for account_id, _t in members:
             entry = _POOL.get(account_id)
             if entry is not None and getattr(entry.get("client"), "is_connected", False):
                 try:
                     live = await _has_active_group_call(entry["client"], chat_id)
                 except Exception:
-                    live = True  # transient error — assume stream is still live
+                    live = True  # never treat an error as "stream gone"
                 break
 
         if not live:
-            # Stream has ended. Require multiple confirmations so a transient
-            # blip doesn't evict everyone.
+            # Might be over — but require several consecutive confirmations so a
+            # single blip can NEVER evict everyone. Keep rejoining until then.
             strikes = _STREAM_GONE_STRIKES.get(chat_id, 0) + 1
             _STREAM_GONE_STRIKES[chat_id] = strikes
             if strikes >= STREAM_GONE_CONFIRMATIONS:
-                # Confirmed dead — release all bots from this chat.
-                for account_id in member_ids:
-                    _forget_join(account_id, reason="stream_ended")
+                for account_id, _t in members:
+                    _forget_join(account_id)
                 _STREAM_GONE_STRIKES.pop(chat_id, None)
                 print(
-                    f"[reconcile] live stream in chat {chat_id} confirmed ended (strikes={strikes}); "
-                    f"released {len(member_ids)} bot(s)."
+                    f"[rejoin] live stream in chat {chat_id} confirmed ended after "
+                    f"{strikes} checks; released {len(members)} bot(s)."
                 )
+                continue
+            # Not yet confirmed gone — fall through and keep everyone alive.
         else:
-            # Stream is live — reset strike counter.
             _STREAM_GONE_STRIKES.pop(chat_id, None)
 
-    return 0
+        # --- Decide which members have dropped and queue them for rejoin.
+        for account_id, target in members:
+            entry = _POOL.get(account_id)
+            dropped = False
+            if entry is not None:
+                client = entry.get("client")
+                if client is not None and not getattr(client, "is_connected", True):
+                    # Client itself died — definitely needs a full rebuild+rejoin.
+                    dropped = True
+                    _LIVE_STATE[account_id] = "dropped"
+                else:
+                    connected = _connected_chat_ids(entry["calls"])
+                    if connected is not None:
+                        # Version exposes real state — trust it (and sync our
+                        # view). Match against EVERY id representation so a
+                        # format mismatch can't mark a live bot as dropped.
+                        dropped = not (_chat_id_variants(chat_id) & connected)
+                        _LIVE_STATE[account_id] = "dropped" if dropped else "connected"
+                    else:
+                        # Fall back to our own event-tracked state.
+                        dropped = _LIVE_STATE.get(account_id) == "dropped"
+            else:
+                # Lost the client entirely — definitely needs reviving.
+                dropped = True
+
+            if dropped:
+                # Respect per-account backoff: a bot that just failed waits its
+                # exponential delay before the next try. This is what keeps a mass
+                # recovery from re-play-storming the shared event loop (the storm
+                # itself starves keepalives and drops connections). First-time
+                # drops have no timer, so they retry on this very sweep.
+                next_at = _NEXT_RETRY_AT.get(account_id)
+                if next_at is None or now >= next_at:
+                    to_rejoin.append((account_id, target))
+
+    if not to_rejoin:
+        return 0
+
+    # Recover the due bots in parallel; the semaphore inside _rejoin_one paces it
+    # so even a full mass-drop comes back smoothly without re-overloading the loop.
+    results = await asyncio.gather(
+        *(_rejoin_one(aid, tgt) for aid, tgt in to_rejoin),
+        return_exceptions=True,
+    )
+    return sum(1 for r in results if r is True)
 
 
 async def join_livestream(
@@ -823,7 +1019,6 @@ async def join_livestream(
             try:
                 # Timeout-guard so a wedged WebRTC negotiation can't hang forever
                 # holding the join-semaphore slot (see REJOIN_PLAY_TIMEOUT).
-                print(f"[JOIN] account {account_id} joining chat {chat_id} (attempt {attempt}/{JOIN_RETRY_ATTEMPTS})")
                 await asyncio.wait_for(
                     calls.play(chat_id, _listen_only_stream()),
                     timeout=REJOIN_PLAY_TIMEOUT,
@@ -831,12 +1026,10 @@ async def join_livestream(
                 # Remember we belong here so auto-rejoin can restore us on a drop.
                 _ACTIVE_JOINS[account_id] = target_info
                 _LIVE_STATE[account_id] = "connected"
-                print(f"[JOIN_OK] account {account_id} successfully joined chat {chat_id}")
                 return  # joined successfully
             except asyncio.TimeoutError as e:
                 # Negotiation stalled — rebuild a clean transport before retrying
                 # so we don't keep hammering a half-open socket.
-                print(f"[JOIN_TIMEOUT] account {account_id} timeout (attempt {attempt}/{JOIN_RETRY_ATTEMPTS})")
                 last_exc = e
                 await _teardown_client(account_id)
                 if attempt < JOIN_RETRY_ATTEMPTS:
@@ -844,14 +1037,13 @@ async def join_livestream(
                     calls = entry["calls"]
                     await asyncio.sleep(1.5 * attempt + random.uniform(0.0, 1.0))
                     continue
-                _forget_join(account_id, reason="join_timeout")
+                _forget_join(account_id)
                 raise UserbotError(
                     f"Live stream join timed out after {JOIN_RETRY_ATTEMPTS} tries."
                 ) from last_exc
             except ChatAdminRequired:
                 # Race: the live stream ended between our check and the join.
-                print(f"[JOIN_ADMIN_REQUIRED] account {account_id} — stream ended during join")
-                _forget_join(account_id, reason="stream_ended_during_join")
+                _forget_join(account_id)
                 raise NoActiveLivestream(
                     "No live stream is currently running in this chat. "
                     "Start the live stream/video chat first, then add the link."
@@ -859,7 +1051,6 @@ async def join_livestream(
             except Exception as e:
                 # Already in the call from a previous attempt/run -> success.
                 if _already_in_call(e):
-                    print(f"[JOIN_ALREADY_IN] account {account_id} already in call")
                     _ACTIVE_JOINS[account_id] = target_info
                     _LIVE_STATE[account_id] = "connected"
                     return
@@ -868,16 +1059,14 @@ async def join_livestream(
                     # Too-long inline wait: hand back to the worker to retry
                     # later so this bot still joins once the limit clears. Don't
                     # arm auto-rejoin yet — it isn't in the call.
-                    print(f"[JOIN_FLOOD] account {account_id} flood wait {secs}s")
-                    _forget_join(account_id, reason="flood_wait")
+                    _forget_join(account_id)
                     raise FloodWaitError(secs, what="livestream join")
-                print(f"[JOIN_FAIL] account {account_id} attempt {attempt} error: {e.__class__.__name__}")
                 last_exc = e
                 if attempt < JOIN_RETRY_ATTEMPTS:
                     # Brief backoff for momentary network/call hiccups, then retry.
                     await asyncio.sleep(1.5 * attempt + random.uniform(0.0, 1.0))
                     continue
-                _forget_join(account_id, reason="join_failed")
+                _forget_join(account_id)
                 raise UserbotError(
                     f"Failed to join live stream after {JOIN_RETRY_ATTEMPTS} tries: "
                     f"{e.__class__.__name__}: {e}"
@@ -885,27 +1074,37 @@ async def join_livestream(
 
 
 async def leave_livestream(account_id: int, chat_link: str) -> None:
-    """Make a single userbot intentionally leave the live stream."""
-    print(f"[LEAVE] account {account_id} explicitly leaving {chat_link}")
-    _forget_join(account_id, reason="explicit_leave")
+    # Forget it FIRST so the auto-rejoin handler treats this as an intentional
+    # leave and does not immediately drag the bot back into the call.
+    _forget_join(account_id)
     entry = _POOL.get(account_id)
-    if entry is not None:
-        try:
-            calls: PyTgCalls = entry["calls"]
-            await calls.leave_call(chat.id)
-        except Exception:
-            pass
+    if not entry:
+        return
+    client: Client = entry["client"]
+    calls: PyTgCalls = entry["calls"]
+    try:
+        chat = await client.get_chat(_normalize_link(chat_link))
+        await calls.leave_call(chat.id)
+    except Exception:
+        pass
 
 
 async def leave_livestream_all(account_ids: list[int], chat_link: str) -> int:
-    """Make all queued userbots leave the live stream at once."""
-    # Pre-release them so their event handlers won't try to rejoin while we're in
+    """
+    Drop MANY userbots out of a chat's live stream at once.
+
+    The numeric chat id is resolved a single time using any warm client, then a
+    leave_call is fired on every warm client concurrently. Because all the leaves
+    run in parallel (asyncio.gather), even 500-1000 userbots exit within a few
+    seconds instead of trickling out one job at a time. Returns how many left.
+    """
+    if not account_ids:
+        return 0
+
+    # Intentional leave: forget these accounts up front so auto-rejoin ignores
     # the disconnect events we are about to trigger.
-    released = 0
-    print(f"[LEAVE_ALL] {len(account_ids)} bots leaving {chat_link}")
     for aid in account_ids:
-        if int(aid) in _ACTIVE_JOINS:
-            _forget_join(int(aid), reason="batch_leave")
+        _forget_join(int(aid))
 
     link = _normalize_link(chat_link)
 
