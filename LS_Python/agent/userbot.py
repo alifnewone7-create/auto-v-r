@@ -638,9 +638,12 @@ def _already_in_call(exc: Exception) -> bool:
     return "already" in m and ("call" in m or "join" in m)
 
 
-def _forget_join(account_id: int) -> None:
+def _forget_join(account_id: int, reason: str = "unknown") -> None:
     """Stop tracking an account for live-stream keep-alive (intentional leave or
     a stream that has genuinely ended). Clears the target and all state views."""
+    if account_id in _ACTIVE_JOINS:
+        target = _ACTIVE_JOINS[account_id]
+        print(f"[DROP] account {account_id} leaving chat {target.get('chat_id')} — reason: {reason}")
     _ACTIVE_JOINS.pop(account_id, None)
     _LIVE_STATE.pop(account_id, None)
     _JOIN_FAILS.pop(account_id, None)
@@ -751,10 +754,10 @@ async def reconcile_active_joins() -> int:
             if strikes >= STREAM_GONE_CONFIRMATIONS:
                 # Confirmed dead — release all bots from this chat.
                 for account_id in member_ids:
-                    _forget_join(account_id)
+                    _forget_join(account_id, reason="stream_ended")
                 _STREAM_GONE_STRIKES.pop(chat_id, None)
                 print(
-                    f"[reconcile] live stream in chat {chat_id} confirmed ended; "
+                    f"[reconcile] live stream in chat {chat_id} confirmed ended (strikes={strikes}); "
                     f"released {len(member_ids)} bot(s)."
                 )
         else:
@@ -820,6 +823,7 @@ async def join_livestream(
             try:
                 # Timeout-guard so a wedged WebRTC negotiation can't hang forever
                 # holding the join-semaphore slot (see REJOIN_PLAY_TIMEOUT).
+                print(f"[JOIN] account {account_id} joining chat {chat_id} (attempt {attempt}/{JOIN_RETRY_ATTEMPTS})")
                 await asyncio.wait_for(
                     calls.play(chat_id, _listen_only_stream()),
                     timeout=REJOIN_PLAY_TIMEOUT,
@@ -827,10 +831,12 @@ async def join_livestream(
                 # Remember we belong here so auto-rejoin can restore us on a drop.
                 _ACTIVE_JOINS[account_id] = target_info
                 _LIVE_STATE[account_id] = "connected"
+                print(f"[JOIN_OK] account {account_id} successfully joined chat {chat_id}")
                 return  # joined successfully
             except asyncio.TimeoutError as e:
                 # Negotiation stalled — rebuild a clean transport before retrying
                 # so we don't keep hammering a half-open socket.
+                print(f"[JOIN_TIMEOUT] account {account_id} timeout (attempt {attempt}/{JOIN_RETRY_ATTEMPTS})")
                 last_exc = e
                 await _teardown_client(account_id)
                 if attempt < JOIN_RETRY_ATTEMPTS:
@@ -838,13 +844,14 @@ async def join_livestream(
                     calls = entry["calls"]
                     await asyncio.sleep(1.5 * attempt + random.uniform(0.0, 1.0))
                     continue
-                _forget_join(account_id)
+                _forget_join(account_id, reason="join_timeout")
                 raise UserbotError(
                     f"Live stream join timed out after {JOIN_RETRY_ATTEMPTS} tries."
                 ) from last_exc
             except ChatAdminRequired:
                 # Race: the live stream ended between our check and the join.
-                _forget_join(account_id)
+                print(f"[JOIN_ADMIN_REQUIRED] account {account_id} — stream ended during join")
+                _forget_join(account_id, reason="stream_ended_during_join")
                 raise NoActiveLivestream(
                     "No live stream is currently running in this chat. "
                     "Start the live stream/video chat first, then add the link."
@@ -852,6 +859,7 @@ async def join_livestream(
             except Exception as e:
                 # Already in the call from a previous attempt/run -> success.
                 if _already_in_call(e):
+                    print(f"[JOIN_ALREADY_IN] account {account_id} already in call")
                     _ACTIVE_JOINS[account_id] = target_info
                     _LIVE_STATE[account_id] = "connected"
                     return
@@ -860,14 +868,16 @@ async def join_livestream(
                     # Too-long inline wait: hand back to the worker to retry
                     # later so this bot still joins once the limit clears. Don't
                     # arm auto-rejoin yet — it isn't in the call.
-                    _forget_join(account_id)
+                    print(f"[JOIN_FLOOD] account {account_id} flood wait {secs}s")
+                    _forget_join(account_id, reason="flood_wait")
                     raise FloodWaitError(secs, what="livestream join")
+                print(f"[JOIN_FAIL] account {account_id} attempt {attempt} error: {e.__class__.__name__}")
                 last_exc = e
                 if attempt < JOIN_RETRY_ATTEMPTS:
                     # Brief backoff for momentary network/call hiccups, then retry.
                     await asyncio.sleep(1.5 * attempt + random.uniform(0.0, 1.0))
                     continue
-                _forget_join(account_id)
+                _forget_join(account_id, reason="join_failed")
                 raise UserbotError(
                     f"Failed to join live stream after {JOIN_RETRY_ATTEMPTS} tries: "
                     f"{e.__class__.__name__}: {e}"
@@ -875,37 +885,27 @@ async def join_livestream(
 
 
 async def leave_livestream(account_id: int, chat_link: str) -> None:
-    # Forget it FIRST so the auto-rejoin handler treats this as an intentional
-    # leave and does not immediately drag the bot back into the call.
-    _forget_join(account_id)
+    """Make a single userbot intentionally leave the live stream."""
+    print(f"[LEAVE] account {account_id} explicitly leaving {chat_link}")
+    _forget_join(account_id, reason="explicit_leave")
     entry = _POOL.get(account_id)
-    if not entry:
-        return
-    client: Client = entry["client"]
-    calls: PyTgCalls = entry["calls"]
-    try:
-        chat = await client.get_chat(_normalize_link(chat_link))
-        await calls.leave_call(chat.id)
-    except Exception:
-        pass
+    if entry is not None:
+        try:
+            calls: PyTgCalls = entry["calls"]
+            await calls.leave_call(chat.id)
+        except Exception:
+            pass
 
 
 async def leave_livestream_all(account_ids: list[int], chat_link: str) -> int:
-    """
-    Drop MANY userbots out of a chat's live stream at once.
-
-    The numeric chat id is resolved a single time using any warm client, then a
-    leave_call is fired on every warm client concurrently. Because all the leaves
-    run in parallel (asyncio.gather), even 500-1000 userbots exit within a few
-    seconds instead of trickling out one job at a time. Returns how many left.
-    """
-    if not account_ids:
-        return 0
-
-    # Intentional leave: forget these accounts up front so auto-rejoin ignores
+    """Make all queued userbots leave the live stream at once."""
+    # Pre-release them so their event handlers won't try to rejoin while we're in
     # the disconnect events we are about to trigger.
+    released = 0
+    print(f"[LEAVE_ALL] {len(account_ids)} bots leaving {chat_link}")
     for aid in account_ids:
-        _forget_join(int(aid))
+        if int(aid) in _ACTIVE_JOINS:
+            _forget_join(int(aid), reason="batch_leave")
 
     link = _normalize_link(chat_link)
 
