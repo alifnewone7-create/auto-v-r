@@ -1298,6 +1298,9 @@ async def _resolve_and_join_chat(client: Client, chat_link: str) -> int:
     if "+" in chat_link or "joinchat" in chat_link:
         try:
             chat = await client.join_chat(chat_link)
+            # Jitter after join to avoid [420 Flood] on CheckChatInvite when
+            # multiple bots join the same private link in rapid succession.
+            await asyncio.sleep(random.uniform(1.0, 2.0))
             return chat.id
         except Exception:
             # Already a member -> just resolve it.
@@ -1307,6 +1310,8 @@ async def _resolve_and_join_chat(client: Client, chat_link: str) -> int:
     # Public username / link.
     try:
         await client.join_chat(link)
+        # Jitter to avoid flood on join.
+        await asyncio.sleep(random.uniform(1.0, 2.0))
     except Exception:
         pass  # already a member, or join not required
     chat = await client.get_chat(link)
@@ -1575,6 +1580,10 @@ async def view_post_all(chat_id: int, message_id: int, spread_seconds: float = 0
                 await client.invoke(
                     GetMessagesViews(peer=peer, id=[int(message_id)], increment=True)
                 )
+                # Extra jitter after each view to avoid Telegram's rate limit on
+                # GetMessagesViews (Flood: Too Many Requests). Even with semaphore
+                # gating, 25 in rapid succession can trigger [420 Flood].
+                await asyncio.sleep(random.uniform(3.0, 5.0))
                 return True
             except Exception as e:
                 print(f"[!] view failed (msg {message_id}): {e.__class__.__name__}: {e}")
@@ -1659,6 +1668,10 @@ async def view_post_scheduled(
                 await client.invoke(
                     GetMessagesViews(peer=peer, id=[int(message_id)], increment=True)
                 )
+                # Extra jitter after each view to avoid Telegram's rate limit on
+                # GetMessagesViews (Flood: Too Many Requests). Even with semaphore
+                # gating, 25 in rapid succession can trigger [420 Flood].
+                await asyncio.sleep(random.uniform(3.0, 5.0))
                 return True
             except Exception as e:
                 print(f"[!] view failed (msg {message_id}): {e.__class__.__name__}: {e}")
@@ -1883,6 +1896,9 @@ async def vote_on_poll(
     # starve live-stream WebRTC keepalives (bots getting kicked mid-stream).
     async with _get_action_sem():
         await client.vote_poll(resolved, int(message_id), int(option_index))
+        # Extra jitter after vote to avoid Telegram's rate limit on vote_poll
+        # (CheckChatInvite, SendVote, etc). Prevents [420 Flood].
+        await asyncio.sleep(random.uniform(3.0, 5.0))
 
 
 async def retract_poll_vote(
@@ -1909,6 +1925,9 @@ async def retract_poll_vote(
     # live-stream WebRTC keepalives.
     async with _get_action_sem():
         await client.invoke(SendVote(peer=peer, msg_id=int(message_id), options=[]))
+        # Extra jitter after retract to avoid Telegram's rate limit on SendVote.
+        # Prevents [420 Flood] on poll interactions.
+        await asyncio.sleep(random.uniform(3.0, 5.0))
 
 
 # ===========================================================================
@@ -2052,7 +2071,12 @@ async def react_post_scheduled(
         # Gate the reaction call so a pool-wide burst can't saturate the event
         # loop and starve live-stream WebRTC keepalives (bots getting kicked).
         async with sem:
-            return await _react_once(client, chat_id, message_id, emojis)
+            result = await _react_once(client, chat_id, message_id, emojis)
+            # Extra jitter after each reaction to avoid Telegram's rate limit on
+            # SendReaction. Even with semaphore gating, 25 in rapid succession can
+            # trigger [420 Flood]. 3-5s jitter keeps Telegram happy long-term.
+            await asyncio.sleep(random.uniform(3.0, 5.0))
+            return result
 
     probe_results = await asyncio.gather(
         *(_gated_react(c) for c in probe_clients),
