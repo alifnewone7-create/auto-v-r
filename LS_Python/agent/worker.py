@@ -990,6 +990,22 @@ async def process_one(job: dict) -> None:
         # and "socket.send() raised exception").
         await db.arun(db.finish_job, job["id"], result)
         print(f"[OK] job #{job['id']} {job['type']} -> {result.get('stage', 'done')}")
+    except userbot.FrozenAccountError as e:
+        # Telegram FROZE this account. It answers with [420 FROZEN_METHOD_INVALID]
+        # (which pyrogram prints as "[420 Flood]"), so without this branch the job
+        # would be rescheduled forever as a fake rate limit. Mark the account
+        # 'frozen' so it drops out of every pool and shows up on the website's
+        # "remove frozen" flow, then fail the job (a frozen account never recovers).
+        await db.arun(db.fail_job, job["id"], f"Account frozen by Telegram: {e}"[:500])
+        if job.get("account_id"):
+            await db.arun(
+                db.set_account_status, job["account_id"], "frozen", f"Account frozen by Telegram: {e}"[:500]
+            )
+            try:
+                await userbot._teardown_client(job["account_id"])
+            except Exception:
+                pass
+        print(f"[FROZEN] job #{job['id']} {job['type']}: account {job.get('account_id')} is frozen; marked and stopped retrying")
     except userbot.FloodWaitError as e:
         # Telegram rate limit that's too long to wait out inline. Don't fail the
         # job - put it back on the queue to run after the demanded wait (plus a
@@ -1004,6 +1020,21 @@ async def process_one(job: dict) -> None:
             print(f"[WAIT] job #{job['id']} {job['type']}: rate limited, retry in ~{int(delay)}s "
                   f"(attempt {job['attempts']}/{MAX_FLOOD_RETRIES})")
     except Exception as e:
+        # A frozen account can raise a raw pyrogram 420 here (not wrapped as
+        # FrozenAccountError) from view/react/vote. Detect it and retire the
+        # account instead of failing quietly and leaving it in the pool.
+        if userbot.is_frozen_error(e):
+            await db.arun(db.fail_job, job["id"], f"Account frozen by Telegram: {e}"[:500])
+            if job.get("account_id"):
+                await db.arun(
+                    db.set_account_status, job["account_id"], "frozen", f"Account frozen by Telegram: {e}"[:500]
+                )
+                try:
+                    await userbot._teardown_client(job["account_id"])
+                except Exception:
+                    pass
+            print(f"[FROZEN] job #{job['id']} {job['type']}: account {job.get('account_id')} is frozen; marked and stopped retrying")
+            return
         await db.arun(db.fail_job, job["id"], str(e))
         # Only auth/login jobs may mark the account as failed. A livestream
         # join/leave error keeps the account logged in so the website does not

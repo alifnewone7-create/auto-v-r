@@ -79,6 +79,35 @@ class FloodWaitError(UserbotError):
         super().__init__(f"Rate limited by Telegram on {what}, retry in {self.seconds}s.")
 
 
+class FrozenAccountError(UserbotError):
+    """
+    Raised when Telegram has FROZEN the account. Frozen accounts answer almost
+    every method with `[420 FROZEN_METHOD_INVALID]` — and because Telegram tags
+    it with code 420, pyrogram prints it as "[420 Flood]", so our flood handling
+    used to mistake it for a rate limit and reschedule the job FOREVER (the
+    endless "rate limited, retry in ~435s" loop). It is NOT a rate limit: the
+    account is dead and will never recover, so the worker must mark it 'frozen'
+    and stop retrying instead.
+    """
+
+    def __init__(self, detail: str = ""):
+        self.detail = detail
+        super().__init__(f"Account frozen by Telegram: {detail}".strip())
+
+
+def is_frozen_error(exc: Exception) -> bool:
+    """
+    True when an exception is Telegram's account-frozen signal. We match on the
+    text because pyrogram surfaces it as a generic 420 whose message contains
+    'FROZEN_METHOD_INVALID' / 'FROZEN'. Checked at several layers so a frozen
+    account is never mistaken for a flood wait.
+    """
+    if isinstance(exc, FrozenAccountError):
+        return True
+    text = f"{getattr(exc, 'ID', '')} {getattr(exc, 'MESSAGE', '')} {exc}".upper()
+    return "FROZEN_METHOD_INVALID" in text or "FROZEN_METHOD" in text or "_FROZEN" in text
+
+
 # In-memory pool of live userbots, keyed by account_id.
 # { account_id: {"client": Client, "calls": PyTgCalls} }
 _POOL: dict[int, dict] = {}
@@ -232,6 +261,11 @@ def _flood_seconds(exc: Exception) -> int | None:
     seconds; otherwise None. pyrofork exposes the seconds as `.value`; some
     ntgcalls wrappers surface it as `.x` or in the message text.
     """
+    # A frozen-account error is a 420 that pyrogram prints as "[420 Flood]".
+    # It is NOT a rate limit — never report a wait for it, or the worker would
+    # reschedule a dead account's job over and over.
+    if is_frozen_error(exc):
+        return None
     if isinstance(exc, FloodWait):
         return int(getattr(exc, "value", None) or getattr(exc, "x", 0) or 0) or None
     # ntgcalls sometimes re-raises floods as a generic error carrying the text.
@@ -2300,6 +2334,11 @@ async def _flood_retry(make_coro, *, what: str, attempts: int = 3, inline_max: i
         try:
             return await make_coro()
         except FloodWait as e:
+            # A frozen account's 420 can arrive here disguised as a FloodWait.
+            # Don't wait or reschedule it — surface it as frozen so the worker
+            # retires the account instead of looping forever.
+            if is_frozen_error(e):
+                raise FrozenAccountError(str(e))
             wait = int(getattr(e, "value", 0) or 0)
             if wait > inline_max or i == attempts - 1:
                 raise FloodWaitError(wait, what)
