@@ -1180,6 +1180,12 @@ async def join_livestream(
                     _ACTIVE_JOINS[account_id] = target_info
                     _LIVE_STATE[account_id] = "connected"
                     return
+                # A frozen account can never join — stop retrying immediately and
+                # surface it as frozen so the worker retires the account instead of
+                # looping on a fake flood wait.
+                if is_frozen_error(e):
+                    _forget_join(account_id)
+                    raise FrozenAccountError(str(e)) from e
                 secs = _flood_seconds(e)
                 if secs is not None:
                     # Too-long inline wait: hand back to the worker to retry

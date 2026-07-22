@@ -501,6 +501,16 @@ async def handle_join_livestream(job: dict) -> dict:
         )
         await db.arun(db.set_participant, target_id, account_id, "joined", None)
     except Exception as e:
+        # A frozen account fails the join with Telegram's [420 FROZEN_METHOD_INVALID]
+        # (printed as "[420 Flood]"). That is NOT a rate limit and will never
+        # succeed, so mark the account 'frozen' right here — it shows up on the
+        # website's "Remove frozen" flow and stops being pulled into streams. We
+        # re-raise a FrozenAccountError so process_one fails the job WITHOUT the
+        # endless flood-style reschedule.
+        if userbot.is_frozen_error(e):
+            await db.arun(db.set_participant, target_id, account_id, "failed", "Account frozen by Telegram")
+            await db.arun(db.recount_livestream, target_id)
+            raise userbot.FrozenAccountError(str(e)) from e
         await db.arun(db.set_participant, target_id, account_id, "failed", str(e)[:500])
         await db.arun(db.recount_livestream, target_id)
         raise
