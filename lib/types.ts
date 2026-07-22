@@ -13,6 +13,9 @@
 //  login_2fa      -> account has 2FA, agent needs the password
 //  logged_in      -> session string stored, userbot ready
 //  failed         -> something went wrong (see last_error)
+//  frozen         -> Telegram froze/banned/deactivated the account (dead, no use).
+//                    Detected by the `check_frozen` job; see last_error for the
+//                    exact reason. These are excluded from all action pools.
 export type AccountStatus =
   | "new"
   | "purchased"
@@ -25,6 +28,7 @@ export type AccountStatus =
   | "login_2fa"
   | "logged_in"
   | "failed"
+  | "frozen"
 
 export interface TelegramAccount {
   id: number
@@ -65,6 +69,7 @@ export type JobType =
   | "cast_vote" // make one userbot vote on a poll option
   | "retract_vote" // make one userbot remove its vote from a poll
   | "update_profile" // change an account's name / username / profile photo
+  | "check_frozen" // probe accounts and mark frozen/banned/logged-out ones
 
 export type JobStatus = "queued" | "processing" | "done" | "failed"
 

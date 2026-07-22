@@ -857,6 +857,93 @@ async def _run_delete_profile_photos(job: dict) -> dict:
         raise
 
 
+async def handle_check_frozen(job: dict) -> dict:
+    """
+    Probe accounts and mark the dead ones so they can be cleaned up from the
+    website. For each candidate we ask Telegram (cheaply) whether the account is
+    frozen / banned / logged-out and write the verdict back:
+
+      frozen / banned -> status 'frozen' (+ reason in last_error); excluded from
+                         every action pool from now on.
+      logged_out      -> status 'failed'  (needs re-login).
+      ok              -> stays 'logged_in', last_error cleared.
+      unknown         -> left untouched (transient error; don't punish a good one).
+
+    Payload:
+      {account_id: N}  -> check just that one account, OR
+      {}               -> check every logged_in / frozen account on this shard.
+    """
+    payload = job.get("payload") or {}
+    one_id = payload.get("account_id") or job.get("account_id")
+
+    if one_id:
+        rows = db.query(
+            """
+            SELECT id, api_id, api_hash, session_string
+            FROM telegram_accounts
+            WHERE id = %s AND api_id IS NOT NULL AND api_hash IS NOT NULL
+              AND session_string IS NOT NULL
+            """,
+            (int(one_id),),
+        )
+    else:
+        # Re-check both live and already-frozen accounts: a good one can get
+        # frozen, and (rarely) a frozen one can recover.
+        rows = db.query(
+            """
+            SELECT id, api_id, api_hash, session_string
+            FROM telegram_accounts
+            WHERE status IN ('logged_in', 'frozen')
+              AND api_id IS NOT NULL AND api_hash IS NOT NULL
+              AND session_string IS NOT NULL
+            """
+            + _SHARD_ACCOUNT_SQL,
+            _SHARD_ACCOUNT_PARAMS or None,
+        )
+
+    if not rows:
+        return {"stage": "checked", "checked": 0, "frozen": 0, "banned": 0, "logged_out": 0}
+
+    counts = {"ok": 0, "frozen": 0, "banned": 0, "logged_out": 0, "unknown": 0}
+
+    async def _check(acc: dict) -> None:
+        state, detail = await userbot.probe_account_health(
+            acc["id"], int(acc["api_id"]), acc["api_hash"], acc["session_string"]
+        )
+        counts[state] = counts.get(state, 0) + 1
+        if state in ("frozen", "banned"):
+            reason = "Account frozen by Telegram" if state == "frozen" else "Account banned/deactivated"
+            await db.arun(db.set_account_status, acc["id"], "frozen", f"{reason}: {detail}"[:500])
+            # Drop the dead client so it stops occupying a slot / spinning sockets.
+            try:
+                await userbot._teardown_client(acc["id"])
+            except Exception:
+                pass
+        elif state == "logged_out":
+            await db.arun(db.set_account_status, acc["id"], "failed", f"Session invalid: {detail}"[:500])
+        elif state == "ok":
+            await db.arun(db.set_account_status, acc["id"], "logged_in", None)
+
+    # Run in modest batches; probe_account_health already gates + jitters each
+    # call, so this just bounds how many are outstanding at once.
+    for i in range(0, len(rows), 50):
+        await asyncio.gather(*(_check(a) for a in rows[i : i + 50]))
+
+    print(
+        f"[OK] check_frozen: {len(rows)} checked -> "
+        f"{counts['frozen']} frozen, {counts['banned']} banned, "
+        f"{counts['logged_out']} logged-out, {counts['ok']} ok"
+    )
+    return {
+        "stage": "checked",
+        "checked": len(rows),
+        "frozen": counts["frozen"],
+        "banned": counts["banned"],
+        "logged_out": counts["logged_out"],
+        "ok": counts["ok"],
+    }
+
+
 HANDLERS = {
     "buy_tglion_batch": handle_buy_tglion_batch,
     "provision_tglion": handle_provision_tglion,
@@ -876,6 +963,7 @@ HANDLERS = {
     "react_post": handle_react_post,
     "update_profile": handle_update_profile,
     "delete_profile_photos": handle_delete_profile_photos,
+    "check_frozen": handle_check_frozen,
 }
 
 # Jobs that are part of the login / auth flow. ONLY these may flip an account

@@ -13,6 +13,7 @@ const MAP: Record<AccountStatus, { label: string; className: string }> = {
   login_2fa: { label: "Needs 2FA password", className: "bg-chart-2/20 text-chart-2 border-transparent" },
   logged_in: { label: "Ready", className: "bg-chart-3/20 text-chart-3 border-transparent" },
   failed: { label: "Failed", className: "bg-destructive/15 text-destructive border-transparent" },
+  frozen: { label: "Frozen", className: "bg-destructive/15 text-destructive border-transparent" },
 }
 
 export function StatusBadge({ status }: { status: AccountStatus }) {

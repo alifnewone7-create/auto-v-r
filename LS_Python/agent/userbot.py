@@ -604,6 +604,98 @@ def _attach_rejoin_handler(account_id: int, calls: PyTgCalls) -> None:
         print(f"[!] could not attach rejoin handler for account {account_id}: {e}")
 
 
+# Public username the frozen-probe resolves. Resolving a username goes through
+# contacts.resolveUsername, one of the methods Telegram blocks for frozen
+# accounts with [420 FROZEN_METHOD_INVALID] — so a healthy account resolves it
+# fine while a frozen one reveals itself. Override with AGENT_FROZEN_PROBE_PEER.
+FROZEN_PROBE_PEER = _os.environ.get("AGENT_FROZEN_PROBE_PEER", "telegram")
+
+
+async def probe_account_health(
+    account_id: int, api_id: int, api_hash: str, session_string: str
+) -> tuple[str, str]:
+    """
+    Cheaply classify one account's current standing with Telegram. Returns a
+    (state, detail) tuple where state is one of:
+
+      "ok"         - account is alive and unrestricted
+      "frozen"     - Telegram froze the account (FROZEN_METHOD_INVALID); dead
+      "banned"     - account deleted / deactivated / banned; dead
+      "logged_out" - session is no longer valid (needs re-login)
+      "unknown"    - could not determine (network / flood); caller leaves as-is
+
+    Frozen accounts are useless for views/reactions/votes/livestreams (every
+    action method returns FROZEN_METHOD_INVALID), so this is what powers the
+    website's "check & remove frozen accounts" maintenance flow. We reuse a warm
+    pooled client when available, and gate + jitter the probe so scanning a big
+    fleet doesn't itself trip a flood wait.
+    """
+    from pyrogram.errors import (
+        UserDeactivated,
+        UserDeactivatedBan,
+        AuthKeyUnregistered,
+        SessionRevoked,
+        SessionExpired,
+        Unauthorized,
+    )
+
+    def _classify(err: Exception) -> tuple[str, str] | None:
+        text = str(err).upper()
+        if "FROZEN" in text:
+            return ("frozen", str(err))
+        if "DEACTIVATED" in text or "USER_BANNED" in text or "USER_DEACTIVATED" in text:
+            return ("banned", str(err))
+        if (
+            "AUTH_KEY_UNREGISTERED" in text
+            or "SESSION_REVOKED" in text
+            or "SESSION_EXPIRED" in text
+            or "USER_DEACTIVATED_BAN" in text
+            or "UNAUTHORIZED" in text
+        ):
+            return ("logged_out", str(err))
+        return None
+
+    async with _get_action_sem():
+        # Small jitter so a fleet-wide scan spreads out instead of hammering
+        # Telegram with hundreds of resolves at once.
+        await asyncio.sleep(random.uniform(0.5, 2.0))
+        try:
+            entry = _POOL.get(account_id)
+            if entry is None:
+                entry = await _ensure_online(account_id, api_id, api_hash, session_string)
+            client: Client = entry["client"]
+
+            # 1) get_me() surfaces a dead/banned/logged-out session immediately.
+            try:
+                await client.get_me()
+            except (UserDeactivated, UserDeactivatedBan) as e:
+                return ("banned", str(e))
+            except (AuthKeyUnregistered, SessionRevoked, SessionExpired, Unauthorized) as e:
+                return ("logged_out", str(e))
+
+            # 2) Resolve a public username — a method frozen accounts cannot use.
+            #    A healthy account succeeds; a frozen one raises FROZEN_METHOD_INVALID.
+            try:
+                await client.resolve_peer(FROZEN_PROBE_PEER)
+            except Exception as e:
+                hit = _classify(e)
+                if hit:
+                    return hit
+                # Anything else here (e.g. a transient flood) is NOT proof the
+                # account is frozen, so treat the account as healthy: get_me
+                # already succeeded.
+                return ("ok", "")
+
+            return ("ok", "")
+        except Exception as e:
+            hit = _classify(e)
+            if hit:
+                return hit
+            # Could not tell — surface as unknown so the caller leaves the row
+            # untouched rather than wrongly marking a good account frozen.
+            return ("unknown", str(e))
+
+
 async def prewarm(accounts: list[dict]) -> int:
     """
     Connect every already-logged-in account up front and keep it in _POOL.

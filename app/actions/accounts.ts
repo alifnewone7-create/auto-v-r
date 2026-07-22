@@ -294,3 +294,40 @@ export async function deleteAccount(accountId: number) {
   revalidatePath("/")
   return { ok: true }
 }
+
+/**
+ * Queue a fleet-wide health probe. The Python agent's `check_frozen` job logs
+ * into each account, asks Telegram whether it's frozen/banned/logged-out, and
+ * flips the dead ones to status 'frozen' (or 'failed' for logged-out). Progress
+ * shows up as the account badges change on the dashboard.
+ */
+export async function checkFrozenAccounts() {
+  await requireAuth()
+  // Avoid piling up duplicate scans if one is already pending.
+  const pending = await queryOne<{ id: number }>(
+    `SELECT id FROM jobs WHERE type = 'check_frozen' AND status IN ('queued','processing') LIMIT 1`,
+  )
+  if (pending) return { ok: true, alreadyRunning: true }
+
+  await enqueueJob("check_frozen", null, {})
+  revalidatePath("/")
+  return { ok: true }
+}
+
+/**
+ * Permanently delete every account Telegram has frozen (status = 'frozen').
+ * These accounts can no longer perform any action, so removing them keeps the
+ * fleet clean. Returns how many were removed.
+ */
+export async function deleteFrozenAccounts() {
+  await requireAuth()
+  const frozen = await query<{ id: number }>(`SELECT id FROM telegram_accounts WHERE status = 'frozen'`)
+  if (frozen.length === 0) return { ok: true, deleted: 0 }
+
+  const ids = frozen.map((r) => r.id)
+  await query(`DELETE FROM livestream_participants WHERE account_id = ANY($1::int[])`, [ids])
+  await query(`DELETE FROM jobs WHERE account_id = ANY($1::int[])`, [ids])
+  await query(`DELETE FROM telegram_accounts WHERE id = ANY($1::int[])`, [ids])
+  revalidatePath("/")
+  return { ok: true, deleted: ids.length }
+}
