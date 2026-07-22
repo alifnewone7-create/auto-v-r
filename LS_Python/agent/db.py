@@ -85,7 +85,10 @@ raise_fd_limit()
 # copy PER shard (tagging payload.shard_index), and each shard runs its copy
 # against its own local bots. The originating code needs to know nothing about
 # shards, so the website stays completely shard-agnostic.
-FANOUT_JOB_TYPES = ("view_post", "react_post", "leave_livestream_all")
+# check_frozen is fanned out too: a global health scan must reach EVERY shard's
+# bots, not just the one shard that happens to claim the job (which would only
+# probe ~1/N of the fleet and report the rest as untouched).
+FANOUT_JOB_TYPES = ("view_post", "react_post", "leave_livestream_all", "check_frozen")
 
 # Pool size. Kept modest because Neon (via the -pooler endpoint) is happiest with
 # a bounded number of server connections; the agent reuses these warm connections

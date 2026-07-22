@@ -887,13 +887,15 @@ async def handle_check_frozen(job: dict) -> dict:
             (int(one_id),),
         )
     else:
-        # Re-check both live and already-frozen accounts: a good one can get
-        # frozen, and (rarely) a frozen one can recover.
+        # Re-check live, already-frozen, AND failed accounts that still hold a
+        # session: a good one can get frozen, a frozen one can (rarely) recover,
+        # and some accounts that are really frozen were previously mislabelled
+        # 'failed' by the old flood loop — probing reclassifies them correctly.
         rows = db.query(
             """
             SELECT id, api_id, api_hash, session_string
             FROM telegram_accounts
-            WHERE status IN ('logged_in', 'frozen')
+            WHERE status IN ('logged_in', 'frozen', 'failed')
               AND api_id IS NOT NULL AND api_hash IS NOT NULL
               AND session_string IS NOT NULL
             """
