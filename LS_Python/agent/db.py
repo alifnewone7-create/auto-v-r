@@ -657,6 +657,49 @@ def clear_account_cooldown(account_id: int) -> None:
     )
 
 
+def reserve_paced_slot(gap_seconds: float) -> float:
+    """
+    Reserve the next GLOBAL action-start slot, shared across every shard.
+
+    All worker shards call this before starting a per-account action. It bumps a
+    single shared timestamp (agent_pacing.next_start_at) forward by `gap_seconds`
+    in ONE atomic statement and returns how many seconds THIS caller must wait
+    before it may start. Because the row is locked for the update, two shards can
+    never grab the same slot — so across the whole fleet the accounts start
+    strictly one-by-one, `gap_seconds` apart, no matter how many shards run.
+
+    Returns the wait in seconds (0 if the gate was idle / in the past).
+    """
+    gap = max(0.0, float(gap_seconds))
+    rows = query(
+        """
+        WITH cur AS (
+            SELECT GREATEST(next_start_at, now()) AS slot
+            FROM agent_pacing
+            WHERE id = 1
+            FOR UPDATE
+        )
+        UPDATE agent_pacing p
+        SET next_start_at = cur.slot + (%s || ' seconds')::interval
+        FROM cur
+        WHERE p.id = 1
+        RETURNING EXTRACT(EPOCH FROM (cur.slot - now())) AS wait_seconds
+        """,
+        (gap,),
+    )
+    if not rows:
+        return 0.0
+    wait = rows[0].get("wait_seconds")
+    try:
+        wait = float(wait)
+    except (TypeError, ValueError):
+        return 0.0
+    # Never wait absurdly long: if the queued backlog pushed the slot very far
+    # out, cap the single wait so a shard can't appear frozen. The gate still
+    # advances, so ordering is preserved.
+    return max(0.0, min(wait, gap * 50 if gap > 0 else 60.0))
+
+
 # ---------------------------------------------------------------------------
 # Livestream helpers
 # ---------------------------------------------------------------------------

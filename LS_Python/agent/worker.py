@@ -1043,14 +1043,25 @@ async def paced_dispatcher() -> None:
     while True:
         job = await q.get()
         try:
+            # Reserve the next GLOBAL start slot before launching. This is a
+            # SHARED DB gate, so even with 7 shards each running their own
+            # dispatcher, only ONE account across the WHOLE fleet starts per gap —
+            # true one-by-one, not "one per shard at the same instant" (which was
+            # why it still looked like a burst). The gap is randomized so the
+            # fleet doesn't tick like a metronome.
+            gap = random.uniform(ACTION_DISPATCH_GAP_MIN, ACTION_DISPATCH_GAP_MAX)
+            try:
+                wait = await db.arun(db.reserve_paced_slot, gap)
+            except Exception as e:
+                # If the gate is unreachable, fall back to a local gap so we still
+                # pace (just per-shard) instead of bursting.
+                print(f"[!] paced gate unavailable ({e}); using local gap")
+                wait = gap
+            if wait and wait > 0:
+                await asyncio.sleep(wait)
             task = asyncio.create_task(process_one(job))
             _paced_tasks.add(task)
             task.add_done_callback(_paced_tasks.discard)
-            # Gap before the NEXT account starts. Random so 250 accounts don't
-            # tick like a metronome. Skewed by the account id so different
-            # accounts contribute slightly different gaps.
-            gap = random.uniform(ACTION_DISPATCH_GAP_MIN, ACTION_DISPATCH_GAP_MAX)
-            await asyncio.sleep(gap)
         except Exception as e:
             print(f"[!] paced dispatch error: {e}")
         finally:
