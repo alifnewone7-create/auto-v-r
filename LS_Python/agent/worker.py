@@ -82,9 +82,16 @@ DEFAULT_API_ID = os.environ.get("TGLION_API_ID", "").strip() or _BUILTIN_API_ID
 DEFAULT_API_HASH = os.environ.get("TGLION_API_HASH", "").strip() or _BUILTIN_API_HASH
 
 POLL_SECONDS = float(os.environ.get("AGENT_POLL_SECONDS", "3"))
-# How many queued jobs to claim and run concurrently per loop. Raise this if you
-# have many userbots (e.g. 100) so they all join in one parallel batch.
+# How many queued jobs to claim per loop.
 BATCH_SIZE = int(os.environ.get("AGENT_BATCH_SIZE", "100"))
+# Per-account ACTION jobs (livestream join, channel join, vote, ...) are NOT
+# fired all at once. They go through a paced dispatcher that starts them ONE AT
+# A TIME, waiting a random gap between each start so the accounts act one-by-one
+# instead of in a single burst (the behaviour that gets a fleet flood-banned).
+# Each still runs as its own task, so one account's flood wait only delays the
+# NEXT start, never blocks the others. Tune the gap here (seconds).
+ACTION_DISPATCH_GAP_MIN = float(os.environ.get("AGENT_ACTION_DISPATCH_GAP_MIN", "3"))
+ACTION_DISPATCH_GAP_MAX = float(os.environ.get("AGENT_ACTION_DISPATCH_GAP_MAX", "8"))
 # Threads for off-loop DB work (asyncio.to_thread). Enough to absorb a burst of
 # finishing jobs; they mostly wait on the DB connection pool so this is cheap.
 DB_THREAD_WORKERS = max(8, int(os.environ.get("AGENT_DB_THREAD_WORKERS", "24")))
@@ -1003,6 +1010,52 @@ PACED_JOB_TYPES = {
     "detect_poll",
 }
 
+# Queue of per-account action jobs waiting to be started one-by-one, and the set
+# that keeps their running tasks alive. Created in main() so they bind to the
+# running loop.
+_paced_queue: "asyncio.Queue[dict] | None" = None
+_paced_tasks: set = set()
+
+
+def _get_paced_queue() -> "asyncio.Queue[dict]":
+    global _paced_queue
+    if _paced_queue is None:
+        _paced_queue = asyncio.Queue()
+    return _paced_queue
+
+
+async def paced_dispatcher() -> None:
+    """
+    Start per-account action jobs ONE AT A TIME.
+
+    Pulls a job off the paced queue, launches it as its own background task, then
+    sleeps a random gap BEFORE starting the next one. This is what makes the
+    accounts act one-by-one with a real gap between them instead of the whole
+    batch firing in the same instant.
+
+    Crucially, it only gaps the STARTS — each job runs concurrently once started,
+    so a slow account (or one sitting on a flood wait) never blocks the queue; it
+    just means the next account starts a few seconds later. A flooded account's
+    own job reschedules itself and its DB cooldown keeps it from being re-claimed
+    until the wait passes, all without stalling the others.
+    """
+    q = _get_paced_queue()
+    while True:
+        job = await q.get()
+        try:
+            task = asyncio.create_task(process_one(job))
+            _paced_tasks.add(task)
+            task.add_done_callback(_paced_tasks.discard)
+            # Gap before the NEXT account starts. Random so 250 accounts don't
+            # tick like a metronome. Skewed by the account id so different
+            # accounts contribute slightly different gaps.
+            gap = random.uniform(ACTION_DISPATCH_GAP_MIN, ACTION_DISPATCH_GAP_MAX)
+            await asyncio.sleep(gap)
+        except Exception as e:
+            print(f"[!] paced dispatch error: {e}")
+        finally:
+            q.task_done()
+
 
 async def process_one(job: dict) -> None:
     handler = HANDLERS.get(job["type"])
@@ -1413,6 +1466,12 @@ async def main() -> None:
     background.add(warmup_task)
     warmup_task.add_done_callback(background.discard)
 
+    # Start the paced dispatcher: it drains per-account action jobs one-by-one
+    # with a gap between starts, so accounts don't all act in the same instant.
+    dispatcher_task = asyncio.create_task(paced_dispatcher())
+    background.add(dispatcher_task)
+    dispatcher_task.add_done_callback(background.discard)
+
     last_beat = 0.0
     last_view_poll = 0.0
     last_purge = 0.0
@@ -1504,16 +1563,24 @@ async def main() -> None:
             await asyncio.sleep(POLL_SECONDS)
             continue
 
-        print(f"[>] Got {len(jobs)} job(s); dispatching concurrently.")
-        # Fire each job as its own background task so the loop keeps polling and
-        # heartbeating. This lets long, time-spread reaction jobs run in parallel
-        # with views (and everything else) - so on a channel with BOTH enabled,
-        # views and reactions trickle in together instead of one burst then the
-        # other. Jobs are already claimed in the DB, so they won't be re-run.
-        for job in jobs:
+        paced_q = _get_paced_queue()
+        immediate = [j for j in jobs if not (j.get("account_id") and j["type"] in PACED_JOB_TYPES)]
+        paced = [j for j in jobs if j.get("account_id") and j["type"] in PACED_JOB_TYPES]
+        print(
+            f"[>] Got {len(jobs)} job(s); {len(immediate)} immediate, "
+            f"{len(paced)} paced one-by-one."
+        )
+        # Non per-account jobs (views, reactions fan-out, auth, buy, leave-all,
+        # etc.) fire immediately as their own tasks so the loop keeps polling and
+        # heartbeating. Jobs are already claimed in the DB, so they won't be re-run.
+        for job in immediate:
             task = asyncio.create_task(process_one(job))
             background.add(task)
             task.add_done_callback(background.discard)
+        # Per-account action jobs go to the paced dispatcher, which starts them
+        # one at a time with a gap so the accounts act one-by-one, not in a burst.
+        for job in paced:
+            paced_q.put_nowait(job)
 
 
 if __name__ == "__main__":
