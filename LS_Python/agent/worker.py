@@ -990,17 +990,48 @@ AUTH_JOB_TYPES = {
 }
 
 
+# Per-account action jobs that should be PACED: each of these makes a real
+# Telegram request for a single account, so we run them behind that account's
+# lock (strictly one-by-one for the account) and rest the account for its
+# personal delay window afterwards. Login/auth/profile jobs are excluded — they
+# are one-off setup steps, not repeated engagement actions.
+PACED_JOB_TYPES = {
+    "join_livestream",
+    "join_channel",
+    "cast_vote",
+    "retract_vote",
+    "detect_poll",
+}
+
+
 async def process_one(job: dict) -> None:
     handler = HANDLERS.get(job["type"])
     if not handler:
         await db.arun(db.fail_job, job["id"], f"Unknown job type: {job['type']}")
         return
+
+    acct = job.get("account_id")
+    paced = bool(acct) and job["type"] in PACED_JOB_TYPES
+
     try:
-        result = await handler(job)
+        if paced:
+            # Serialize this account's actions and honor its personal pacing
+            # window so it never fires back-to-back. Different accounts still run
+            # fully in parallel — the lock is per account.
+            async with userbot._get_account_lock(acct):
+                await userbot.account_gate(acct)
+                result = await handler(job)
+                userbot.note_account_paced(acct)
+        else:
+            result = await handler(job)
         # Run the result write OFF the event loop so a burst of finishing jobs
         # never freezes pytgcalls' sockets (the old cause of the agent stalling
         # and "socket.send() raised exception").
         await db.arun(db.finish_job, job["id"], result)
+        # A clean run means the account is healthy again — lift any leftover
+        # cooldown so it isn't needlessly skipped next poll.
+        if paced:
+            await db.arun(db.note_account_action, acct, 0.0)
         print(f"[OK] job #{job['id']} {job['type']} -> {result.get('stage', 'done')}")
     except userbot.FrozenAccountError as e:
         # Telegram FROZE this account. It answers with [420 FROZEN_METHOD_INVALID]
@@ -1029,8 +1060,20 @@ async def process_one(job: dict) -> None:
         else:
             delay = e.seconds + random.uniform(3.0, 10.0)
             await db.arun(db.reschedule_job, job["id"], delay, f"Rate limited, retrying in ~{int(delay)}s")
+            # Put the WHOLE account to sleep for the flood duration, not just this
+            # job. Telegram's flood wait is account-wide, so any other queued job
+            # for this account must also hold off — claim_next_jobs skips accounts
+            # whose cooldown_until is in the future. Other accounts are untouched.
+            if job.get("account_id"):
+                await db.arun(
+                    db.set_account_cooldown,
+                    job["account_id"],
+                    delay,
+                    f"Telegram flood wait ~{int(e.seconds)}s",
+                    True,
+                )
             print(f"[WAIT] job #{job['id']} {job['type']}: rate limited, retry in ~{int(delay)}s "
-                  f"(attempt {job['attempts']}/{MAX_FLOOD_RETRIES})")
+                  f"(account {job.get('account_id')} paused; attempt {job['attempts']}/{MAX_FLOOD_RETRIES})")
     except Exception as e:
         # A frozen account can raise a raw pyrogram 420 here (not wrapped as
         # FrozenAccountError) from view/react/vote. Detect it and retire the

@@ -255,6 +255,88 @@ def _get_action_sem() -> asyncio.Semaphore:
     return _action_sem
 
 
+# ---------------------------------------------------------------------------
+# Per-account scheduler: give every account its OWN pacing so they never all
+# fire at once, each waits between its own requests, and one account's flood
+# wait can't touch the others.
+#
+# Because the fleet is sharded (one account is always handled by exactly one
+# process, account_id %% N == shard_index), this in-memory state is authoritative
+# for the accounts this process owns — no cross-process races.
+#
+# Two layers work together:
+#   * This in-memory pacing/serialization for the SHORT per-account delay between
+#     actions (fast, no DB write per action).
+#   * The DB cooldown_until column (set on real Telegram flood waits) for the
+#     DURABLE, cross-poll isolation that stops the queue from handing a
+#     flooded account new jobs. See db.set_account_cooldown / claim_next_jobs.
+# ---------------------------------------------------------------------------
+
+# The min/max seconds an account rests between its own requests. Each account
+# gets a STABLE personal range inside these bounds (derived from its id), so
+# account #101 might always pace 4-9s while #102 paces 8-20s — 250 accounts stop
+# looking like one script running on a timer. Tunable via env.
+ACCOUNT_DELAY_MIN = float(_os.environ.get("AGENT_ACCOUNT_DELAY_MIN", "3"))
+ACCOUNT_DELAY_MAX = float(_os.environ.get("AGENT_ACCOUNT_DELAY_MAX", "20"))
+
+# Earliest monotonic time each account may make its next request (short pacing).
+_ACCOUNT_NEXT_FREE: dict[int, float] = {}
+# One asyncio.Lock per account so its actions run strictly one-by-one within
+# this process (created lazily in the loop).
+_ACCOUNT_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+def _account_delay_profile(account_id: int) -> tuple[float, float]:
+    """
+    A STABLE (lo, hi) pacing window for one account, derived deterministically
+    from its id — same account always gets the same personality, but different
+    accounts differ. This is what breaks the "all 250 behave identically"
+    fingerprint that gets fleets flagged.
+    """
+    rng = random.Random(account_id * 2654435761 & 0xFFFFFFFF)
+    span = max(0.0, ACCOUNT_DELAY_MAX - ACCOUNT_DELAY_MIN)
+    lo = ACCOUNT_DELAY_MIN + rng.uniform(0.0, span * 0.5)
+    hi = lo + rng.uniform(2.0, max(2.0, span * 0.6))
+    return (lo, hi)
+
+
+def _account_pacing_delay(account_id: int) -> float:
+    """Pick one delay from this account's personal window (fresh each call)."""
+    lo, hi = _account_delay_profile(account_id)
+    return random.uniform(lo, hi)
+
+
+def _get_account_lock(account_id: int) -> asyncio.Lock:
+    lock = _ACCOUNT_LOCKS.get(account_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ACCOUNT_LOCKS[account_id] = lock
+    return lock
+
+
+async def account_gate(account_id: int) -> None:
+    """
+    Wait until this account is allowed to make its next request. Enforces the
+    account's own short pacing window ONLY (a few seconds). Long Telegram flood
+    waits are NOT slept on here — they are handled durably by rescheduling the
+    job + the DB cooldown, so we never hold a task hostage for minutes.
+    """
+    now = time.monotonic()
+    ready_at = _ACCOUNT_NEXT_FREE.get(account_id, 0.0)
+    if ready_at > now:
+        await asyncio.sleep(min(ready_at - now, ACCOUNT_DELAY_MAX * 2))
+
+
+def note_account_paced(account_id: int) -> None:
+    """Start this account's short pacing window after it just acted."""
+    _ACCOUNT_NEXT_FREE[account_id] = time.monotonic() + _account_pacing_delay(account_id)
+
+
+def account_in_pacing_cooldown(account_id: int) -> bool:
+    """True if the account is still inside its short in-memory pacing window."""
+    return _ACCOUNT_NEXT_FREE.get(account_id, 0.0) > time.monotonic()
+
+
 def _flood_seconds(exc: Exception) -> int | None:
     """
     If `exc` is (or wraps) a Telegram FloodWait, return the required wait in
@@ -1694,14 +1776,14 @@ async def view_post_all(chat_id: int, message_id: int, spread_seconds: float = 0
     real viewers arriving one after another instead of a single instant spike.
     Returns how many userbots successfully registered a view.
     """
-    clients = [entry["client"] for entry in _POOL.values()]
-    if not clients:
+    pool = [(acc_id, entry["client"]) for acc_id, entry in _POOL.items()]
+    if not pool:
         return 0
 
-    offsets = _natural_arrival_offsets(len(clients), spread_seconds)
+    offsets = _natural_arrival_offsets(len(pool), spread_seconds)
     sem = _get_action_sem()
 
-    async def _one(client: Client, delay: float) -> bool:
+    async def _one(acc_id: int, client: Client, delay: float) -> bool:
         if delay > 0:
             await asyncio.sleep(delay)
         # Gate the actual MTProto work so a big pool can't flood the event loop
@@ -1712,16 +1794,16 @@ async def view_post_all(chat_id: int, message_id: int, spread_seconds: float = 0
                 await client.invoke(
                     GetMessagesViews(peer=peer, id=[int(message_id)], increment=True)
                 )
-                # Extra jitter after each view to avoid Telegram's rate limit on
-                # GetMessagesViews (Flood: Too Many Requests). Even with semaphore
-                # gating, 25 in rapid succession can trigger [420 Flood].
-                await asyncio.sleep(random.uniform(3.0, 5.0))
+                # Rest this account for ITS OWN personal delay window (not a shared
+                # fixed value) so 250 accounts don't all pace identically — the
+                # per-account "personality" that avoids fleet-wide fingerprinting.
+                await asyncio.sleep(_account_pacing_delay(acc_id))
                 return True
             except Exception as e:
                 print(f"[!] view failed (msg {message_id}): {e.__class__.__name__}: {e}")
                 return False
 
-    results = await asyncio.gather(*(_one(c, d) for c, d in zip(clients, offsets)))
+    results = await asyncio.gather(*(_one(a, c, d) for (a, c), d in zip(pool, offsets)))
     return sum(1 for ok in results if ok)
 
 
@@ -1754,8 +1836,8 @@ async def view_post_scheduled(
 
     Returns how many userbots successfully registered a view.
     """
-    clients = [entry["client"] for entry in _POOL.values()]
-    if not clients:
+    pool = [(acc_id, entry["client"]) for acc_id, entry in _POOL.items()]
+    if not pool:
         return 0
 
     # Pick a "low to high" amount of userbots for this specific post.
@@ -1781,15 +1863,15 @@ async def view_post_scheduled(
 
         # Cap at this shard's local pool (shares are only ever short, never over,
         # which keeps the global total <= the requested "high").
-        my_count = min(my_count, len(clients))
+        my_count = min(my_count, len(pool))
         if my_count <= 0:
             return 0
-        clients = random.sample(clients, my_count)
+        pool = random.sample(pool, my_count)
 
-    offsets = _natural_arrival_offsets(len(clients), spread_seconds)
+    offsets = _natural_arrival_offsets(len(pool), spread_seconds)
     sem = _get_action_sem()
 
-    async def _one(client: Client, delay: float) -> bool:
+    async def _one(acc_id: int, client: Client, delay: float) -> bool:
         if delay > 0:
             await asyncio.sleep(delay)
         # Gate the actual MTProto work so a big pool can't flood the event loop
@@ -1800,16 +1882,15 @@ async def view_post_scheduled(
                 await client.invoke(
                     GetMessagesViews(peer=peer, id=[int(message_id)], increment=True)
                 )
-                # Extra jitter after each view to avoid Telegram's rate limit on
-                # GetMessagesViews (Flood: Too Many Requests). Even with semaphore
-                # gating, 25 in rapid succession can trigger [420 Flood].
-                await asyncio.sleep(random.uniform(3.0, 5.0))
+                # Rest this account for ITS OWN personal delay window so the fleet
+                # doesn't pace in lockstep (per-account anti-fingerprint pacing).
+                await asyncio.sleep(_account_pacing_delay(acc_id))
                 return True
             except Exception as e:
                 print(f"[!] view failed (msg {message_id}): {e.__class__.__name__}: {e}")
                 return False
 
-    results = await asyncio.gather(*(_one(c, d) for c, d in zip(clients, offsets)))
+    results = await asyncio.gather(*(_one(a, c, d) for (a, c), d in zip(pool, offsets)))
     return sum(1 for ok in results if ok)
 
 
@@ -2028,9 +2109,10 @@ async def vote_on_poll(
     # starve live-stream WebRTC keepalives (bots getting kicked mid-stream).
     async with _get_action_sem():
         await client.vote_poll(resolved, int(message_id), int(option_index))
-        # Extra jitter after vote to avoid Telegram's rate limit on vote_poll
-        # (CheckChatInvite, SendVote, etc). Prevents [420 Flood].
-        await asyncio.sleep(random.uniform(3.0, 5.0))
+        # Rest THIS account for its own personal delay window after voting so the
+        # fleet doesn't vote in lockstep and to stay under vote_poll's rate limit
+        # (CheckChatInvite, SendVote). Per-account pacing, not a shared fixed value.
+        await asyncio.sleep(_account_pacing_delay(account_id))
 
 
 async def retract_poll_vote(
@@ -2057,9 +2139,10 @@ async def retract_poll_vote(
     # live-stream WebRTC keepalives.
     async with _get_action_sem():
         await client.invoke(SendVote(peer=peer, msg_id=int(message_id), options=[]))
-        # Extra jitter after retract to avoid Telegram's rate limit on SendVote.
-        # Prevents [420 Flood] on poll interactions.
-        await asyncio.sleep(random.uniform(3.0, 5.0))
+        # Rest THIS account for its own personal delay window after retracting so
+        # the fleet doesn't act in lockstep and to stay under SendVote's rate
+        # limit. Per-account pacing, not a shared fixed value.
+        await asyncio.sleep(_account_pacing_delay(account_id))
 
 
 # ===========================================================================
@@ -2156,8 +2239,8 @@ async def react_post_scheduled(
     Returns how many userbots successfully reacted (emojis the channel rejects
     are skipped, so the count can be lower than the number chosen).
     """
-    clients = [entry["client"] for entry in _POOL.values()]
-    if not clients or not emojis:
+    pool = [(acc_id, entry["client"]) for acc_id, entry in _POOL.items()]
+    if not pool or not emojis:
         return 0
 
     # Pick a "below to high" amount of userbots for this specific post.
@@ -2183,10 +2266,10 @@ async def react_post_scheduled(
 
         # Cap at this shard's local pool (shares are only ever short, never over,
         # which keeps the global total <= the requested "high").
-        my_count = min(my_count, len(clients))
+        my_count = min(my_count, len(pool))
         if my_count <= 0:
             return 0
-        clients = random.sample(clients, my_count)
+        pool = random.sample(pool, my_count)
 
     # ---- Probe phase -------------------------------------------------------
     # Before firing at the whole pool, let a couple of userbots test the post.
@@ -2194,24 +2277,23 @@ async def react_post_scheduled(
     # permission, deleted post, private channel, ...) the probes come back
     # "blocked" and we skip the rest of the pool quietly - no crash, no wasted
     # calls hammering a post that will reject everyone.
-    probe_n = min(2, len(clients))
-    probe_clients = clients[:probe_n]
-    rest_clients = clients[probe_n:]
+    probe_n = min(2, len(pool))
+    probe_pool = pool[:probe_n]
+    rest_pool = pool[probe_n:]
     sem = _get_action_sem()
 
-    async def _gated_react(client: Client) -> str:
+    async def _gated_react(acc_id: int, client: Client) -> str:
         # Gate the reaction call so a pool-wide burst can't saturate the event
         # loop and starve live-stream WebRTC keepalives (bots getting kicked).
         async with sem:
             result = await _react_once(client, chat_id, message_id, emojis)
-            # Extra jitter after each reaction to avoid Telegram's rate limit on
-            # SendReaction. Even with semaphore gating, 25 in rapid succession can
-            # trigger [420 Flood]. 3-5s jitter keeps Telegram happy long-term.
-            await asyncio.sleep(random.uniform(3.0, 5.0))
+            # Rest this account for ITS OWN personal delay window so the fleet
+            # doesn't react in lockstep (per-account anti-fingerprint pacing).
+            await asyncio.sleep(_account_pacing_delay(acc_id))
             return result
 
     probe_results = await asyncio.gather(
-        *(_gated_react(c) for c in probe_clients),
+        *(_gated_react(a, c) for a, c in probe_pool),
         return_exceptions=True,
     )
     success = sum(1 for r in probe_results if r == "ok")
@@ -2222,27 +2304,27 @@ async def react_post_scheduled(
     if probe_n > 0 and success == 0 and blocked == probe_n:
         print(
             f"[react] skipping post {chat_id}/{message_id}: reactions not allowed "
-            f"(all {probe_n} probe userbot(s) blocked); remaining {len(rest_clients)} skipped"
+            f"(all {probe_n} probe userbot(s) blocked); remaining {len(rest_pool)} skipped"
         )
         return 0
 
-    if not rest_clients:
+    if not rest_pool:
         return success
 
     # ---- Fan out to the rest of the pool -----------------------------------
     # Front-loaded, uneven arrival times inside the window: a burst of early
     # reactions right after the post, then a thinning tail - just like real users.
-    offsets = _natural_arrival_offsets(len(rest_clients), window_seconds)
+    offsets = _natural_arrival_offsets(len(rest_pool), window_seconds)
 
-    async def _scheduled(client: Client, delay: float) -> str:
+    async def _scheduled(acc_id: int, client: Client, delay: float) -> str:
         if delay > 0:
             await asyncio.sleep(delay)
-        return await _gated_react(client)
+        return await _gated_react(acc_id, client)
 
     # return_exceptions=True: even an unexpected error on one userbot can never
     # bubble up and take down the job / worker.
     results = await asyncio.gather(
-        *(_scheduled(c, d) for c, d in zip(rest_clients, offsets)),
+        *(_scheduled(a, c, d) for (a, c), d in zip(rest_pool, offsets)),
         return_exceptions=True,
     )
     return success + sum(1 for r in results if r == "ok")

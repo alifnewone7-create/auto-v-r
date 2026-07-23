@@ -288,10 +288,28 @@ def claim_next_jobs(
                           AND payload ? 'shard_index'
                           AND (payload->>'shard_index')::int = %(si)s
                         )
-                        -- per-account job for an account this shard owns
+                        -- per-account job for an account this shard owns.
+                        -- Skip it while that account is cooling down (a Telegram
+                        -- flood wait or a per-account pacing delay): the job stays
+                        -- queued and is picked up on a later poll once the cooldown
+                        -- passes. This is what isolates one account's flood wait so
+                        -- it never blocks the other accounts. We also refuse to
+                        -- claim a second job for an account that already has one in
+                        -- flight, so each account runs its jobs strictly one by one.
                         OR (
                           account_id IS NOT NULL
                           AND (account_id %% %(sc)s) = %(si)s
+                          AND NOT EXISTS (
+                            SELECT 1 FROM telegram_accounts a
+                            WHERE a.id = jobs.account_id
+                              AND a.cooldown_until IS NOT NULL
+                              AND a.cooldown_until > now()
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1 FROM jobs j2
+                            WHERE j2.account_id = jobs.account_id
+                              AND j2.status = 'processing'
+                          )
                         )
                         -- misc no-account, non-fanout job -> shard 0 handles it
                         OR (
@@ -561,6 +579,82 @@ def update_account(account_id: int, **fields: Any) -> None:
 
 def set_account_status(account_id: int, status: str, error: str | None = None) -> None:
     update_account(account_id, status=status, last_error=error)
+
+
+def set_account_cooldown(
+    account_id: int,
+    seconds: float,
+    reason: str | None = None,
+    is_flood: bool = False,
+) -> None:
+    """
+    Put ONE account to sleep for `seconds`. While cooling down, claim_next_jobs
+    will not hand this account any new per-account job, so a flood wait (or a
+    deliberate pacing delay) on one account never stalls the other ~250.
+
+    is_flood=True also records flood_until separately so the website can show
+    "flood wait: 312s left" distinctly from an ordinary short pacing delay.
+    Never shortens an existing, longer cooldown (GREATEST), so a big flood wait
+    can't be wiped out by a tiny pacing delay that lands right after it.
+    """
+    secs = max(0.0, float(seconds))
+    query(
+        """
+        UPDATE telegram_accounts
+        SET cooldown_until = GREATEST(
+                COALESCE(cooldown_until, now()),
+                now() + (%s || ' seconds')::interval
+            ),
+            flood_until = CASE
+                WHEN %s THEN GREATEST(
+                    COALESCE(flood_until, now()),
+                    now() + (%s || ' seconds')::interval
+                )
+                ELSE flood_until
+            END,
+            last_error = COALESCE(%s, last_error),
+            last_action_at = now(),
+            updated_at = now()
+        WHERE id = %s
+        """,
+        (secs, is_flood, secs, reason, account_id),
+    )
+
+
+def note_account_action(account_id: int, cooldown_seconds: float = 0.0) -> None:
+    """
+    Record that an account just made a Telegram request, and optionally start a
+    short pacing cooldown before its next per-account job. Called after every
+    successful per-account action so the fleet self-paces.
+    """
+    secs = max(0.0, float(cooldown_seconds))
+    if secs > 0:
+        query(
+            """
+            UPDATE telegram_accounts
+            SET last_action_at = now(),
+                cooldown_until = GREATEST(
+                    COALESCE(cooldown_until, now()),
+                    now() + (%s || ' seconds')::interval
+                ),
+                updated_at = now()
+            WHERE id = %s
+            """,
+            (secs, account_id),
+        )
+    else:
+        query(
+            "UPDATE telegram_accounts SET last_action_at = now(), updated_at = now() WHERE id = %s",
+            (account_id,),
+        )
+
+
+def clear_account_cooldown(account_id: int) -> None:
+    """Lift any cooldown/flood wait on an account (e.g. once it succeeds again)."""
+    query(
+        "UPDATE telegram_accounts SET cooldown_until = NULL, flood_until = NULL, updated_at = now() WHERE id = %s",
+        (account_id,),
+    )
 
 
 # ---------------------------------------------------------------------------
