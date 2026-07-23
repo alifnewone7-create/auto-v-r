@@ -337,6 +337,57 @@ def account_in_pacing_cooldown(account_id: int) -> bool:
     return _ACCOUNT_NEXT_FREE.get(account_id, 0.0) > time.monotonic()
 
 
+# When ON (default), the bulk fan-out actions (views, reactions) run STRICTLY
+# one account at a time: an account acts, then we wait ITS personal delay before
+# the NEXT account even starts. This is the "one by one with a gap, not all at
+# once" behaviour — no two accounts ever hit Telegram in the same instant, which
+# is the safest pattern against fleet-wide flood/freeze. Set AGENT_SEQUENTIAL_ACTIONS=0
+# to fall back to the older concurrent (spread-over-a-window) fan-out.
+SEQUENTIAL_ACTIONS = _os.environ.get("AGENT_SEQUENTIAL_ACTIONS", "1").lower() not in ("0", "false", "no")
+
+
+async def run_pool_actions(pool, action, offsets=None) -> list:
+    """
+    Run `action(account_id, client)` for every (account_id, client) in `pool`.
+
+    Sequential mode (default): process accounts one-by-one; after each account
+    acts, sleep that account's own pacing delay (3s+ personal window) before the
+    next account begins. One account's slowness/flood never overlaps another's —
+    they simply drip in order.
+
+    Concurrent mode (AGENT_SEQUENTIAL_ACTIONS=0): the legacy behaviour — fire all
+    accounts together, merely staggered by `offsets` across a window.
+
+    Exceptions from a single account are captured and returned in place (never
+    raised) so one bad account can't abort the whole batch.
+    """
+    results: list = []
+    if SEQUENTIAL_ACTIONS:
+        for acc_id, client in pool:
+            try:
+                results.append(await action(acc_id, client))
+            except Exception as e:  # noqa: BLE001 - isolate per-account failures
+                results.append(e)
+            # The gap BEFORE the next account starts = this account's personal
+            # delay window. This is what the user sees as "3s+ between each".
+            await asyncio.sleep(_account_pacing_delay(acc_id))
+        return results
+
+    # Legacy concurrent fan-out (staggered starts, then all overlap).
+    if offsets is None:
+        offsets = [0.0] * len(pool)
+
+    async def _staggered(acc_id, client, delay):
+        if delay > 0:
+            await asyncio.sleep(delay)
+        return await action(acc_id, client)
+
+    return await asyncio.gather(
+        *(_staggered(a, c, d) for (a, c), d in zip(pool, offsets)),
+        return_exceptions=True,
+    )
+
+
 def _flood_seconds(exc: Exception) -> int | None:
     """
     If `exc` is (or wraps) a Telegram FloodWait, return the required wait in
@@ -689,7 +740,7 @@ def _attach_rejoin_handler(account_id: int, calls: PyTgCalls) -> None:
             try:
                 name = update.__class__.__name__.lower()
                 if account_id not in _ACTIVE_JOINS:
-                    return  # we intentionally left — ignore.
+                    return  # we intentionally left �� ignore.
 
                 # CRITICAL: a listen-only join publishes no media, so pytgcalls
                 # fires StreamEnded (and pause/resume) almost immediately even
@@ -1783,9 +1834,7 @@ async def view_post_all(chat_id: int, message_id: int, spread_seconds: float = 0
     offsets = _natural_arrival_offsets(len(pool), spread_seconds)
     sem = _get_action_sem()
 
-    async def _one(acc_id: int, client: Client, delay: float) -> bool:
-        if delay > 0:
-            await asyncio.sleep(delay)
+    async def _one(acc_id: int, client: Client) -> bool:
         # Gate the actual MTProto work so a big pool can't flood the event loop
         # and starve the WebRTC keepalives of bots that are in a live stream.
         async with sem:
@@ -1794,17 +1843,15 @@ async def view_post_all(chat_id: int, message_id: int, spread_seconds: float = 0
                 await client.invoke(
                     GetMessagesViews(peer=peer, id=[int(message_id)], increment=True)
                 )
-                # Rest this account for ITS OWN personal delay window (not a shared
-                # fixed value) so 250 accounts don't all pace identically — the
-                # per-account "personality" that avoids fleet-wide fingerprinting.
-                await asyncio.sleep(_account_pacing_delay(acc_id))
                 return True
             except Exception as e:
                 print(f"[!] view failed (msg {message_id}): {e.__class__.__name__}: {e}")
                 return False
 
-    results = await asyncio.gather(*(_one(a, c, d) for (a, c), d in zip(pool, offsets)))
-    return sum(1 for ok in results if ok)
+    # run_pool_actions drips one account at a time (default), waiting each
+    # account's personal delay before the next starts — the per-account gap.
+    results = await run_pool_actions(pool, _one, offsets)
+    return sum(1 for ok in results if ok is True)
 
 
 async def view_post_scheduled(
@@ -1871,9 +1918,7 @@ async def view_post_scheduled(
     offsets = _natural_arrival_offsets(len(pool), spread_seconds)
     sem = _get_action_sem()
 
-    async def _one(acc_id: int, client: Client, delay: float) -> bool:
-        if delay > 0:
-            await asyncio.sleep(delay)
+    async def _one(acc_id: int, client: Client) -> bool:
         # Gate the actual MTProto work so a big pool can't flood the event loop
         # and starve the WebRTC keepalives of bots that are in a live stream.
         async with sem:
@@ -1882,16 +1927,15 @@ async def view_post_scheduled(
                 await client.invoke(
                     GetMessagesViews(peer=peer, id=[int(message_id)], increment=True)
                 )
-                # Rest this account for ITS OWN personal delay window so the fleet
-                # doesn't pace in lockstep (per-account anti-fingerprint pacing).
-                await asyncio.sleep(_account_pacing_delay(acc_id))
                 return True
             except Exception as e:
                 print(f"[!] view failed (msg {message_id}): {e.__class__.__name__}: {e}")
                 return False
 
-    results = await asyncio.gather(*(_one(a, c, d) for (a, c), d in zip(pool, offsets)))
-    return sum(1 for ok in results if ok)
+    # Drips one account at a time (default), each waiting its personal delay
+    # before the next — the per-account gap the fleet uses to avoid bursts.
+    results = await run_pool_actions(pool, _one, offsets)
+    return sum(1 for ok in results if ok is True)
 
 
 # Cross-client dedup: the SAME post is delivered to every warm userbot that is a
@@ -2285,17 +2329,13 @@ async def react_post_scheduled(
     async def _gated_react(acc_id: int, client: Client) -> str:
         # Gate the reaction call so a pool-wide burst can't saturate the event
         # loop and starve live-stream WebRTC keepalives (bots getting kicked).
+        # The per-account gap between accounts is applied by run_pool_actions.
         async with sem:
-            result = await _react_once(client, chat_id, message_id, emojis)
-            # Rest this account for ITS OWN personal delay window so the fleet
-            # doesn't react in lockstep (per-account anti-fingerprint pacing).
-            await asyncio.sleep(_account_pacing_delay(acc_id))
-            return result
+            return await _react_once(client, chat_id, message_id, emojis)
 
-    probe_results = await asyncio.gather(
-        *(_gated_react(a, c) for a, c in probe_pool),
-        return_exceptions=True,
-    )
+    # Probes run one-by-one too (with their own gap) so even the test phase never
+    # fires two accounts at the same instant.
+    probe_results = await run_pool_actions(probe_pool, _gated_react)
     success = sum(1 for r in probe_results if r == "ok")
     blocked = sum(1 for r in probe_results if r == "blocked")
 
@@ -2316,17 +2356,10 @@ async def react_post_scheduled(
     # reactions right after the post, then a thinning tail - just like real users.
     offsets = _natural_arrival_offsets(len(rest_pool), window_seconds)
 
-    async def _scheduled(acc_id: int, client: Client, delay: float) -> str:
-        if delay > 0:
-            await asyncio.sleep(delay)
-        return await _gated_react(acc_id, client)
-
-    # return_exceptions=True: even an unexpected error on one userbot can never
-    # bubble up and take down the job / worker.
-    results = await asyncio.gather(
-        *(_scheduled(a, c, d) for (a, c), d in zip(rest_pool, offsets)),
-        return_exceptions=True,
-    )
+    # Drip the reactions one account at a time (default): each account reacts,
+    # then waits its own personal delay before the next account reacts. One bad
+    # account is captured in-place and never aborts the batch.
+    results = await run_pool_actions(rest_pool, _gated_react, offsets)
     return success + sum(1 for r in results if r == "ok")
 
 
