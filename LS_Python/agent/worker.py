@@ -175,14 +175,6 @@ BUY_PACING_SECONDS = float(os.environ.get("AGENT_BUY_PACING_SECONDS", "8"))
 BUY_RETRY_ATTEMPTS = int(os.environ.get("AGENT_BUY_RETRY_ATTEMPTS", "4"))
 BUY_RETRY_DELAY = float(os.environ.get("AGENT_BUY_RETRY_DELAY", "15"))
 
-# KILL SWITCH for tg-lion buying. When OFF (AGENT_BUY_ENABLED=0), the buy handler
-# refuses to purchase and does NOT re-queue the next buy — so a leftover
-# buy_tglion_batch chain sitting in the queue can never keep spending money when
-# the server restarts. Default is OFF so buying only happens when you explicitly
-# turn it on (AGENT_BUY_ENABLED=1). This is the reliable way to stop an accidental
-# order (e.g. the Afghanistan numbers) regardless of what is already queued.
-BUY_ENABLED = os.environ.get("AGENT_BUY_ENABLED", "0").lower() not in ("0", "false", "no", "")
-
 # Created lazily inside the running event loop (see _get_profile_sem).
 _profile_sem: asyncio.Semaphore | None = None
 
@@ -222,18 +214,6 @@ async def handle_buy_tglion_batch(job: dict) -> dict:
     index = total - remaining + 1  # 1-based position of this number in the order
     if not country_code:
         raise RuntimeError("buy_tglion_batch job is missing country_code")
-
-    # KILL SWITCH: if buying is disabled, do NOT purchase and do NOT re-queue the
-    # rest of the chain. This stops an accidental/leftover order dead in its
-    # tracks — every restart just finishes this one job as "cancelled" and the
-    # chain ends. Turn buying back on with AGENT_BUY_ENABLED=1 when you actually
-    # want to place an order.
-    if not BUY_ENABLED:
-        print(
-            f"[buy] DISABLED (AGENT_BUY_ENABLED=0): cancelling {country_code} order, "
-            f"{remaining} number(s) NOT bought. Chain stopped."
-        )
-        return {"stage": "cancelled", "reason": "buying disabled", "remaining": remaining}
 
     # --- buy ONE number (retry transient tg-lion errors) --------------------
     # tg-lion calls are synchronous/blocking, so run them off the event loop to
