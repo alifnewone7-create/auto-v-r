@@ -417,6 +417,21 @@ def flood_wait_seconds(exc: Exception) -> int | None:
     raised straight from a raw Pyrogram call."""
     return _flood_seconds(exc)
 
+
+def is_peer_flood_error(exc: Exception) -> bool:
+    """
+    True if `exc` is Telegram's [400 PEER_FLOOD] — "your account is currently
+    limited". This is NOT a normal FloodWait: Telegram gives no wait value and
+    the account is temporarily blocked from messaging (especially new/unknown
+    users). Retrying quickly makes the limit worse, so the worker must pause the
+    WHOLE account for a long cooldown instead of rescheduling the job.
+
+    Detected by string so we don't hard-depend on a specific pyrofork error class
+    name (the class + the message text both contain "PEER_FLOOD").
+    """
+    s = f"{exc.__class__.__name__}: {exc}"
+    return "PEER_FLOOD" in s
+
 # In-memory pool of IN-PROGRESS login clients, keyed by phone number.
 # The userbot login is split across two jobs (send_login_code -> submit_login_code)
 # that both run inside this same long-running worker process. We MUST keep the

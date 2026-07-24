@@ -92,6 +92,11 @@ BATCH_SIZE = int(os.environ.get("AGENT_BATCH_SIZE", "100"))
 # NEXT start, never blocks the others. Tune the gap here (seconds).
 ACTION_DISPATCH_GAP_MIN = float(os.environ.get("AGENT_ACTION_DISPATCH_GAP_MIN", "3"))
 ACTION_DISPATCH_GAP_MAX = float(os.environ.get("AGENT_ACTION_DISPATCH_GAP_MAX", "5"))
+# When Telegram answers [400 PEER_FLOOD] ("your account is currently limited"),
+# the account is temporarily blocked from messaging — usually for hours. There is
+# NO wait value, and retrying fast makes it worse, so we pause the WHOLE account
+# for this long (seconds) and stop retrying the job. Default 6h.
+PEER_FLOOD_COOLDOWN = float(os.environ.get("AGENT_PEER_FLOOD_COOLDOWN", str(6 * 3600)))
 # Threads for off-loop DB work (asyncio.to_thread). Enough to absorb a burst of
 # finishing jobs; they mostly wait on the DB connection pool so this is cheap.
 DB_THREAD_WORKERS = max(8, int(os.environ.get("AGENT_DB_THREAD_WORKERS", "24")))
@@ -1247,6 +1252,25 @@ async def process_one(job: dict) -> None:
                 except Exception:
                     pass
             print(f"[FROZEN] job #{job['id']} {job['type']}: account {job.get('account_id')} is frozen; marked and stopped retrying")
+            return
+        if userbot.is_peer_flood_error(e):
+            # [400 PEER_FLOOD] — Telegram is limiting this account from messaging
+            # (typical when DMing new/unknown users). There's no wait value and
+            # retrying fast makes it worse, so we DON'T reschedule. Instead fail
+            # this job and pause the WHOLE account for a long cooldown so its other
+            # queued send_dm jobs skip too (claim_next_jobs honors cooldown_until).
+            # The account stays logged in — it recovers on its own after the limit.
+            await db.arun(db.fail_job, job["id"], f"Account limited by Telegram (PEER_FLOOD): {e}"[:500])
+            if job.get("account_id"):
+                await db.arun(
+                    db.set_account_cooldown,
+                    job["account_id"],
+                    PEER_FLOOD_COOLDOWN,
+                    "Telegram PEER_FLOOD (account limited)",
+                    True,
+                )
+            print(f"[LIMITED] job #{job['id']} {job['type']}: account {job.get('account_id')} hit PEER_FLOOD; "
+                  f"paused ~{int(PEER_FLOOD_COOLDOWN)}s and stopped retrying")
             return
         await db.arun(db.fail_job, job["id"], str(e))
         # Only auth/login jobs may mark the account as failed. A livestream
