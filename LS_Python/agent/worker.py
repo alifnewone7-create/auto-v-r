@@ -91,7 +91,7 @@ BATCH_SIZE = int(os.environ.get("AGENT_BATCH_SIZE", "100"))
 # Each still runs as its own task, so one account's flood wait only delays the
 # NEXT start, never blocks the others. Tune the gap here (seconds).
 ACTION_DISPATCH_GAP_MIN = float(os.environ.get("AGENT_ACTION_DISPATCH_GAP_MIN", "3"))
-ACTION_DISPATCH_GAP_MAX = float(os.environ.get("AGENT_ACTION_DISPATCH_GAP_MAX", "8"))
+ACTION_DISPATCH_GAP_MAX = float(os.environ.get("AGENT_ACTION_DISPATCH_GAP_MAX", "5"))
 # Threads for off-loop DB work (asyncio.to_thread). Enough to absorb a burst of
 # finishing jobs; they mostly wait on the DB connection pool so this is cheap.
 DB_THREAD_WORKERS = max(8, int(os.environ.get("AGENT_DB_THREAD_WORKERS", "24")))
@@ -1072,11 +1072,9 @@ AUTH_JOB_TYPES = {
 }
 
 
-# Per-account action jobs that should be PACED: each of these makes a real
-# Telegram request for a single account, so we run them behind that account's
-# lock (strictly one-by-one for the account) and rest the account for its
-# personal delay window afterwards. Login/auth/profile jobs are excluded — they
-# are one-off setup steps, not repeated engagement actions.
+# Reference list of the core repeated engagement actions. Kept for readability /
+# reference only — routing no longer keys off this set (see job_is_paced below),
+# so that EVERY per-account action is paced, not just these.
 PACED_JOB_TYPES = {
     "join_livestream",
     "join_channel",
@@ -1085,6 +1083,26 @@ PACED_JOB_TYPES = {
     "detect_poll",
     "send_dm",
 }
+
+
+def job_is_paced(job: dict) -> bool:
+    """
+    Should this job be started one-by-one (behind the global gap + per-account
+    lock) instead of firing immediately?
+
+    YES for any job that acts for a SINGLE account and is not part of the
+    login/auth flow — i.e. every per-account engagement action (join, vote,
+    view-per-account, react, leave, profile edit, delete photos, send_dm,
+    check_frozen, ...). This is what guarantees the accounts act account-by-account
+    with a gap instead of in a simultaneous burst that floods them.
+
+    NO for:
+      - login/auth jobs (the user is actively waiting; they must stay snappy), and
+      - bulk fan-out jobs with no account_id (view_post, react_post,
+        leave_livestream_all, raise_hand_all) which already spread their own work
+        internally over a time window.
+    """
+    return bool(job.get("account_id")) and job["type"] not in AUTH_JOB_TYPES
 
 # Queue of per-account action jobs waiting to be started one-by-one, and the set
 # that keeps their running tasks alive. Created in main() so they bind to the
@@ -1151,7 +1169,7 @@ async def process_one(job: dict) -> None:
         return
 
     acct = job.get("account_id")
-    paced = bool(acct) and job["type"] in PACED_JOB_TYPES
+    paced = job_is_paced(job)
 
     try:
         if paced:
@@ -1660,8 +1678,10 @@ async def main() -> None:
             continue
 
         paced_q = _get_paced_queue()
-        immediate = [j for j in jobs if not (j.get("account_id") and j["type"] in PACED_JOB_TYPES)]
-        paced = [j for j in jobs if j.get("account_id") and j["type"] in PACED_JOB_TYPES]
+        # Route: per-account engagement jobs are PACED (one-by-one, with a gap);
+        # auth/login jobs and bulk fan-out jobs stay IMMEDIATE. See job_is_paced.
+        immediate = [j for j in jobs if not job_is_paced(j)]
+        paced = [j for j in jobs if job_is_paced(j)]
         print(
             f"[>] Got {len(jobs)} job(s); {len(immediate)} immediate, "
             f"{len(paced)} paced one-by-one."
