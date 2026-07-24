@@ -1136,6 +1136,77 @@ def set_profile_update(
 
 
 # ---------------------------------------------------------------------------
+# Review / Direct-Message helpers (userbots DM one target user text + media)
+# ---------------------------------------------------------------------------
+
+def get_message_send(send_id: int) -> Optional[dict[str, Any]]:
+    """Fetch one message_sends row (the per-account step list for a campaign)."""
+    return query_one(
+        """
+        SELECT s.*, c.target_link, c.target_title
+          FROM message_sends s
+          JOIN message_campaigns c ON c.id = s.campaign_id
+         WHERE s.id = %s
+        """,
+        (send_id,),
+    )
+
+
+def get_message_asset(asset_id: int) -> Optional[dict[str, Any]]:
+    """
+    Fetch a stored media asset (base64 in message_assets). Returns a dict with
+    raw `bytes`, `mime`, and `kind` ('image' | 'video'), or None if missing.
+    """
+    import base64
+
+    row = query_one("SELECT data, mime, kind FROM message_assets WHERE id = %s", (asset_id,))
+    if not row or not row.get("data"):
+        return None
+    return {"bytes": base64.b64decode(row["data"]), "mime": row.get("mime"), "kind": row.get("kind") or "image"}
+
+
+def set_message_send(send_id: int, status: str, error: str | None = None) -> None:
+    """Record the outcome of one account's DM send (pending/sending/sent/failed)."""
+    query(
+        "UPDATE message_sends SET status = %s, last_error = %s, updated_at = now() WHERE id = %s",
+        (status, error[:500] if error else None, send_id),
+    )
+
+
+def recount_message_campaign(campaign_id: int) -> None:
+    """
+    Recompute a campaign's sent/failed counters + overall status from its send
+    rows. Status: 'sending' while any row is still pending/sending, else 'done'
+    (all sent), 'failed' (all failed), or 'partial' (a mix).
+    """
+    query(
+        """
+        WITH agg AS (
+          SELECT
+            count(*)                                   AS total,
+            count(*) FILTER (WHERE status = 'sent')    AS sent,
+            count(*) FILTER (WHERE status = 'failed')  AS failed,
+            count(*) FILTER (WHERE status IN ('pending','sending')) AS busy
+          FROM message_sends WHERE campaign_id = %s
+        )
+        UPDATE message_campaigns c
+           SET sent_count   = agg.sent,
+               failed_count = agg.failed,
+               status = CASE
+                          WHEN agg.busy > 0 THEN 'sending'
+                          WHEN agg.failed = 0 THEN 'done'
+                          WHEN agg.sent = 0 THEN 'failed'
+                          ELSE 'partial'
+                        END,
+               updated_at = now()
+          FROM agg
+         WHERE c.id = %s
+        """,
+        (campaign_id, campaign_id),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Agent heartbeat
 # ---------------------------------------------------------------------------
 

@@ -2716,3 +2716,121 @@ async def delete_profile_photos(
             continue
 
     return {"deleted": deleted}
+
+
+# ===========================================================================
+# Review / Direct-Message: send text + image/video to ONE target user
+# ===========================================================================
+
+# Small pause between consecutive messages from the SAME account so a burst of
+# steps looks human and doesn't trip Telegram's per-chat flood limits. The
+# account-level pacing (paced dispatcher) already spaces DIFFERENT accounts apart.
+_DM_STEP_MIN_DELAY = float(_os.environ.get("AGENT_DM_STEP_DELAY_MIN", "1.5"))
+_DM_STEP_MAX_DELAY = float(_os.environ.get("AGENT_DM_STEP_DELAY_MAX", "3.5"))
+
+
+async def send_dm(
+    account_id: int,
+    api_id: int,
+    api_hash: str,
+    session_string: str,
+    target: str,
+    steps: list[dict],
+) -> dict:
+    """
+    Send one account's ordered message sequence to a single target user.
+
+    `steps` is the RESOLVED step list (the worker has already fetched media bytes
+    from the DB). Each step is one of:
+      { "kind": "text",  "text": "..." }
+      { "kind": "album", "media": [ {"bytes":b, "mime":m, "kind":"image"}, ... ] }
+      { "kind": "video", "media": [ {"bytes":b, "mime":m, "kind":"video"} ] }
+
+    Behaviour (mirrors the panel spec):
+      - each text step  -> its own separate message,
+      - an album step with 1 image -> a single photo; with >1 -> a grouped album,
+      - a video step -> one video message.
+
+    Raises UserbotError / FloodWaitError so the worker can record failure + retry.
+    Sending is NOT an auth job, so a failure never logs the account out.
+    """
+    import io
+
+    from pyrogram.types import InputMediaPhoto, InputMediaVideo
+
+    entry = await _ensure_online(account_id, api_id, api_hash, session_string)
+    client: Client = entry["client"]
+
+    peer = _normalize_link(target) if isinstance(target, str) else target
+
+    # Resolve the peer once up-front so an unreachable target fails fast with a
+    # clear reason instead of part-way through the sequence.
+    try:
+        await client.get_chat(peer)
+    except Exception as e:  # noqa: BLE001
+        if flood_wait_seconds(e) is not None:
+            raise
+        raise UserbotError(f"Could not reach target user: {e.__class__.__name__}")
+
+    def _photo_bio(item: dict, idx: int) -> io.BytesIO:
+        bio = io.BytesIO(item["bytes"])
+        bio.name = f"image_{idx}.jpg"
+        return bio
+
+    def _video_bio(item: dict, idx: int) -> io.BytesIO:
+        bio = io.BytesIO(item["bytes"])
+        bio.name = f"video_{idx}.mp4"
+        return bio
+
+    sent_steps = 0
+    for i, step in enumerate(steps or []):
+        kind = step.get("kind")
+
+        if kind == "text":
+            text = (step.get("text") or "").strip()
+            if not text:
+                continue
+            await _flood_retry(lambda t=text: client.send_message(peer, t), what="send text")
+            sent_steps += 1
+
+        elif kind == "album":
+            media = step.get("media") or []
+            if not media:
+                continue
+            if len(media) == 1:
+                await _flood_retry(
+                    lambda m=media[0]: client.send_photo(peer, _photo_bio(m, 0)),
+                    what="send photo",
+                )
+            else:
+                group = [InputMediaPhoto(_photo_bio(m, j)) for j, m in enumerate(media)]
+                await _flood_retry(lambda g=group: client.send_media_group(peer, g), what="send album")
+            sent_steps += 1
+
+        elif kind == "video":
+            media = step.get("media") or []
+            if not media:
+                continue
+            item = media[0]
+            # A video sent alongside photos in the same step still goes as a video
+            # message; single video -> send_video, multiple -> grouped media.
+            if len(media) == 1:
+                await _flood_retry(
+                    lambda it=item: client.send_video(peer, _video_bio(it, 0)),
+                    what="send video",
+                )
+            else:
+                group = []
+                for j, m in enumerate(media):
+                    if (m.get("kind") or "image") == "video":
+                        group.append(InputMediaVideo(_video_bio(m, j)))
+                    else:
+                        group.append(InputMediaPhoto(_photo_bio(m, j)))
+                await _flood_retry(lambda g=group: client.send_media_group(peer, g), what="send media")
+            sent_steps += 1
+
+        # Human-like gap before the next step from this same account.
+        if i < len(steps) - 1:
+            await asyncio.sleep(random.uniform(_DM_STEP_MIN_DELAY, _DM_STEP_MAX_DELAY))
+
+    return {"sent_steps": sent_steps}

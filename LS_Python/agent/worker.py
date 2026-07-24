@@ -874,6 +874,80 @@ async def _run_delete_profile_photos(job: dict) -> dict:
         raise
 
 
+async def handle_send_dm(job: dict) -> dict:
+    """
+    Send one account's DM sequence (from a Review campaign) to the target user.
+
+    The website queued one of these per numbered slot. We load the send row,
+    resolve the referenced media assets to raw bytes, hand the ordered steps to
+    the userbot, then write the per-account result back to message_sends and
+    refresh the campaign's counters/status. Sending is NOT an auth job, so a
+    failure fails only THIS job — the account stays logged in.
+    """
+    account_id = job["account_id"]
+    p = job["payload"]
+    send_id = p.get("send_id")
+    campaign_id = p.get("campaign_id")
+
+    send = db.get_message_send(int(send_id)) if send_id else None
+    if not send:
+        return {"stage": "send_missing", "send_id": send_id}
+
+    acc = db.get_account(account_id)
+    if not acc or acc.get("status") != "logged_in":
+        db.set_message_send(int(send_id), "failed", "Account is not logged in.")
+        if campaign_id:
+            db.recount_message_campaign(int(campaign_id))
+        return {"stage": "not_logged_in"}
+
+    # Resolve each step's asset ids -> raw bytes so the userbot never touches DB.
+    raw_steps = send.get("steps") or []
+    if isinstance(raw_steps, str):
+        import json as _json
+
+        raw_steps = _json.loads(raw_steps)
+
+    resolved: list[dict] = []
+    for step in raw_steps:
+        kind = step.get("kind")
+        if kind == "text":
+            resolved.append({"kind": "text", "text": step.get("text") or ""})
+        elif kind in ("album", "video"):
+            media = []
+            for aid in step.get("asset_ids") or []:
+                asset = db.get_message_asset(int(aid))
+                if asset and asset.get("bytes"):
+                    media.append(asset)
+            if media:
+                resolved.append({"kind": kind, "media": media})
+
+    if not resolved:
+        db.set_message_send(int(send_id), "sent", None)  # nothing to send == done
+        if campaign_id:
+            db.recount_message_campaign(int(campaign_id))
+        return {"stage": "empty"}
+
+    db.set_message_send(int(send_id), "sending", None)
+    try:
+        result = await userbot.send_dm(
+            account_id,
+            int(acc["api_id"]),
+            acc["api_hash"],
+            acc["session_string"],
+            send["target_link"],
+            resolved,
+        )
+        db.set_message_send(int(send_id), "sent", None)
+        if campaign_id:
+            db.recount_message_campaign(int(campaign_id))
+        return {"stage": "dm_sent", "sent_steps": result.get("sent_steps", 0)}
+    except Exception as e:
+        db.set_message_send(int(send_id), "failed", str(e))
+        if campaign_id:
+            db.recount_message_campaign(int(campaign_id))
+        raise
+
+
 async def handle_check_frozen(job: dict) -> dict:
     """
     Probe accounts and mark the dead ones so they can be cleaned up from the
@@ -982,6 +1056,7 @@ HANDLERS = {
     "react_post": handle_react_post,
     "update_profile": handle_update_profile,
     "delete_profile_photos": handle_delete_profile_photos,
+    "send_dm": handle_send_dm,
     "check_frozen": handle_check_frozen,
 }
 
@@ -1008,6 +1083,7 @@ PACED_JOB_TYPES = {
     "cast_vote",
     "retract_vote",
     "detect_poll",
+    "send_dm",
 }
 
 # Queue of per-account action jobs waiting to be started one-by-one, and the set

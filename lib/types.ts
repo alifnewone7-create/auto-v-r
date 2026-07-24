@@ -269,6 +269,49 @@ export interface ChannelJoinTargetRow extends ChannelJoinTarget {
   participants: ChannelJoinParticipant[]
 }
 
+// Review / Direct-Message campaigns: userbots DM one target user text + media.
+export type MessageCampaignStatus = "sending" | "done" | "partial" | "failed"
+export type MessageSendStatus = "pending" | "sending" | "sent" | "failed"
+
+// One ordered step an account sends. `album` groups 1+ images (>1 = album);
+// `video` carries a single video asset.
+export type MessageStep =
+  | { kind: "text"; text: string }
+  | { kind: "album"; asset_ids: number[] }
+  | { kind: "video"; asset_ids: number[] }
+
+export interface MessageSendRow {
+  id: number
+  account_id: number
+  position: number
+  phone: string
+  label: string | null
+  steps: MessageStep[]
+  status: MessageSendStatus
+  last_error: string | null
+}
+
+export interface MessageCampaignRow {
+  id: number
+  target_link: string
+  target_title: string | null
+  status: MessageCampaignStatus
+  total_count: number
+  sent_count: number
+  failed_count: number
+  last_error: string | null
+  created_at: string
+  updated_at: string
+  sends: MessageSendRow[]
+}
+
+// A logged-in account shown as a numbered slot in the Review composer.
+export interface ReviewAccountSlot {
+  id: number
+  label: string | null
+  phone_number: string
+}
+
 // A telegram account row enriched with the latest profile-edit result, used by
 // the bulk profile editor UI.
 export interface ProfileAccountRow {

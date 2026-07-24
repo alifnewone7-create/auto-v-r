@@ -280,6 +280,45 @@ CREATE TABLE IF NOT EXISTS channel_join_participants (
 
 CREATE INDEX IF NOT EXISTS channel_join_targets_status_idx ON channel_join_targets (status);
 CREATE INDEX IF NOT EXISTS channel_join_participants_target_idx ON channel_join_participants (target_id);
+
+-- Review / Direct-Message campaigns: userbots DM text + image/video to one user.
+-- Media is stored base64 in message_assets (same pattern as profile_assets) so
+-- the Python agent reads bytes straight from the DB (no blob storage needed).
+CREATE TABLE IF NOT EXISTS message_assets (
+  id         SERIAL PRIMARY KEY,
+  data       TEXT NOT NULL,
+  mime       TEXT NOT NULL DEFAULT 'image/jpeg',
+  kind       TEXT NOT NULL DEFAULT 'image',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS message_campaigns (
+  id           SERIAL PRIMARY KEY,
+  target_link  TEXT NOT NULL,
+  target_title TEXT,
+  status       TEXT NOT NULL DEFAULT 'sending',
+  total_count  INTEGER NOT NULL DEFAULT 0,
+  sent_count   INTEGER NOT NULL DEFAULT 0,
+  failed_count INTEGER NOT NULL DEFAULT 0,
+  last_error   TEXT,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS message_sends (
+  id          SERIAL PRIMARY KEY,
+  campaign_id INTEGER NOT NULL REFERENCES message_campaigns(id) ON DELETE CASCADE,
+  account_id  INTEGER NOT NULL REFERENCES telegram_accounts(id) ON DELETE CASCADE,
+  position    INTEGER NOT NULL,
+  steps       JSONB NOT NULL DEFAULT '[]'::jsonb,
+  status      TEXT NOT NULL DEFAULT 'pending',
+  last_error  TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS message_sends_campaign_idx ON message_sends (campaign_id);
+CREATE INDEX IF NOT EXISTS message_campaigns_created_idx ON message_campaigns (created_at DESC);
 `
 
 // Reads every scripts/*.sql file in filename order and returns them as an
