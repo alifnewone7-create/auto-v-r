@@ -1769,29 +1769,83 @@ def _first_client() -> Optional[Client]:
     return None
 
 
-async def resolve_channel_latest(link_or_chat_id) -> tuple[int, str, int]:
+# How many warm userbots to try when resolving a channel before giving up. A
+# cached numeric chat_id can only be resolved by an account that already has the
+# channel's access_hash (one that has seen/joined it); a different account throws
+# [400 CHANNEL_INVALID]. Trying several accounts + the public link fixes that.
+_RESOLVE_MAX_CLIENTS = int(_os.environ.get("AGENT_RESOLVE_MAX_CLIENTS", "6"))
+
+
+def _is_channel_invalid(exc: Exception) -> bool:
+    s = f"{exc.__class__.__name__}: {exc}"
+    return "CHANNEL_INVALID" in s or "PEER_ID_INVALID" in s or "USERNAME_NOT_OCCUPIED" in s
+
+
+async def resolve_channel_latest(link_or_chat_id, fallback_link=None) -> tuple[int, str, int]:
     """
     Resolve a channel and return (chat_id, title, latest_message_id).
 
-    Uses any warm userbot. Works for public channels without joining; private
-    channels require at least one userbot to be a member.
+    Robust against [400 CHANNEL_INVALID]: resolving a channel by its cached
+    numeric id only works on an account that already knows that channel's
+    access_hash. So we try several warm userbots, and we also fall back to the
+    public @username / t.me link (which ANY account can resolve without ever
+    having joined). Order of attempts:
+      1. public username/link first when we have one (works from any account),
+      2. then the numeric chat_id (needed for private channels, on a member acct),
+    each tried across up to _RESOLVE_MAX_CLIENTS warm accounts.
     """
-    client = _first_client()
-    if client is None:
+    clients = [entry["client"] for entry in _POOL.values()]
+    if not clients:
         raise UserbotError("No warm userbots available yet.")
+    clients = clients[:_RESOLVE_MAX_CLIENTS]
 
-    target = link_or_chat_id
-    if isinstance(link_or_chat_id, str):
-        target = _normalize_link(link_or_chat_id)
-    chat = await client.get_chat(target)
+    # Build the ordered list of things to try. Prefer a public username/link
+    # because it resolves from any account; keep the numeric id as a fallback for
+    # private channels where only a member can resolve it.
+    candidates: list = []
 
-    latest = 0
-    async for msg in client.get_chat_history(chat.id, limit=1):
-        latest = msg.id
-        break
+    def _add(ref):
+        if ref is None or ref == "":
+            return
+        if isinstance(ref, str):
+            ref = _normalize_link(ref)
+        if ref not in candidates:
+            candidates.append(ref)
 
-    title = chat.title or (f"@{chat.username}" if chat.username else str(chat.id))
-    return chat.id, title, latest
+    primary = link_or_chat_id
+    if isinstance(primary, str):
+        _add(primary)          # a link was passed directly
+        _add(fallback_link)
+    else:
+        # primary is a numeric chat_id: try the public link FIRST (any account),
+        # then the numeric id (member account only).
+        _add(fallback_link)
+        _add(primary)
+
+    last_exc: Exception | None = None
+    for target in candidates:
+        for client in clients:
+            try:
+                chat = await client.get_chat(target)
+                latest = 0
+                async for msg in client.get_chat_history(chat.id, limit=1):
+                    latest = msg.id
+                    break
+                title = chat.title or (f"@{chat.username}" if chat.username else str(chat.id))
+                return chat.id, title, latest
+            except Exception as e:  # noqa: BLE001 - try the next account/candidate
+                last_exc = e
+                # Only keep trying other accounts for "this account can't see it"
+                # style errors; a genuine flood wait should bubble up immediately
+                # so the caller applies the proper backoff.
+                if flood_wait_seconds(e) is not None:
+                    raise
+                if not _is_channel_invalid(e):
+                    # Unknown error on this client — try the next one, but remember it.
+                    continue
+
+    # Nothing worked across all accounts/candidates.
+    raise last_exc if last_exc is not None else UserbotError("Could not resolve channel.")
 
 
 def _natural_arrival_offsets(n: int, window_seconds: float, *, front_load: bool = True) -> list[float]:

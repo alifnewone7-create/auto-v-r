@@ -1269,7 +1269,12 @@ async def poll_view_targets() -> None:
             continue
         try:
             ref = t["chat_id"] if t["chat_id"] is not None else t["channel_link"]
-            chat_id, title, latest = await userbot.resolve_channel_latest(ref)
+            # Pass the link as a fallback: if the cached numeric chat_id can't be
+            # resolved by the accounts we have warm (CHANNEL_INVALID), the public
+            # link still resolves from any account.
+            chat_id, title, latest = await userbot.resolve_channel_latest(
+                ref, fallback_link=t.get("channel_link")
+            )
 
             # Resolved fine - clear any prior cooldown.
             _view_resolve_cooldown.pop(t["id"], None)
@@ -1366,7 +1371,11 @@ async def poll_reaction_targets() -> None:
             continue
         try:
             ref = t["chat_id"] if t["chat_id"] is not None else t["channel_link"]
-            chat_id, title, latest = await userbot.resolve_channel_latest(ref)
+            # Fall back to the public link if the cached numeric chat_id fails to
+            # resolve on the accounts we have warm (CHANNEL_INVALID).
+            chat_id, title, latest = await userbot.resolve_channel_latest(
+                ref, fallback_link=t.get("channel_link")
+            )
 
             _reaction_resolve_cooldown.pop(t["id"], None)
 
