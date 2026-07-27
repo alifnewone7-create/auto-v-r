@@ -2,22 +2,17 @@ import { NextResponse } from "next/server"
 import { query } from "@/lib/db"
 import { isAuthenticated } from "@/lib/auth"
 
-// Cap the numbered composer at 30 accounts (matches the "1..30" list spec).
-const MAX_SLOTS = 30
-
 export async function GET() {
   if (!(await isAuthenticated())) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
   }
 
-  // The first N logged-in accounts become numbered slots 1..N in the composer.
+  // Every logged-in account becomes a numbered slot 1..N in the composer.
   const accounts = await query<{ id: number; label: string | null; phone_number: string }>(
     `SELECT id, label, phone_number
        FROM telegram_accounts
       WHERE status = 'logged_in'
-      ORDER BY id
-      LIMIT $1`,
-    [MAX_SLOTS],
+      ORDER BY id`,
   )
 
   // Recent campaigns with their per-account send rows.
