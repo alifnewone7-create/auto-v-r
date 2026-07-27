@@ -27,6 +27,7 @@ import {
   Users,
   AlertCircle,
   Images,
+  Search,
 } from "lucide-react"
 import { toast } from "sonner"
 import { uploadMessageAsset, sendMessageCampaign, deleteMessageCampaign } from "@/app/actions/messages"
@@ -368,7 +369,23 @@ export function ReviewSection() {
   const [bulkText, setBulkText] = useState("")
   const [targetLink, setTargetLink] = useState("")
   const [sending, setSending] = useState(false)
+  const [search, setSearch] = useState("")
   const bulkMediaRef = useRef<HTMLInputElement>(null)
+
+  // Filter accounts by the search box while KEEPING each account's real position
+  // (1-based index in the full list) — the bulk list + send logic rely on that
+  // number, so we filter a {position, account} view instead of the raw array.
+  const visibleAccounts = useMemo(() => {
+    const all = accounts.map((account, i) => ({ position: i + 1, account }))
+    const q = search.trim().toLowerCase()
+    if (!q) return all
+    return all.filter(
+      ({ position, account }) =>
+        String(position).includes(q) ||
+        (account.label ?? "").toLowerCase().includes(q) ||
+        (account.phone_number ?? "").toLowerCase().includes(q),
+    )
+  }, [accounts, search])
 
   const getSlot = (pos: number): SlotState => slots[pos] ?? defaultSlot()
   const setSlot = (pos: number, next: SlotState) => setSlots((prev) => ({ ...prev, [pos]: next }))
@@ -542,15 +559,49 @@ export function ReviewSection() {
         </div>
       ) : (
         <div className="flex flex-col gap-3">
-          {accounts.map((acc, i) => (
-            <SlotCard
-              key={acc.id}
-              position={i + 1}
-              account={acc}
-              slot={getSlot(i + 1)}
-              onChange={(next) => setSlot(i + 1, next)}
-            />
-          ))}
+          {/* Search accounts by number (or name/phone). All show by default. */}
+          <div className="flex items-center justify-between gap-2">
+            <div className="relative w-full max-w-xs">
+              <Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                inputMode="numeric"
+                placeholder="Search account by number..."
+                className="pl-9"
+                aria-label="Search accounts by number"
+              />
+              {search ? (
+                <button
+                  type="button"
+                  onClick={() => setSearch("")}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-muted-foreground hover:text-foreground"
+                  aria-label="Clear search"
+                >
+                  <X className="size-4" />
+                </button>
+              ) : null}
+            </div>
+            <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
+              {search ? `${visibleAccounts.length} of ${accounts.length}` : `${accounts.length} accounts`}
+            </span>
+          </div>
+
+          {visibleAccounts.length === 0 ? (
+            <div className="rounded-lg border border-dashed border-border py-10 text-center text-sm text-muted-foreground">
+              {`No account matches "${search}".`}
+            </div>
+          ) : (
+            visibleAccounts.map(({ position, account }) => (
+              <SlotCard
+                key={account.id}
+                position={position}
+                account={account}
+                slot={getSlot(position)}
+                onChange={(next) => setSlot(position, next)}
+              />
+            ))
+          )}
         </div>
       )}
 
