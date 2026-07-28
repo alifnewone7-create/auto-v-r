@@ -93,13 +93,15 @@ function SlotCard({
   return (
     <Card className="border-border/70">
       <CardHeader className="flex flex-row items-center justify-between gap-2 space-y-0 py-3">
-        <CardTitle className="flex items-center gap-2 text-sm font-medium">
-          <span className="flex size-6 items-center justify-center rounded-md bg-primary/15 text-xs font-semibold text-primary tabular-nums">
+        <CardTitle className="flex min-w-0 items-center gap-2 text-sm font-medium">
+          <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-primary/15 text-xs font-semibold text-primary tabular-nums">
             {position}
           </span>
           <span className="truncate">{account.label || account.phone_number}</span>
         </CardTitle>
-        <span className="text-xs text-muted-foreground">{account.phone_number}</span>
+        {account.label ? (
+          <span className="hidden shrink-0 text-xs text-muted-foreground sm:inline">{account.phone_number}</span>
+        ) : null}
       </CardHeader>
       <CardContent className="flex flex-col gap-3">
         {/* Text messages: each box = one separate message */}
@@ -516,8 +518,13 @@ export function ReviewSection() {
               "Each number is an account (1 = 1st account, 2 = 2nd, up to your logged-in count). A # line under it is another separate message that same account sends. Apply fills the boxes below."
             }
           </p>
-          <div className="flex flex-wrap gap-2">
-            <Button size="sm" className="gap-1.5" onClick={applyBulkList} disabled={accounts.length === 0}>
+          <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+            <Button
+              size="sm"
+              className="w-full gap-1.5 sm:w-auto"
+              onClick={applyBulkList}
+              disabled={accounts.length === 0}
+            >
               <ListOrdered className="size-4" />
               Apply text
             </Button>
@@ -535,7 +542,7 @@ export function ReviewSection() {
             <Button
               size="sm"
               variant="outline"
-              className="gap-1.5 bg-transparent"
+              className="w-full gap-1.5 bg-transparent sm:w-auto"
               onClick={() => bulkMediaRef.current?.click()}
               disabled={accounts.length === 0}
             >
@@ -560,8 +567,8 @@ export function ReviewSection() {
       ) : (
         <div className="flex flex-col gap-3">
           {/* Search accounts by number (or name/phone). All show by default. */}
-          <div className="flex items-center justify-between gap-2">
-            <div className="relative w-full max-w-xs">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <div className="relative w-full sm:max-w-xs">
               <Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
               <Input
                 value={search}
@@ -592,15 +599,17 @@ export function ReviewSection() {
               {`No account matches "${search}".`}
             </div>
           ) : (
-            visibleAccounts.map(({ position, account }) => (
-              <SlotCard
-                key={account.id}
-                position={position}
-                account={account}
-                slot={getSlot(position)}
-                onChange={(next) => setSlot(position, next)}
-              />
-            ))
+            <div className="grid grid-cols-1 items-start gap-3 lg:grid-cols-2">
+              {visibleAccounts.map(({ position, account }) => (
+                <SlotCard
+                  key={account.id}
+                  position={position}
+                  account={account}
+                  slot={getSlot(position)}
+                  onChange={(next) => setSlot(position, next)}
+                />
+              ))}
+            </div>
           )}
         </div>
       )}
