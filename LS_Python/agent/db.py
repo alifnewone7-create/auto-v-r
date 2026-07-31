@@ -1178,8 +1178,15 @@ def recount_message_campaign(campaign_id: int) -> None:
     Recompute a campaign's sent/failed counters + overall status from its send
     rows. Status: 'sending' while any row is still pending/sending, else 'done'
     (all sent), 'failed' (all failed), or 'partial' (a mix).
+
+    As soon as the campaign becomes terminal (no send is still pending/sending)
+    we free the heavy media it used: every base64 blob in message_assets that
+    this campaign's sends referenced is deleted right away. The media has already
+    been delivered and is never read again, so this is the main disk saver and it
+    happens the moment the task finishes. The delete is idempotent, so a repeat
+    call (or two shards finishing the last two sends at once) is harmless.
     """
-    query(
+    row = query_one(
         """
         WITH agg AS (
           SELECT
@@ -1201,9 +1208,70 @@ def recount_message_campaign(campaign_id: int) -> None:
                updated_at = now()
           FROM agg
          WHERE c.id = %s
+        RETURNING c.status
         """,
         (campaign_id, campaign_id),
     )
+
+    # Terminal now? Drop this campaign's media assets (they're done being sent).
+    if row and row.get("status") in ("done", "failed", "partial"):
+        query(
+            """
+            DELETE FROM message_assets
+             WHERE id IN (
+               SELECT (aid)::int
+                 FROM message_sends s,
+                      jsonb_array_elements(s.steps) AS step,
+                      jsonb_array_elements_text(step->'asset_ids') AS aid
+                WHERE s.campaign_id = %s
+                  AND step ? 'asset_ids'
+             )
+            """,
+            (campaign_id,),
+        )
+
+
+def cleanup_finished_message_data(job_retention_seconds: int = 3600) -> dict[str, int]:
+    """
+    Periodic safety-net sweep for the Review/DM feature (run by the primary shard).
+    Deletes rows that are no longer needed once work has finished:
+
+      1. Orphan media  – any message_assets blob not referenced by ANY send.
+         Covers uploads that were never sent (composer abandoned) and anything the
+         per-campaign delete in recount_message_campaign happened to miss.
+      2. Spent jobs     – send_dm jobs that are already 'done'/'failed' and older
+         than `job_retention_seconds`. The real per-account outcome lives in
+         message_sends, so these job rows carry no further value.
+
+    Returns a small dict of how many rows were removed, for logging.
+    """
+    assets = query(
+        """
+        DELETE FROM message_assets a
+         WHERE NOT EXISTS (
+           SELECT 1
+             FROM message_sends s,
+                  jsonb_array_elements(s.steps) AS step,
+                  jsonb_array_elements_text(step->'asset_ids') AS aid
+            WHERE step ? 'asset_ids' AND (aid)::int = a.id
+         )
+        RETURNING a.id
+        """
+    )
+    jobs = query(
+        """
+        DELETE FROM jobs
+         WHERE type = 'send_dm'
+           AND status IN ('done', 'failed')
+           AND updated_at < now() - (%s || ' seconds')::interval
+        RETURNING id
+        """,
+        (max(0, int(job_retention_seconds)),),
+    )
+    return {
+        "assets": len(assets) if assets else 0,
+        "jobs": len(jobs) if jobs else 0,
+    }
 
 
 # ---------------------------------------------------------------------------

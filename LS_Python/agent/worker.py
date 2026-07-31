@@ -1644,6 +1644,16 @@ async def main() -> None:
                     print(f"[i] Recovered {recovered} stale job(s) back to the queue.")
             except Exception as e:
                 print(f"[!] stale-job recovery failed: {e}")
+            # Safety-net cleanup for the Review/DM feature: drop orphan media blobs
+            # (abandoned uploads / anything the per-campaign delete missed) and
+            # spent send_dm job rows. Finished campaigns already free their own
+            # media in recount_message_campaign; this just catches the leftovers.
+            try:
+                cleaned = await db.arun(db.cleanup_finished_message_data)
+                if cleaned.get("assets") or cleaned.get("jobs"):
+                    print(f"[dm] cleaned {cleaned['assets']} orphan media + {cleaned['jobs']} spent job(s)")
+            except Exception as e:
+                print(f"[!] message-data cleanup failed: {e}")
             last_purge = now
 
         # Fan-out expansion: the primary shard turns each un-sharded view/react/
