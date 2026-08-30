@@ -69,6 +69,16 @@ ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS country_code      TEXT;
 ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS tglion_pass       TEXT;
 ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS two_step_password TEXT;
 
+-- Frozen-account appeal tracking ----------------------------------------------
+-- When Telegram freezes an account, we let the agent file an appeal on its
+-- behalf (opens the Telegram service chat / @SpamBot and submits the appeal).
+--   appeal_status: null | 'queued' | 'appealing' | 'submitted' | 'failed' | 'recovered'
+--   appeal_result: transcript of what Telegram/@SpamBot replied, or the error
+--   appeal_at:     when the last appeal attempt ran
+ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS appeal_status TEXT;
+ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS appeal_result TEXT;
+ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS appeal_at     TIMESTAMPTZ;
+
 -- Job queue (website enqueues, Python agent claims & executes) -----------------
 CREATE TABLE IF NOT EXISTS jobs (
   id          SERIAL PRIMARY KEY,

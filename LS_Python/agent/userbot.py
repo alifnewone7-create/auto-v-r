@@ -878,6 +878,171 @@ async def probe_account_health(
             return ("unknown", str(e))
 
 
+# Telegram's official service-notifications peer. This numeric id is always
+# reachable from a logged-in session WITHOUT resolving a username, which matters
+# because a frozen account cannot resolve usernames (FROZEN_METHOD_INVALID). The
+# freeze notice + its "Appeal" inline button (when Telegram attaches one) arrive
+# in this chat.
+TELEGRAM_SERVICE_PEER = 777000
+
+# Inline-button / bot-reply wording that means "start or confirm the appeal".
+# Telegram localises and reworries these over time, so we match loosely.
+_APPEAL_BUTTON_HINTS = (
+    "appeal",
+    "this is a mistake",
+    "i disagree",
+    "not a spammer",
+    "no longer",
+    "wrongly",
+    "restore",
+    "unban",
+    "unfreeze",
+    "review",
+    "yes",
+    "confirm",
+    "continue",
+)
+
+# Default appeal message sent to @SpamBot when the flow needs written text.
+_DEFAULT_APPEAL_TEXT = _os.environ.get(
+    "AGENT_APPEAL_TEXT",
+    "Hello, my account has been limited/frozen by mistake. I have not sent spam "
+    "or violated the Terms of Service. Please review and remove the restriction. "
+    "Thank you.",
+)
+
+
+def _looks_like_appeal_button(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return bool(t) and any(h in t for h in _APPEAL_BUTTON_HINTS)
+
+
+async def appeal_frozen(
+    account_id: int,
+    api_id: int,
+    api_hash: str,
+    session_string: str,
+    appeal_text: str | None = None,
+) -> dict:
+    """
+    File a freeze/limit appeal ON BEHALF of one frozen account, doing exactly what
+    a human would: open the Telegram service chat and @SpamBot, press the
+    "Appeal"/"This is a mistake" buttons, and/or send a written appeal, then read
+    back Telegram's replies.
+
+    A frozen account can still CONNECT and receive/send messages to peers it
+    already knows (like the 777000 service chat and @SpamBot) even though every
+    "action" method is blocked — so this is the one thing such an account can
+    still usefully do. This never logs the account out (not an auth job); on any
+    error we return a failure dict with the reason instead of raising.
+
+    Returns: {
+      "recovered": bool,          # account is no longer frozen after appealing
+      "submitted": bool,          # we managed to send/press something
+      "transcript": str,          # human-readable log of what happened + replies
+    }
+    """
+    text = (appeal_text or _DEFAULT_APPEAL_TEXT).strip() or _DEFAULT_APPEAL_TEXT
+    log: list[str] = []
+    submitted = False
+
+    def _note(line: str) -> None:
+        log.append(line)
+
+    async def _capture_reply(peer, after_ms: float = 4.0) -> None:
+        """Wait briefly, then record the newest incoming message text from peer."""
+        await asyncio.sleep(after_ms)
+        try:
+            async for m in client.get_chat_history(peer, limit=3):
+                if not m.outgoing and (m.text or m.caption):
+                    _note(f"  ↳ reply: {(m.text or m.caption).strip()[:400]}")
+                    break
+        except Exception:
+            pass
+
+    async def _try_press_buttons(peer, label: str) -> bool:
+        """Scan recent messages from `peer` for an appeal-like inline button and
+        click the first match. Returns True if something was clicked."""
+        pressed = False
+        try:
+            async for m in client.get_chat_history(peer, limit=12):
+                markup = getattr(m, "reply_markup", None)
+                rows = getattr(markup, "inline_keyboard", None)
+                if not rows:
+                    continue
+                for row in rows:
+                    for btn in row:
+                        if _looks_like_appeal_button(getattr(btn, "text", "")):
+                            _note(f"[{label}] pressing button: {btn.text!r}")
+                            try:
+                                res = await m.click(btn.text)
+                                if isinstance(res, str) and res.strip():
+                                    _note(f"  ↳ Telegram: {res.strip()[:400]}")
+                                pressed = True
+                            except Exception as e:
+                                # URL buttons can't be "clicked" server-side; note and move on.
+                                _note(f"  ↳ could not press {btn.text!r}: {e.__class__.__name__}")
+                            if pressed:
+                                return True
+                if pressed:
+                    break
+        except Exception as e:
+            _note(f"[{label}] could not read history: {e.__class__.__name__}")
+        return pressed
+
+    try:
+        entry = await _ensure_online(account_id, api_id, api_hash, session_string)
+        client: Client = entry["client"]
+    except Exception as e:
+        return {
+            "recovered": False,
+            "submitted": False,
+            "transcript": f"Could not connect account to appeal: {e.__class__.__name__}: {e}",
+        }
+
+    # --- 1) Telegram service chat (777000): press an "Appeal" button if present.
+    if await _try_press_buttons(TELEGRAM_SERVICE_PEER, "service"):
+        submitted = True
+        await _capture_reply(TELEGRAM_SERVICE_PEER)
+
+    # --- 2) @SpamBot conversation: /start, then press a button or send the text.
+    try:
+        await client.send_message("SpamBot", "/start")
+        submitted = True
+        _note("[spambot] sent /start")
+        await asyncio.sleep(3.0)
+        if not await _try_press_buttons("SpamBot", "spambot"):
+            # No button flow — send the written appeal so a human reviewer sees it.
+            await client.send_message("SpamBot", text)
+            _note(f"[spambot] sent appeal text: {text[:200]}")
+        await _capture_reply("SpamBot")
+    except Exception as e:
+        # Frozen accounts often can't resolve @SpamBot by username; that's expected.
+        _note(f"[spambot] unreachable ({e.__class__.__name__}) — this is common for frozen accounts")
+
+    # --- 3) Re-probe: did the appeal (or time) lift the freeze already?
+    recovered = False
+    try:
+        state, detail = await probe_account_health(account_id, api_id, api_hash, session_string)
+        _note(f"[recheck] status now: {state}")
+        recovered = state == "ok"
+    except Exception as e:
+        _note(f"[recheck] could not re-probe: {e.__class__.__name__}")
+
+    if not submitted:
+        _note(
+            "No appeal channel was reachable. Telegram may not have attached an "
+            "in-app appeal for this account yet — try again later, or appeal from "
+            "the official Telegram app."
+        )
+
+    return {
+        "recovered": recovered,
+        "submitted": submitted,
+        "transcript": "\n".join(log) if log else "No appeal actions were possible.",
+    }
+
+
 async def prewarm(accounts: list[dict]) -> int:
     """
     Connect every already-logged-in account up front and keep it in _POOL.

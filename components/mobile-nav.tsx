@@ -1,7 +1,7 @@
 "use client"
 
 import { useState } from "react"
-import { Menu, X, Users, LogOut, Eye, Vote, Smile, UserCog, UserPlus, Radio, Trash2, MessageSquare } from "lucide-react"
+import { Menu, X, Users, LogOut, Eye, Vote, Smile, UserCog, UserPlus, Radio, Trash2, MessageSquare, ShieldCheck } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { logoutAction } from "@/app/actions/auth"
 import {
@@ -32,6 +32,7 @@ const TABS: Tab[] = [
   { value: "profile", label: "Profile", icon: <UserCog className="size-4" /> },
   { value: "prp-delete", label: "Prp Delete", icon: <Trash2 className="size-4" /> },
   { value: "review", label: "Review", icon: <MessageSquare className="size-4" /> },
+  { value: "appeal", label: "Appeal", icon: <ShieldCheck className="size-4" /> },
 ]
 
 interface MobileNavProps {

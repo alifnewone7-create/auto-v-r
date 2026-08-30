@@ -88,7 +88,10 @@ raise_fd_limit()
 # check_frozen is fanned out too: a global health scan must reach EVERY shard's
 # bots, not just the one shard that happens to claim the job (which would only
 # probe ~1/N of the fleet and report the rest as untouched).
-FANOUT_JOB_TYPES = ("view_post", "react_post", "leave_livestream_all", "check_frozen")
+# appeal_frozen is fanned out too: a "appeal all frozen accounts" request must
+# reach EVERY shard's frozen bots (each shard can only appeal from its own local
+# clients), exactly like the check_frozen health scan.
+FANOUT_JOB_TYPES = ("view_post", "react_post", "leave_livestream_all", "check_frozen", "appeal_frozen")
 
 # Pool size. Kept modest because Neon (via the -pooler endpoint) is happiest with
 # a bounded number of server connections; the agent reuses these warm connections
@@ -579,6 +582,29 @@ def update_account(account_id: int, **fields: Any) -> None:
 
 def set_account_status(account_id: int, status: str, error: str | None = None) -> None:
     update_account(account_id, status=status, last_error=error)
+
+
+def set_account_appeal(
+    account_id: int, appeal_status: str, result: str | None = None
+) -> None:
+    """
+    Record the state of a freeze appeal for one account. `appeal_status` is one
+    of 'queued' | 'appealing' | 'submitted' | 'recovered' | 'failed'. The result
+    transcript (Telegram/@SpamBot replies or the error) is stored so the panel
+    can show the user what happened. appeal_at is stamped on every write so the
+    UI can show "last appealed …".
+    """
+    query(
+        """
+        UPDATE telegram_accounts
+           SET appeal_status = %s,
+               appeal_result = %s,
+               appeal_at = now(),
+               updated_at = now()
+         WHERE id = %s
+        """,
+        (appeal_status, result, account_id),
+    )
 
 
 def set_account_cooldown(

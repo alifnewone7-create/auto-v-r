@@ -1,7 +1,7 @@
 "use client"
 
 import { useState } from "react"
-import { Radio, Users, LogOut, Eye, Vote, Smile, UserCog, UserPlus, Trash2, MessageSquare } from "lucide-react"
+import { Radio, Users, LogOut, Eye, Vote, Smile, UserCog, UserPlus, Trash2, MessageSquare, ShieldCheck } from "lucide-react"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Button } from "@/components/ui/button"
 import {
@@ -27,6 +27,7 @@ import { ChannelJoinSection } from "@/components/channel-join-section"
 import { ProfileSection } from "@/components/profile-section"
 import { PrpDeleteSection } from "@/components/prp-delete-section"
 import { ReviewSection } from "@/components/review-section"
+import { AppealSection } from "@/components/appeal-section"
 
 export function Dashboard() {
   const [activeTab, setActiveTab] = useState("accounts")
@@ -119,6 +120,10 @@ export function Dashboard() {
               <MessageSquare className="size-4" />
               <span className="hidden lg:inline">Review</span>
             </TabsTrigger>
+            <TabsTrigger value="appeal" className="gap-2">
+              <ShieldCheck className="size-4" />
+              <span className="hidden lg:inline">Appeal</span>
+            </TabsTrigger>
           </TabsList>
 
           <TabsContent value="accounts" className="mt-6">
@@ -147,6 +152,9 @@ export function Dashboard() {
           </TabsContent>
           <TabsContent value="review" className="mt-6">
             <ReviewSection />
+          </TabsContent>
+          <TabsContent value="appeal" className="mt-6">
+            <AppealSection />
           </TabsContent>
         </Tabs>
       </main>
