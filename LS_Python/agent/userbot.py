@@ -205,6 +205,27 @@ _ACTIVE_JOINS: dict[int, dict] = {}
 # tell who dropped. Values: "connected" | "dropped".
 _LIVE_STATE: dict[int, str] = {}
 
+
+def reserved_live_ids() -> set[int]:
+    """
+    Account ids currently RESERVED for a live stream and therefore excluded from
+    all other work (reactions / views / votes / DMs).
+
+    An account counts as reserved the whole time it is assigned to a live call —
+    both while "connected" AND while temporarily "dropped", because a dropped bot
+    is still owned by the auto-rejoin loop and will be pulled back into the call
+    at any moment. Sending it a task in that window would fight the rejoiner and
+    risk errors, so we keep it out until it fully leaves (which pops _LIVE_STATE
+    via _forget_join). Returns a fresh copy so callers can mutate it freely.
+    """
+    return set(_LIVE_STATE.keys())
+
+
+def is_reserved_for_live(account_id: int) -> bool:
+    """True if this account is tied up in a live stream right now (see
+    reserved_live_ids). Cheap O(1) check for the task selectors/handlers."""
+    return account_id in _LIVE_STATE
+
 # Clients that already have the auto-rejoin handler attached (attach once).
 _REJOIN_ATTACHED: set[int] = set()
 
@@ -2117,7 +2138,14 @@ async def view_post_scheduled(
 
     Returns how many userbots successfully registered a view.
     """
-    pool = [(acc_id, entry["client"]) for acc_id, entry in _POOL.items()]
+    # Skip accounts reserved for a live stream (see reserved_live_ids): a bot in
+    # a live call takes no other work until it leaves and rejoins the pool.
+    reserved = reserved_live_ids()
+    pool = [
+        (acc_id, entry["client"])
+        for acc_id, entry in _POOL.items()
+        if acc_id not in reserved
+    ]
     if not pool:
         return 0
 
@@ -2517,7 +2545,15 @@ async def react_post_scheduled(
     Returns how many userbots successfully reacted (emojis the channel rejects
     are skipped, so the count can be lower than the number chosen).
     """
-    pool = [(acc_id, entry["client"]) for acc_id, entry in _POOL.items()]
+    # Exclude any account currently reserved for a live stream: while a bot is in
+    # (or auto-rejoining) a live call it must take NO other work. It rejoins the
+    # normal task pool automatically once it leaves (see reserved_live_ids).
+    reserved = reserved_live_ids()
+    pool = [
+        (acc_id, entry["client"])
+        for acc_id, entry in _POOL.items()
+        if acc_id not in reserved
+    ]
     if not pool or not emojis:
         return 0
 

@@ -1,6 +1,6 @@
 "use server"
 
-import { query, queryOne } from "@/lib/db"
+import { query, queryOne, LIVE_BUSY_STATUSES, notInLiveSql } from "@/lib/db"
 import { isAuthenticated } from "@/lib/auth"
 import { revalidatePath } from "next/cache"
 import { isTelegramLink } from "@/lib/validation"
@@ -80,6 +80,9 @@ export async function castVotes(targetId: number, optionIndex: number, amount: n
   if (target.status !== "ready") return { error: "Poll is not ready yet. Detect the poll first." }
 
   // Logged-in userbots with NO active cast on this poll = the ones still free.
+  // Accounts currently reserved for a live stream are excluded (they take no
+  // other work until they leave); with fewer free accounts we simply cast fewer
+  // votes (capped by LIMIT) — never an error, never a crash.
   const free = await query<TelegramAccount>(
     `SELECT a.id FROM telegram_accounts a
      WHERE a.status = 'logged_in'
@@ -87,9 +90,10 @@ export async function castVotes(targetId: number, optionIndex: number, amount: n
          SELECT 1 FROM vote_casts c
          WHERE c.target_id = $1 AND c.account_id = a.id AND c.status <> 'failed'
        )
+       AND ${notInLiveSql("a", 3)}
      ORDER BY a.id
      LIMIT $2`,
-    [targetId, amount],
+    [targetId, amount, LIVE_BUSY_STATUSES],
   )
 
   if (free.length === 0) {

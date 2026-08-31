@@ -399,3 +399,22 @@ export async function queryOne<T = any>(text: string, params: any[] = []): Promi
   const rows = await query<T>(text, params)
   return rows[0] ?? null
 }
+
+// Participant statuses that mean an account is currently tied up in a live
+// stream (joining, in the call, or on its way out). While an account is in any
+// of these states it must NOT be handed any other work (reactions/views/votes/
+// DMs) — it rejoins the normal task pool automatically once it leaves.
+export const LIVE_BUSY_STATUSES = ["pending", "joining", "joined", "leaving"] as const
+
+// SQL predicate: "this `telegram_accounts` row alias is NOT reserved for a live
+// stream right now." Pass the table alias used in your query (e.g. "a") and the
+// $-placeholder index that will carry LIVE_BUSY_STATUSES. Keeps the live-reserve
+// rule identical across every task selector (vote, DM, …). Example:
+//   `... WHERE a.status = 'logged_in' AND ${notInLiveSql("a", 1)}`  with param $1 = LIVE_BUSY_STATUSES
+export function notInLiveSql(alias: string, statusParamIndex: number): string {
+  return `NOT EXISTS (
+    SELECT 1 FROM livestream_participants p
+     WHERE p.account_id = ${alias}.id
+       AND p.status = ANY($${statusParamIndex})
+  )`
+}

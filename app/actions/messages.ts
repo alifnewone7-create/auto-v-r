@@ -1,6 +1,6 @@
 "use server"
 
-import { query, queryOne } from "@/lib/db"
+import { query, queryOne, LIVE_BUSY_STATUSES, notInLiveSql } from "@/lib/db"
 import { isAuthenticated } from "@/lib/auth"
 import { revalidatePath } from "next/cache"
 import type { MessageStep } from "@/lib/types"
@@ -95,16 +95,28 @@ export async function sendMessageCampaign(input: SendCampaignInput) {
     return { error: "Add at least one message (text or media) for at least one account." }
   }
 
-  // Only allow logged-in accounts, and confirm every referenced asset exists.
+  // Only allow logged-in accounts that are NOT currently reserved for a live
+  // stream, and confirm every referenced asset exists. An account in a live call
+  // takes no other work, so it's skipped here (it becomes usable again the moment
+  // it leaves the stream) rather than fighting the live keep-alive.
   const accountIds = Array.from(new Set(slots.map((s) => s.accountId)))
-  const liveAccounts = await query<{ id: number }>(
-    `SELECT id FROM telegram_accounts WHERE status = 'logged_in' AND id = ANY($1::int[])`,
-    [accountIds],
+  const eligible = await query<{ id: number }>(
+    `SELECT a.id FROM telegram_accounts a
+      WHERE a.status = 'logged_in'
+        AND a.id = ANY($1::int[])
+        AND ${notInLiveSql("a", 2)}`,
+    [accountIds, LIVE_BUSY_STATUSES],
   )
-  const liveSet = new Set(liveAccounts.map((a) => a.id))
-  const usableSlots = slots.filter((s) => liveSet.has(s.accountId))
+  const eligibleSet = new Set(eligible.map((a) => a.id))
+  const usableSlots = slots.filter((s) => eligibleSet.has(s.accountId))
+  const skippedLive = slots.length - usableSlots.length
   if (usableSlots.length === 0) {
-    return { error: "None of the selected accounts are logged in." }
+    return {
+      error:
+        skippedLive > 0
+          ? "All selected accounts are busy in a live stream right now. Try again after they leave the live."
+          : "None of the selected accounts are logged in.",
+    }
   }
 
   // Create the campaign row first so sends/jobs can reference it.
@@ -131,7 +143,7 @@ export async function sendMessageCampaign(input: SendCampaignInput) {
   )
 
   revalidatePath("/")
-  return { ok: true, count: usableSlots.length }
+  return { ok: true, count: usableSlots.length, skippedLive }
 }
 
 export async function deleteMessageCampaign(campaignId: number) {
