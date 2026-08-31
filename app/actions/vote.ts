@@ -30,7 +30,12 @@ export async function detectPoll(formData: FormData) {
   if (!link) return { error: "Poll / channel link is required." }
   if (!isTelegramLink(link)) return { error: "Enter a valid Telegram link." }
 
-  const accounts = await query<TelegramAccount>(`SELECT id FROM telegram_accounts WHERE status = 'logged_in' LIMIT 1`)
+  const accounts = await query<TelegramAccount>(
+    `SELECT a.id FROM telegram_accounts a
+      WHERE a.status = 'logged_in' AND ${notInLiveSql("a", 1)}
+      LIMIT 1`,
+    [LIVE_BUSY_STATUSES],
+  )
   if (accounts.length === 0) {
     return { error: "No logged-in userbots available. Add and log in an account first." }
   }
@@ -53,7 +58,12 @@ export async function redetectPoll(targetId: number) {
   const target = await queryOne<VoteTarget>(`SELECT * FROM vote_targets WHERE id = $1`, [targetId])
   if (!target) return { error: "Poll not found." }
 
-  const account = await queryOne<TelegramAccount>(`SELECT id FROM telegram_accounts WHERE status = 'logged_in' LIMIT 1`)
+  const account = await queryOne<TelegramAccount>(
+    `SELECT a.id FROM telegram_accounts a
+      WHERE a.status = 'logged_in' AND ${notInLiveSql("a", 1)}
+      LIMIT 1`,
+    [LIVE_BUSY_STATUSES],
+  )
   if (!account) return { error: "No logged-in userbots available." }
 
   await query(`UPDATE vote_targets SET status = 'detecting', last_error = NULL, updated_at = now() WHERE id = $1`, [
