@@ -35,6 +35,11 @@ CREATE TABLE IF NOT EXISTS telegram_accounts (
 ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS mtproto_hash TEXT;
 ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS login_hash   TEXT;
 
+-- Frozen-account appeal tracking (agent files the appeal on the account's behalf)
+ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS appeal_status TEXT;
+ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS appeal_result TEXT;
+ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS appeal_at     TIMESTAMPTZ;
+
 -- Job queue (website enqueues, Python agent claims & executes) -----------------
 CREATE TABLE IF NOT EXISTS jobs (
   id          SERIAL PRIMARY KEY,

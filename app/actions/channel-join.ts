@@ -1,6 +1,6 @@
 "use server"
 
-import { query, queryOne } from "@/lib/db"
+import { query, queryOne, LIVE_BUSY_STATUSES, notInLiveSql } from "@/lib/db"
 import { isAuthenticated } from "@/lib/auth"
 import { revalidatePath } from "next/cache"
 import { isTelegramLink } from "@/lib/validation"
@@ -83,7 +83,12 @@ export async function joinChannel(formData: FormData) {
 
   const allAccounts = await query<TelegramAccount>(
     // Random order so a partial count spreads across different accounts.
-    `SELECT * FROM telegram_accounts WHERE status = 'logged_in' ORDER BY random()`,
+    // Accounts reserved for a live stream are skipped (no other work while live).
+    `SELECT a.* FROM telegram_accounts a
+      WHERE a.status = 'logged_in'
+        AND ${notInLiveSql("a", 1)}
+      ORDER BY random()`,
+    [LIVE_BUSY_STATUSES],
   )
   if (allAccounts.length === 0) {
     return { error: "No logged-in userbots available. Add and log in an account first." }

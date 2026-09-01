@@ -644,8 +644,10 @@ async def handle_view_post(job: dict) -> dict:
     # target split across shards, instead of being re-rolled on every shard (which
     # would multiply the views by the shard count = "all userbots view").
     shard_index = int(payload.get("shard_index", SHARD_INDEX) or 0)
+    reserved = await _reserved_live_ids()
     count = await userbot.view_post_scheduled(
-        chat_id, message_id, VIEW_SPREAD_SECONDS, view_min, view_max, shard_index, SHARD_COUNT
+        chat_id, message_id, VIEW_SPREAD_SECONDS, view_min, view_max, shard_index, SHARD_COUNT,
+        reserved_ids=reserved,
     )
     if target_id:
         db.bump_view_sent(int(target_id), count)
@@ -732,6 +734,34 @@ REACTION_WINDOWS = {
 }
 
 
+# --- Live-reserve cache -------------------------------------------------------
+# reaction/view jobs can arrive many-per-second on a busy channel, so we don't
+# hit the DB for the reserved-account set on every single post. Instead we cache
+# the DB-authoritative set (accounts currently in a live stream) for a couple of
+# seconds. That's fresh enough that a bot leaving a live resumes reactions/views
+# almost immediately, while a burst of posts shares one query.
+_RESERVED_CACHE: set[int] = set()
+_RESERVED_CACHE_AT: float = 0.0
+_RESERVED_CACHE_TTL = 3.0
+
+
+async def _reserved_live_ids() -> set[int]:
+    """DB-authoritative set of accounts reserved for a live stream, cached for
+    _RESERVED_CACHE_TTL seconds. Self-healing: returns empty as soon as no live
+    task exists, so every account resumes reaction/view work on its own."""
+    global _RESERVED_CACHE, _RESERVED_CACHE_AT
+    now = time.monotonic()
+    if now - _RESERVED_CACHE_AT >= _RESERVED_CACHE_TTL:
+        try:
+            _RESERVED_CACHE = await db.arun(db.active_live_account_ids)
+        except Exception as e:
+            # On a transient DB hiccup, keep the last known set rather than
+            # accidentally un-reserving (or over-reserving) everyone.
+            print(f"[!] could not refresh live-reserve set: {e}")
+        _RESERVED_CACHE_AT = now
+    return _RESERVED_CACHE
+
+
 async def handle_react_post(job: dict) -> dict:
     """
     React to a single channel post from EVERY warm userbot, staggered over a
@@ -757,8 +787,10 @@ async def handle_react_post(job: dict) -> dict:
     # target split across shards, instead of being re-rolled on every shard (which
     # would multiply the reactions by the shard count = "all userbots react").
     shard_index = int(p.get("shard_index", SHARD_INDEX) or 0)
+    reserved = await _reserved_live_ids()
     count = await userbot.react_post_scheduled(
-        chat_id, message_id, emojis, window, react_min, react_max, shard_index, SHARD_COUNT
+        chat_id, message_id, emojis, window, react_min, react_max, shard_index, SHARD_COUNT,
+        reserved_ids=reserved,
     )
     if target_id:
         db.bump_reaction_sent(int(target_id), count)
@@ -1037,6 +1069,101 @@ async def handle_check_frozen(job: dict) -> dict:
     }
 
 
+async def handle_appeal_frozen(job: dict) -> dict:
+    """
+    File a freeze/limit appeal on behalf of frozen accounts. For each account the
+    agent opens the Telegram service chat + @SpamBot and presses the
+    "Appeal"/"This is a mistake" buttons (or sends a written appeal), then
+    re-checks whether the freeze lifted.
+
+    Payload:
+      {account_id: N}              -> appeal just that one account, OR
+      {}                           -> appeal EVERY frozen account on this shard
+      {appeal_text: "..."}         -> optional custom message for @SpamBot
+
+    Per-account progress is written to telegram_accounts.appeal_status /
+    appeal_result so the Appeal tab can show what happened. An account that
+    recovers is flipped back to 'logged_in'. Appealing never logs an account out.
+    """
+    payload = job.get("payload") or {}
+    one_id = payload.get("account_id") or job.get("account_id")
+    appeal_text = payload.get("appeal_text") or None
+
+    if one_id:
+        rows = db.query(
+            """
+            SELECT id, api_id, api_hash, session_string
+            FROM telegram_accounts
+            WHERE id = %s AND status = 'frozen'
+              AND api_id IS NOT NULL AND api_hash IS NOT NULL
+              AND session_string IS NOT NULL
+            """,
+            (int(one_id),),
+        )
+    else:
+        rows = db.query(
+            """
+            SELECT id, api_id, api_hash, session_string
+            FROM telegram_accounts
+            WHERE status = 'frozen'
+              AND api_id IS NOT NULL AND api_hash IS NOT NULL
+              AND session_string IS NOT NULL
+            """
+            + _SHARD_ACCOUNT_SQL,
+            _SHARD_ACCOUNT_PARAMS or None,
+        )
+
+    if not rows:
+        return {"stage": "appealed", "appealed": 0, "recovered": 0}
+
+    counts = {"appealed": 0, "recovered": 0, "failed": 0}
+
+    async def _appeal(acc: dict) -> None:
+        await db.arun(db.set_account_appeal, acc["id"], "appealing", None)
+        try:
+            res = await userbot.appeal_frozen(
+                acc["id"], int(acc["api_id"]), acc["api_hash"], acc["session_string"],
+                appeal_text,
+            )
+        except Exception as e:  # never let one account crash the batch
+            await db.arun(
+                db.set_account_appeal, acc["id"], "failed",
+                f"{e.__class__.__name__}: {e}"[:2000],
+            )
+            counts["failed"] += 1
+            return
+
+        transcript = (res.get("transcript") or "")[:2000]
+        if res.get("recovered"):
+            # Freeze lifted — bring the account back into the active pool.
+            await db.arun(db.set_account_appeal, acc["id"], "recovered", transcript)
+            await db.arun(db.set_account_status, acc["id"], "logged_in", None)
+            counts["recovered"] += 1
+        elif res.get("submitted"):
+            await db.arun(db.set_account_appeal, acc["id"], "submitted", transcript)
+            counts["appealed"] += 1
+        else:
+            await db.arun(db.set_account_appeal, acc["id"], "failed", transcript)
+            counts["failed"] += 1
+
+    # Small batches: appeal_frozen already gates + jitters its Telegram calls, so
+    # this just bounds how many accounts are appealing at once.
+    for i in range(0, len(rows), 10):
+        await asyncio.gather(*(_appeal(a) for a in rows[i : i + 10]))
+
+    print(
+        f"[OK] appeal_frozen: {len(rows)} appealed -> "
+        f"{counts['recovered']} recovered, {counts['appealed']} submitted, "
+        f"{counts['failed']} failed"
+    )
+    return {
+        "stage": "appealed",
+        "appealed": counts["appealed"],
+        "recovered": counts["recovered"],
+        "failed": counts["failed"],
+    }
+
+
 HANDLERS = {
     "buy_tglion_batch": handle_buy_tglion_batch,
     "provision_tglion": handle_provision_tglion,
@@ -1058,6 +1185,7 @@ HANDLERS = {
     "delete_profile_photos": handle_delete_profile_photos,
     "send_dm": handle_send_dm,
     "check_frozen": handle_check_frozen,
+    "appeal_frozen": handle_appeal_frozen,
 }
 
 # Jobs that are part of the login / auth flow. ONLY these may flip an account

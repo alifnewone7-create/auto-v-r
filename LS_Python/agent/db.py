@@ -88,7 +88,10 @@ raise_fd_limit()
 # check_frozen is fanned out too: a global health scan must reach EVERY shard's
 # bots, not just the one shard that happens to claim the job (which would only
 # probe ~1/N of the fleet and report the rest as untouched).
-FANOUT_JOB_TYPES = ("view_post", "react_post", "leave_livestream_all", "check_frozen")
+# appeal_frozen is fanned out too: a "appeal all frozen accounts" request must
+# reach EVERY shard's frozen bots (each shard can only appeal from its own local
+# clients), exactly like the check_frozen health scan.
+FANOUT_JOB_TYPES = ("view_post", "react_post", "leave_livestream_all", "check_frozen", "appeal_frozen")
 
 # Pool size. Kept modest because Neon (via the -pooler endpoint) is happiest with
 # a bounded number of server connections; the agent reuses these warm connections
@@ -581,6 +584,29 @@ def set_account_status(account_id: int, status: str, error: str | None = None) -
     update_account(account_id, status=status, last_error=error)
 
 
+def set_account_appeal(
+    account_id: int, appeal_status: str, result: str | None = None
+) -> None:
+    """
+    Record the state of a freeze appeal for one account. `appeal_status` is one
+    of 'queued' | 'appealing' | 'submitted' | 'recovered' | 'failed'. The result
+    transcript (Telegram/@SpamBot replies or the error) is stored so the panel
+    can show the user what happened. appeal_at is stamped on every write so the
+    UI can show "last appealed …".
+    """
+    query(
+        """
+        UPDATE telegram_accounts
+           SET appeal_status = %s,
+               appeal_result = %s,
+               appeal_at = now(),
+               updated_at = now()
+         WHERE id = %s
+        """,
+        (appeal_status, result, account_id),
+    )
+
+
 def set_account_cooldown(
     account_id: int,
     seconds: float,
@@ -703,6 +729,41 @@ def reserve_paced_slot(gap_seconds: float) -> float:
 # ---------------------------------------------------------------------------
 # Livestream helpers
 # ---------------------------------------------------------------------------
+
+# Participant statuses that mean an account is CURRENTLY tied up in a live stream
+# and must not be handed any other work (reactions / views / votes / DMs). Kept
+# in sync with the website's LIVE_BUSY_STATUSES (lib/db.ts).
+LIVE_BUSY_STATUSES = ("pending", "joining", "joined", "leaving")
+
+
+def active_live_account_ids() -> set[int]:
+    """
+    The AUTHORITATIVE, self-healing set of account ids currently reserved for a
+    live stream, read straight from the database.
+
+    This is the same source of truth the website uses to keep live bots out of
+    vote/DM tasks, now shared with the agent's reaction/view path. Because it is
+    driven by `livestream_participants` (whose rows are deleted the instant a live
+    task is stopped or deleted, and set to 'left' when a bot leaves), it can never
+    get "stuck": the moment no live task exists, this returns an empty set and
+    every account resumes all work — exactly the behaviour we want. Unlike the
+    agent's in-memory _LIVE_STATE it also survives an agent restart and any
+    event-tracking drift.
+
+    Only counts participants of a target that still EXISTS, so orphaned rows can
+    never keep an account reserved.
+    """
+    rows = query(
+        """
+        SELECT DISTINCT p.account_id
+          FROM livestream_participants p
+          JOIN livestream_targets t ON t.id = p.target_id
+         WHERE p.status = ANY(%s)
+        """,
+        (list(LIVE_BUSY_STATUSES),),
+    )
+    return {int(r["account_id"]) for r in rows} if rows else set()
+
 
 def set_participant(target_id: int, account_id: int, status: str, error: str | None = None) -> None:
     # Guard against a deleted target: if the live stream task was removed while a

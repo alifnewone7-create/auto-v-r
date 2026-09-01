@@ -70,6 +70,7 @@ export type JobType =
   | "retract_vote" // make one userbot remove its vote from a poll
   | "update_profile" // change an account's name / username / profile photo
   | "check_frozen" // probe accounts and mark frozen/banned/logged-out ones
+  | "appeal_frozen" // file a freeze appeal (Telegram service / @SpamBot) for frozen accounts
 
 export type JobStatus = "queued" | "processing" | "done" | "failed"
 
@@ -310,6 +311,28 @@ export interface ReviewAccountSlot {
   id: number
   label: string | null
   phone_number: string
+}
+
+// Lifecycle of a freeze appeal filed by the agent on an account's behalf.
+//  queued    -> appeal job enqueued, agent hasn't run it yet
+//  appealing -> agent is opening the Telegram service chat / @SpamBot right now
+//  submitted -> the appeal was sent; see appeal_result for Telegram's reply
+//  recovered -> the account is no longer frozen after appealing (back to logged_in)
+//  failed    -> could not file the appeal (see appeal_result)
+export type AppealStatus = "queued" | "appealing" | "submitted" | "recovered" | "failed"
+
+// A frozen telegram account shown in the Appeal tab, with its freeze reason and
+// the latest appeal attempt state.
+export interface FrozenAccountRow {
+  id: number
+  label: string | null
+  phone_number: string
+  status: AccountStatus
+  frozen_reason: string | null // from last_error when Telegram froze it
+  appeal_status: AppealStatus | null
+  appeal_result: string | null
+  appeal_at: string | null
+  updated_at: string
 }
 
 // A telegram account row enriched with the latest profile-edit result, used by

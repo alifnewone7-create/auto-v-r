@@ -205,6 +205,71 @@ _ACTIVE_JOINS: dict[int, dict] = {}
 # tell who dropped. Values: "connected" | "dropped".
 _LIVE_STATE: dict[int, str] = {}
 
+# --- Online-presence keep-alive for live-stream bots -------------------------
+# Telegram only shows an account as "online" for ~60s after it reports activity
+# (account.updateStatus offline=false). A bot that just holds a WebRTC call makes
+# NO such report, so it keeps showing "last seen a long time ago" even while it's
+# sitting in the live. Real viewers look online, so we mimic that: every account
+# that is live gets its presence refreshed on a cadence shorter than Telegram's
+# ~60s window. We throttle per-account so the 15s reconcile sweep doesn't fire a
+# needless updateStatus every pass.
+ONLINE_PING_SECONDS = max(20.0, float(_os.environ.get("AGENT_ONLINE_PING_SECONDS", "45")))
+# { account_id: monotonic timestamp of the last successful online ping }
+_LAST_ONLINE_PING: dict[int, float] = {}
+
+
+async def _set_online(account_id: int, client: "Client", *, force: bool = False) -> None:
+    """
+    Report this account as ONLINE to Telegram (account.updateStatus offline=false)
+    so it shows as active while it's in a live stream — just like a real viewer.
+
+    Throttled to ONLINE_PING_SECONDS per account so repeated reconcile sweeps
+    don't spam updateStatus. Pass force=True right after a (re)join to flip the
+    account online immediately. Best-effort and never raises: presence is cosmetic
+    and must never interfere with the join/keep-alive path.
+
+    NOTE: if the account itself has hidden its "last seen & online" in privacy
+    settings, Telegram won't show it online to others no matter what we send —
+    that's a per-account setting, not something the API can override here.
+    """
+    if client is None or not getattr(client, "is_connected", False):
+        return
+    now = time.monotonic()
+    if not force:
+        last = _LAST_ONLINE_PING.get(account_id, 0.0)
+        if now - last < ONLINE_PING_SECONDS:
+            return
+    try:
+        from pyrogram.raw.functions.account import UpdateStatus
+
+        await client.invoke(UpdateStatus(offline=False))
+        _LAST_ONLINE_PING[account_id] = now
+    except Exception:
+        # Rate limit / transient error — leave the throttle timestamp untouched so
+        # the next sweep retries. Presence is never allowed to break keep-alive.
+        pass
+
+
+def reserved_live_ids() -> set[int]:
+    """
+    Account ids currently RESERVED for a live stream and therefore excluded from
+    all other work (reactions / views / votes / DMs).
+
+    An account counts as reserved the whole time it is assigned to a live call —
+    both while "connected" AND while temporarily "dropped", because a dropped bot
+    is still owned by the auto-rejoin loop and will be pulled back into the call
+    at any moment. Sending it a task in that window would fight the rejoiner and
+    risk errors, so we keep it out until it fully leaves (which pops _LIVE_STATE
+    via _forget_join). Returns a fresh copy so callers can mutate it freely.
+    """
+    return set(_LIVE_STATE.keys())
+
+
+def is_reserved_for_live(account_id: int) -> bool:
+    """True if this account is tied up in a live stream right now (see
+    reserved_live_ids). Cheap O(1) check for the task selectors/handlers."""
+    return account_id in _LIVE_STATE
+
 # Clients that already have the auto-rejoin handler attached (attach once).
 _REJOIN_ATTACHED: set[int] = set()
 
@@ -878,6 +943,171 @@ async def probe_account_health(
             return ("unknown", str(e))
 
 
+# Telegram's official service-notifications peer. This numeric id is always
+# reachable from a logged-in session WITHOUT resolving a username, which matters
+# because a frozen account cannot resolve usernames (FROZEN_METHOD_INVALID). The
+# freeze notice + its "Appeal" inline button (when Telegram attaches one) arrive
+# in this chat.
+TELEGRAM_SERVICE_PEER = 777000
+
+# Inline-button / bot-reply wording that means "start or confirm the appeal".
+# Telegram localises and reworries these over time, so we match loosely.
+_APPEAL_BUTTON_HINTS = (
+    "appeal",
+    "this is a mistake",
+    "i disagree",
+    "not a spammer",
+    "no longer",
+    "wrongly",
+    "restore",
+    "unban",
+    "unfreeze",
+    "review",
+    "yes",
+    "confirm",
+    "continue",
+)
+
+# Default appeal message sent to @SpamBot when the flow needs written text.
+_DEFAULT_APPEAL_TEXT = _os.environ.get(
+    "AGENT_APPEAL_TEXT",
+    "Hello, my account has been limited/frozen by mistake. I have not sent spam "
+    "or violated the Terms of Service. Please review and remove the restriction. "
+    "Thank you.",
+)
+
+
+def _looks_like_appeal_button(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return bool(t) and any(h in t for h in _APPEAL_BUTTON_HINTS)
+
+
+async def appeal_frozen(
+    account_id: int,
+    api_id: int,
+    api_hash: str,
+    session_string: str,
+    appeal_text: str | None = None,
+) -> dict:
+    """
+    File a freeze/limit appeal ON BEHALF of one frozen account, doing exactly what
+    a human would: open the Telegram service chat and @SpamBot, press the
+    "Appeal"/"This is a mistake" buttons, and/or send a written appeal, then read
+    back Telegram's replies.
+
+    A frozen account can still CONNECT and receive/send messages to peers it
+    already knows (like the 777000 service chat and @SpamBot) even though every
+    "action" method is blocked — so this is the one thing such an account can
+    still usefully do. This never logs the account out (not an auth job); on any
+    error we return a failure dict with the reason instead of raising.
+
+    Returns: {
+      "recovered": bool,          # account is no longer frozen after appealing
+      "submitted": bool,          # we managed to send/press something
+      "transcript": str,          # human-readable log of what happened + replies
+    }
+    """
+    text = (appeal_text or _DEFAULT_APPEAL_TEXT).strip() or _DEFAULT_APPEAL_TEXT
+    log: list[str] = []
+    submitted = False
+
+    def _note(line: str) -> None:
+        log.append(line)
+
+    async def _capture_reply(peer, after_ms: float = 4.0) -> None:
+        """Wait briefly, then record the newest incoming message text from peer."""
+        await asyncio.sleep(after_ms)
+        try:
+            async for m in client.get_chat_history(peer, limit=3):
+                if not m.outgoing and (m.text or m.caption):
+                    _note(f"  ↳ reply: {(m.text or m.caption).strip()[:400]}")
+                    break
+        except Exception:
+            pass
+
+    async def _try_press_buttons(peer, label: str) -> bool:
+        """Scan recent messages from `peer` for an appeal-like inline button and
+        click the first match. Returns True if something was clicked."""
+        pressed = False
+        try:
+            async for m in client.get_chat_history(peer, limit=12):
+                markup = getattr(m, "reply_markup", None)
+                rows = getattr(markup, "inline_keyboard", None)
+                if not rows:
+                    continue
+                for row in rows:
+                    for btn in row:
+                        if _looks_like_appeal_button(getattr(btn, "text", "")):
+                            _note(f"[{label}] pressing button: {btn.text!r}")
+                            try:
+                                res = await m.click(btn.text)
+                                if isinstance(res, str) and res.strip():
+                                    _note(f"  ↳ Telegram: {res.strip()[:400]}")
+                                pressed = True
+                            except Exception as e:
+                                # URL buttons can't be "clicked" server-side; note and move on.
+                                _note(f"  ↳ could not press {btn.text!r}: {e.__class__.__name__}")
+                            if pressed:
+                                return True
+                if pressed:
+                    break
+        except Exception as e:
+            _note(f"[{label}] could not read history: {e.__class__.__name__}")
+        return pressed
+
+    try:
+        entry = await _ensure_online(account_id, api_id, api_hash, session_string)
+        client: Client = entry["client"]
+    except Exception as e:
+        return {
+            "recovered": False,
+            "submitted": False,
+            "transcript": f"Could not connect account to appeal: {e.__class__.__name__}: {e}",
+        }
+
+    # --- 1) Telegram service chat (777000): press an "Appeal" button if present.
+    if await _try_press_buttons(TELEGRAM_SERVICE_PEER, "service"):
+        submitted = True
+        await _capture_reply(TELEGRAM_SERVICE_PEER)
+
+    # --- 2) @SpamBot conversation: /start, then press a button or send the text.
+    try:
+        await client.send_message("SpamBot", "/start")
+        submitted = True
+        _note("[spambot] sent /start")
+        await asyncio.sleep(3.0)
+        if not await _try_press_buttons("SpamBot", "spambot"):
+            # No button flow — send the written appeal so a human reviewer sees it.
+            await client.send_message("SpamBot", text)
+            _note(f"[spambot] sent appeal text: {text[:200]}")
+        await _capture_reply("SpamBot")
+    except Exception as e:
+        # Frozen accounts often can't resolve @SpamBot by username; that's expected.
+        _note(f"[spambot] unreachable ({e.__class__.__name__}) — this is common for frozen accounts")
+
+    # --- 3) Re-probe: did the appeal (or time) lift the freeze already?
+    recovered = False
+    try:
+        state, detail = await probe_account_health(account_id, api_id, api_hash, session_string)
+        _note(f"[recheck] status now: {state}")
+        recovered = state == "ok"
+    except Exception as e:
+        _note(f"[recheck] could not re-probe: {e.__class__.__name__}")
+
+    if not submitted:
+        _note(
+            "No appeal channel was reachable. Telegram may not have attached an "
+            "in-app appeal for this account yet — try again later, or appeal from "
+            "the official Telegram app."
+        )
+
+    return {
+        "recovered": recovered,
+        "submitted": submitted,
+        "transcript": "\n".join(log) if log else "No appeal actions were possible.",
+    }
+
+
 async def prewarm(accounts: list[dict]) -> int:
     """
     Connect every already-logged-in account up front and keep it in _POOL.
@@ -949,6 +1179,7 @@ def _forget_join(account_id: int) -> None:
     _LIVE_STATE.pop(account_id, None)
     _JOIN_FAILS.pop(account_id, None)
     _NEXT_RETRY_AT.pop(account_id, None)
+    _LAST_ONLINE_PING.pop(account_id, None)
 
 
 async def _teardown_client(account_id: int) -> None:
@@ -1085,6 +1316,8 @@ async def _rejoin_one(account_id: int, target: dict) -> bool:
             _LIVE_STATE[account_id] = "connected"
             _JOIN_FAILS.pop(account_id, None)
             _NEXT_RETRY_AT.pop(account_id, None)
+            # Show online again as soon as we're back in the call.
+            await _set_online(account_id, entry.get("client"), force=True)
             return True
         except asyncio.TimeoutError:
             # Wedged negotiation — drop the whole client so it can't keep spinning
@@ -1156,6 +1389,9 @@ async def reconcile_active_joins() -> int:
         by_chat.setdefault(int(target["chat_id"]), []).append((account_id, target))
 
     to_rejoin: list[tuple[int, dict]] = []
+    # Connected bots whose Telegram presence we'll refresh this sweep so they keep
+    # showing "online" while in the live (throttled per account inside _set_online).
+    to_online: list[tuple[int, "Client"]] = []
 
     for chat_id, members in by_chat.items():
         # --- Is the host's live stream still running? Ask ONCE, via any warm
@@ -1224,6 +1460,20 @@ async def reconcile_active_joins() -> int:
                 next_at = _NEXT_RETRY_AT.get(account_id)
                 if next_at is None or now >= next_at:
                     to_rejoin.append((account_id, target))
+            elif entry is not None:
+                # Still in the call — keep it looking "online" like a real viewer.
+                client = entry.get("client")
+                if client is not None:
+                    to_online.append((account_id, client))
+
+    # Refresh presence for the connected bots FIRST (each call is throttled and
+    # near-instant when not yet due), so this runs even when nothing needs a
+    # rejoin. Presence is best-effort and never blocks the recovery path.
+    if to_online:
+        await asyncio.gather(
+            *(_set_online(aid, cli) for aid, cli in to_online),
+            return_exceptions=True,
+        )
 
     if not to_rejoin:
         return 0
@@ -1300,6 +1550,9 @@ async def join_livestream(
                 # Remember we belong here so auto-rejoin can restore us on a drop.
                 _ACTIVE_JOINS[account_id] = target_info
                 _LIVE_STATE[account_id] = "connected"
+                # Flip to "online" right away so it looks like a real viewer the
+                # instant it joins, not on the next reconcile sweep.
+                await _set_online(account_id, client, force=True)
                 return  # joined successfully
             except asyncio.TimeoutError as e:
                 # Negotiation stalled — rebuild a clean transport before retrying
@@ -1327,6 +1580,7 @@ async def join_livestream(
                 if _already_in_call(e):
                     _ACTIVE_JOINS[account_id] = target_info
                     _LIVE_STATE[account_id] = "connected"
+                    await _set_online(account_id, client, force=True)
                     return
                 # A frozen account can never join — stop retrying immediately and
                 # surface it as frozen so the worker retires the account instead of
@@ -1931,6 +2185,7 @@ async def view_post_scheduled(
     view_max: int = 0,
     shard_index: int = 0,
     shard_count: int = 1,
+    reserved_ids: set[int] | None = None,
 ) -> int:
     """
     View a single post from the warm userbots, trickling the views in over
@@ -1952,7 +2207,16 @@ async def view_post_scheduled(
 
     Returns how many userbots successfully registered a view.
     """
-    pool = [(acc_id, entry["client"]) for acc_id, entry in _POOL.items()]
+    # Skip accounts reserved for a live stream: a bot in a live call takes no
+    # other work until it leaves. `reserved_ids` is the DB-authoritative set the
+    # worker passes (self-healing / restart-proof); fall back to the in-memory
+    # view only if none was supplied.
+    reserved = reserved_ids if reserved_ids is not None else reserved_live_ids()
+    pool = [
+        (acc_id, entry["client"])
+        for acc_id, entry in _POOL.items()
+        if acc_id not in reserved
+    ]
     if not pool:
         return 0
 
@@ -2330,6 +2594,7 @@ async def react_post_scheduled(
     react_max: int = 0,
     shard_index: int = 0,
     shard_count: int = 1,
+    reserved_ids: set[int] | None = None,
 ) -> int:
     """
     React to a single post from the warm userbots, staggering each userbot's
@@ -2352,7 +2617,17 @@ async def react_post_scheduled(
     Returns how many userbots successfully reacted (emojis the channel rejects
     are skipped, so the count can be lower than the number chosen).
     """
-    pool = [(acc_id, entry["client"]) for acc_id, entry in _POOL.items()]
+    # Exclude any account currently reserved for a live stream: while a bot is in
+    # a live call it must take NO other work, and it resumes automatically once it
+    # leaves. `reserved_ids` is the DB-authoritative set passed by the worker
+    # (self-healing: empty the moment no live task exists, survives restarts). We
+    # fall back to the in-memory view only if the worker didn't pass one.
+    reserved = reserved_ids if reserved_ids is not None else reserved_live_ids()
+    pool = [
+        (acc_id, entry["client"])
+        for acc_id, entry in _POOL.items()
+        if acc_id not in reserved
+    ]
     if not pool or not emojis:
         return 0
 

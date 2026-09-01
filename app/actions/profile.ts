@@ -1,6 +1,6 @@
 "use server"
 
-import { query, queryOne } from "@/lib/db"
+import { query, queryOne, LIVE_BUSY_STATUSES, notInLiveSql } from "@/lib/db"
 import { isAuthenticated } from "@/lib/auth"
 import { revalidatePath } from "next/cache"
 
@@ -179,13 +179,16 @@ export async function updateProfiles(input: ProfileEditInput) {
   }
   const usesPhotoPool = photoAssetIds.length > 0
 
-  // Only touch accounts that are actually logged in.
+  // Only touch accounts that are logged in AND not reserved for a live stream.
   const accounts = await query<{ id: number }>(
-    `SELECT id FROM telegram_accounts WHERE status = 'logged_in' AND id = ANY($1::int[]) ORDER BY id`,
-    [ids],
+    `SELECT a.id FROM telegram_accounts a
+      WHERE a.status = 'logged_in' AND a.id = ANY($1::int[])
+        AND ${notInLiveSql("a", 2)}
+      ORDER BY a.id`,
+    [ids, LIVE_BUSY_STATUSES],
   )
   if (accounts.length === 0) {
-    return { error: "None of the selected accounts are logged in." }
+    return { error: "None of the selected accounts are available (they may be logged out or busy in a live stream)." }
   }
 
   const noRepeat = Boolean(input.noRepeat)
@@ -289,11 +292,14 @@ export async function deleteProfilePhotos(input: { accountIds: number[] }) {
   if (ids.length === 0) return { error: "Select at least one account." }
 
   const accounts = await query<{ id: number }>(
-    `SELECT id FROM telegram_accounts WHERE status = 'logged_in' AND id = ANY($1::int[]) ORDER BY id`,
-    [ids],
+    `SELECT a.id FROM telegram_accounts a
+      WHERE a.status = 'logged_in' AND a.id = ANY($1::int[])
+        AND ${notInLiveSql("a", 2)}
+      ORDER BY a.id`,
+    [ids, LIVE_BUSY_STATUSES],
   )
   if (accounts.length === 0) {
-    return { error: "None of the selected accounts are logged in." }
+    return { error: "None of the selected accounts are available (they may be logged out or busy in a live stream)." }
   }
 
   await Promise.all(

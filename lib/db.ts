@@ -69,6 +69,16 @@ ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS country_code      TEXT;
 ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS tglion_pass       TEXT;
 ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS two_step_password TEXT;
 
+-- Frozen-account appeal tracking ----------------------------------------------
+-- When Telegram freezes an account, we let the agent file an appeal on its
+-- behalf (opens the Telegram service chat / @SpamBot and submits the appeal).
+--   appeal_status: null | 'queued' | 'appealing' | 'submitted' | 'failed' | 'recovered'
+--   appeal_result: transcript of what Telegram/@SpamBot replied, or the error
+--   appeal_at:     when the last appeal attempt ran
+ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS appeal_status TEXT;
+ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS appeal_result TEXT;
+ALTER TABLE telegram_accounts ADD COLUMN IF NOT EXISTS appeal_at     TIMESTAMPTZ;
+
 -- Job queue (website enqueues, Python agent claims & executes) -----------------
 CREATE TABLE IF NOT EXISTS jobs (
   id          SERIAL PRIMARY KEY,
@@ -388,4 +398,23 @@ export async function query<T = any>(text: string, params: any[] = []): Promise<
 export async function queryOne<T = any>(text: string, params: any[] = []): Promise<T | null> {
   const rows = await query<T>(text, params)
   return rows[0] ?? null
+}
+
+// Participant statuses that mean an account is currently tied up in a live
+// stream (joining, in the call, or on its way out). While an account is in any
+// of these states it must NOT be handed any other work (reactions/views/votes/
+// DMs) — it rejoins the normal task pool automatically once it leaves.
+export const LIVE_BUSY_STATUSES = ["pending", "joining", "joined", "leaving"] as const
+
+// SQL predicate: "this `telegram_accounts` row alias is NOT reserved for a live
+// stream right now." Pass the table alias used in your query (e.g. "a") and the
+// $-placeholder index that will carry LIVE_BUSY_STATUSES. Keeps the live-reserve
+// rule identical across every task selector (vote, DM, …). Example:
+//   `... WHERE a.status = 'logged_in' AND ${notInLiveSql("a", 1)}`  with param $1 = LIVE_BUSY_STATUSES
+export function notInLiveSql(alias: string, statusParamIndex: number): string {
+  return `NOT EXISTS (
+    SELECT 1 FROM livestream_participants p
+     WHERE p.account_id = ${alias}.id
+       AND p.status = ANY($${statusParamIndex})
+  )`
 }
