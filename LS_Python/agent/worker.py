@@ -644,8 +644,10 @@ async def handle_view_post(job: dict) -> dict:
     # target split across shards, instead of being re-rolled on every shard (which
     # would multiply the views by the shard count = "all userbots view").
     shard_index = int(payload.get("shard_index", SHARD_INDEX) or 0)
+    reserved = await _reserved_live_ids()
     count = await userbot.view_post_scheduled(
-        chat_id, message_id, VIEW_SPREAD_SECONDS, view_min, view_max, shard_index, SHARD_COUNT
+        chat_id, message_id, VIEW_SPREAD_SECONDS, view_min, view_max, shard_index, SHARD_COUNT,
+        reserved_ids=reserved,
     )
     if target_id:
         db.bump_view_sent(int(target_id), count)
@@ -732,6 +734,34 @@ REACTION_WINDOWS = {
 }
 
 
+# --- Live-reserve cache -------------------------------------------------------
+# reaction/view jobs can arrive many-per-second on a busy channel, so we don't
+# hit the DB for the reserved-account set on every single post. Instead we cache
+# the DB-authoritative set (accounts currently in a live stream) for a couple of
+# seconds. That's fresh enough that a bot leaving a live resumes reactions/views
+# almost immediately, while a burst of posts shares one query.
+_RESERVED_CACHE: set[int] = set()
+_RESERVED_CACHE_AT: float = 0.0
+_RESERVED_CACHE_TTL = 3.0
+
+
+async def _reserved_live_ids() -> set[int]:
+    """DB-authoritative set of accounts reserved for a live stream, cached for
+    _RESERVED_CACHE_TTL seconds. Self-healing: returns empty as soon as no live
+    task exists, so every account resumes reaction/view work on its own."""
+    global _RESERVED_CACHE, _RESERVED_CACHE_AT
+    now = time.monotonic()
+    if now - _RESERVED_CACHE_AT >= _RESERVED_CACHE_TTL:
+        try:
+            _RESERVED_CACHE = await db.arun(db.active_live_account_ids)
+        except Exception as e:
+            # On a transient DB hiccup, keep the last known set rather than
+            # accidentally un-reserving (or over-reserving) everyone.
+            print(f"[!] could not refresh live-reserve set: {e}")
+        _RESERVED_CACHE_AT = now
+    return _RESERVED_CACHE
+
+
 async def handle_react_post(job: dict) -> dict:
     """
     React to a single channel post from EVERY warm userbot, staggered over a
@@ -757,8 +787,10 @@ async def handle_react_post(job: dict) -> dict:
     # target split across shards, instead of being re-rolled on every shard (which
     # would multiply the reactions by the shard count = "all userbots react").
     shard_index = int(p.get("shard_index", SHARD_INDEX) or 0)
+    reserved = await _reserved_live_ids()
     count = await userbot.react_post_scheduled(
-        chat_id, message_id, emojis, window, react_min, react_max, shard_index, SHARD_COUNT
+        chat_id, message_id, emojis, window, react_min, react_max, shard_index, SHARD_COUNT,
+        reserved_ids=reserved,
     )
     if target_id:
         db.bump_reaction_sent(int(target_id), count)

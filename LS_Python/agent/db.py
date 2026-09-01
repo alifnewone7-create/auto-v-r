@@ -730,6 +730,41 @@ def reserve_paced_slot(gap_seconds: float) -> float:
 # Livestream helpers
 # ---------------------------------------------------------------------------
 
+# Participant statuses that mean an account is CURRENTLY tied up in a live stream
+# and must not be handed any other work (reactions / views / votes / DMs). Kept
+# in sync with the website's LIVE_BUSY_STATUSES (lib/db.ts).
+LIVE_BUSY_STATUSES = ("pending", "joining", "joined", "leaving")
+
+
+def active_live_account_ids() -> set[int]:
+    """
+    The AUTHORITATIVE, self-healing set of account ids currently reserved for a
+    live stream, read straight from the database.
+
+    This is the same source of truth the website uses to keep live bots out of
+    vote/DM tasks, now shared with the agent's reaction/view path. Because it is
+    driven by `livestream_participants` (whose rows are deleted the instant a live
+    task is stopped or deleted, and set to 'left' when a bot leaves), it can never
+    get "stuck": the moment no live task exists, this returns an empty set and
+    every account resumes all work — exactly the behaviour we want. Unlike the
+    agent's in-memory _LIVE_STATE it also survives an agent restart and any
+    event-tracking drift.
+
+    Only counts participants of a target that still EXISTS, so orphaned rows can
+    never keep an account reserved.
+    """
+    rows = query(
+        """
+        SELECT DISTINCT p.account_id
+          FROM livestream_participants p
+          JOIN livestream_targets t ON t.id = p.target_id
+         WHERE p.status = ANY(%s)
+        """,
+        (list(LIVE_BUSY_STATUSES),),
+    )
+    return {int(r["account_id"]) for r in rows} if rows else set()
+
+
 def set_participant(target_id: int, account_id: int, status: str, error: str | None = None) -> None:
     # Guard against a deleted target: if the live stream task was removed while a
     # leave job was still queued, the bot has already physically left the call and

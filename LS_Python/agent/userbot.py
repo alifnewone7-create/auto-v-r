@@ -2185,6 +2185,7 @@ async def view_post_scheduled(
     view_max: int = 0,
     shard_index: int = 0,
     shard_count: int = 1,
+    reserved_ids: set[int] | None = None,
 ) -> int:
     """
     View a single post from the warm userbots, trickling the views in over
@@ -2206,9 +2207,11 @@ async def view_post_scheduled(
 
     Returns how many userbots successfully registered a view.
     """
-    # Skip accounts reserved for a live stream (see reserved_live_ids): a bot in
-    # a live call takes no other work until it leaves and rejoins the pool.
-    reserved = reserved_live_ids()
+    # Skip accounts reserved for a live stream: a bot in a live call takes no
+    # other work until it leaves. `reserved_ids` is the DB-authoritative set the
+    # worker passes (self-healing / restart-proof); fall back to the in-memory
+    # view only if none was supplied.
+    reserved = reserved_ids if reserved_ids is not None else reserved_live_ids()
     pool = [
         (acc_id, entry["client"])
         for acc_id, entry in _POOL.items()
@@ -2591,6 +2594,7 @@ async def react_post_scheduled(
     react_max: int = 0,
     shard_index: int = 0,
     shard_count: int = 1,
+    reserved_ids: set[int] | None = None,
 ) -> int:
     """
     React to a single post from the warm userbots, staggering each userbot's
@@ -2614,9 +2618,11 @@ async def react_post_scheduled(
     are skipped, so the count can be lower than the number chosen).
     """
     # Exclude any account currently reserved for a live stream: while a bot is in
-    # (or auto-rejoining) a live call it must take NO other work. It rejoins the
-    # normal task pool automatically once it leaves (see reserved_live_ids).
-    reserved = reserved_live_ids()
+    # a live call it must take NO other work, and it resumes automatically once it
+    # leaves. `reserved_ids` is the DB-authoritative set passed by the worker
+    # (self-healing: empty the moment no live task exists, survives restarts). We
+    # fall back to the in-memory view only if the worker didn't pass one.
+    reserved = reserved_ids if reserved_ids is not None else reserved_live_ids()
     pool = [
         (acc_id, entry["client"])
         for acc_id, entry in _POOL.items()
