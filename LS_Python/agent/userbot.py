@@ -205,6 +205,50 @@ _ACTIVE_JOINS: dict[int, dict] = {}
 # tell who dropped. Values: "connected" | "dropped".
 _LIVE_STATE: dict[int, str] = {}
 
+# --- Online-presence keep-alive for live-stream bots -------------------------
+# Telegram only shows an account as "online" for ~60s after it reports activity
+# (account.updateStatus offline=false). A bot that just holds a WebRTC call makes
+# NO such report, so it keeps showing "last seen a long time ago" even while it's
+# sitting in the live. Real viewers look online, so we mimic that: every account
+# that is live gets its presence refreshed on a cadence shorter than Telegram's
+# ~60s window. We throttle per-account so the 15s reconcile sweep doesn't fire a
+# needless updateStatus every pass.
+ONLINE_PING_SECONDS = max(20.0, float(_os.environ.get("AGENT_ONLINE_PING_SECONDS", "45")))
+# { account_id: monotonic timestamp of the last successful online ping }
+_LAST_ONLINE_PING: dict[int, float] = {}
+
+
+async def _set_online(account_id: int, client: "Client", *, force: bool = False) -> None:
+    """
+    Report this account as ONLINE to Telegram (account.updateStatus offline=false)
+    so it shows as active while it's in a live stream — just like a real viewer.
+
+    Throttled to ONLINE_PING_SECONDS per account so repeated reconcile sweeps
+    don't spam updateStatus. Pass force=True right after a (re)join to flip the
+    account online immediately. Best-effort and never raises: presence is cosmetic
+    and must never interfere with the join/keep-alive path.
+
+    NOTE: if the account itself has hidden its "last seen & online" in privacy
+    settings, Telegram won't show it online to others no matter what we send —
+    that's a per-account setting, not something the API can override here.
+    """
+    if client is None or not getattr(client, "is_connected", False):
+        return
+    now = time.monotonic()
+    if not force:
+        last = _LAST_ONLINE_PING.get(account_id, 0.0)
+        if now - last < ONLINE_PING_SECONDS:
+            return
+    try:
+        from pyrogram.raw.functions.account import UpdateStatus
+
+        await client.invoke(UpdateStatus(offline=False))
+        _LAST_ONLINE_PING[account_id] = now
+    except Exception:
+        # Rate limit / transient error — leave the throttle timestamp untouched so
+        # the next sweep retries. Presence is never allowed to break keep-alive.
+        pass
+
 
 def reserved_live_ids() -> set[int]:
     """
@@ -1135,6 +1179,7 @@ def _forget_join(account_id: int) -> None:
     _LIVE_STATE.pop(account_id, None)
     _JOIN_FAILS.pop(account_id, None)
     _NEXT_RETRY_AT.pop(account_id, None)
+    _LAST_ONLINE_PING.pop(account_id, None)
 
 
 async def _teardown_client(account_id: int) -> None:
@@ -1271,6 +1316,8 @@ async def _rejoin_one(account_id: int, target: dict) -> bool:
             _LIVE_STATE[account_id] = "connected"
             _JOIN_FAILS.pop(account_id, None)
             _NEXT_RETRY_AT.pop(account_id, None)
+            # Show online again as soon as we're back in the call.
+            await _set_online(account_id, entry.get("client"), force=True)
             return True
         except asyncio.TimeoutError:
             # Wedged negotiation — drop the whole client so it can't keep spinning
@@ -1342,6 +1389,9 @@ async def reconcile_active_joins() -> int:
         by_chat.setdefault(int(target["chat_id"]), []).append((account_id, target))
 
     to_rejoin: list[tuple[int, dict]] = []
+    # Connected bots whose Telegram presence we'll refresh this sweep so they keep
+    # showing "online" while in the live (throttled per account inside _set_online).
+    to_online: list[tuple[int, "Client"]] = []
 
     for chat_id, members in by_chat.items():
         # --- Is the host's live stream still running? Ask ONCE, via any warm
@@ -1410,6 +1460,20 @@ async def reconcile_active_joins() -> int:
                 next_at = _NEXT_RETRY_AT.get(account_id)
                 if next_at is None or now >= next_at:
                     to_rejoin.append((account_id, target))
+            elif entry is not None:
+                # Still in the call — keep it looking "online" like a real viewer.
+                client = entry.get("client")
+                if client is not None:
+                    to_online.append((account_id, client))
+
+    # Refresh presence for the connected bots FIRST (each call is throttled and
+    # near-instant when not yet due), so this runs even when nothing needs a
+    # rejoin. Presence is best-effort and never blocks the recovery path.
+    if to_online:
+        await asyncio.gather(
+            *(_set_online(aid, cli) for aid, cli in to_online),
+            return_exceptions=True,
+        )
 
     if not to_rejoin:
         return 0
@@ -1486,6 +1550,9 @@ async def join_livestream(
                 # Remember we belong here so auto-rejoin can restore us on a drop.
                 _ACTIVE_JOINS[account_id] = target_info
                 _LIVE_STATE[account_id] = "connected"
+                # Flip to "online" right away so it looks like a real viewer the
+                # instant it joins, not on the next reconcile sweep.
+                await _set_online(account_id, client, force=True)
                 return  # joined successfully
             except asyncio.TimeoutError as e:
                 # Negotiation stalled — rebuild a clean transport before retrying
@@ -1513,6 +1580,7 @@ async def join_livestream(
                 if _already_in_call(e):
                     _ACTIVE_JOINS[account_id] = target_info
                     _LIVE_STATE[account_id] = "connected"
+                    await _set_online(account_id, client, force=True)
                     return
                 # A frozen account can never join — stop retrying immediately and
                 # surface it as frozen so the worker retires the account instead of
