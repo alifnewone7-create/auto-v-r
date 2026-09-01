@@ -46,42 +46,13 @@ class TgLionError(Exception):
     pass
 
 
-def _clean_env(value: str) -> str:
-    """
-    Normalise a value read from the environment / .env file:
-      - strip surrounding whitespace and newlines
-      - strip ONE layer of matching surrounding quotes
-
-    A quoted .env entry like  TGLION_API_KEY="abc123"  (or with a stray trailing
-    space / CRLF from editing on Windows) otherwise sends the quotes/space as
-    PART of the key, and tg-lion answers "Invalid API key" for a key that looks
-    correct to the eye. This makes those cases just work.
-    """
-    v = (value or "").strip()
-    if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
-        v = v[1:-1].strip()
-    return v
-
-
-def _mask(value: str) -> str:
-    """A log-safe fingerprint of a secret: length + first/last 2 chars only."""
-    if not value:
-        return "<empty>"
-    if len(value) <= 4:
-        return f"len={len(value)} ****"
-    return f"len={len(value)} {value[:2]}…{value[-2:]}"
-
-
 def _creds() -> tuple[str, str]:
-    api_key = _clean_env(os.environ.get("TGLION_API_KEY", ""))
-    user_id = _clean_env(os.environ.get("TGLION_USER_ID", ""))
+    api_key = os.environ.get("TGLION_API_KEY", "").strip()
+    user_id = os.environ.get("TGLION_USER_ID", "").strip()
     if not api_key or not user_id:
         raise TgLionError(
             "TGLION_API_KEY and TGLION_USER_ID must be set in the agent's .env "
-            "to buy numbers / read login codes from tg-lion. "
-            f"(got apiKey {_mask(api_key)}, YourID {_mask(user_id)}) "
-            "NOTE: worker.py loads `.env.vps` with override=True — if a stale "
-            "`.env.vps` exists on this box it will OVERRIDE the key in `.env`."
+            "to buy numbers / read login codes from tg-lion."
         )
     return api_key, user_id
 
@@ -133,19 +104,7 @@ def _call(
     # tg-lion signals failures with status != 'ok' and/or an 'error'/'message' key.
     status = str(data.get("status", "")).lower()
     if raise_on_status and status and status not in ("ok", "success"):
-        msg = str(data.get("error") or data.get("message") or body[:200])
-        # When the provider itself says the key is bad, the value we SENT is fine
-        # to fingerprint (masked) so the VPS log shows whether it's empty/quoted/
-        # truncated, plus the two real-world causes to check.
-        if "api key" in msg.lower() or "apikey" in msg.lower():
-            raise TgLionError(
-                f"tg-lion {action} error: {msg} "
-                f"(sent apiKey {_mask(api_key)}, YourID {_mask(user_id)}). "
-                "Check: (1) the key in this box's `.env` / `.env.vps` "
-                "(`.env.vps` OVERRIDES `.env`), and (2) that tg-lion has "
-                "whitelisted THIS server's IP — tg-lion rejects a correct key "
-                "from an unlisted IP with exactly this message."
-            )
+        msg = data.get("error") or data.get("message") or body[:200]
         raise TgLionError(f"tg-lion {action} error: {msg}")
     return data
 
